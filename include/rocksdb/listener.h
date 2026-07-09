@@ -374,6 +374,16 @@ struct FlushJobInfo {
   // Table properties of the table being flushed
   TableProperties table_properties;
 
+  // Flush iterator record counts. Dropped records are records that were read
+  // from the flushed memtable(s) but not written to the output SST.
+  uint64_t flush_input_records = 0;
+  uint64_t flush_output_records = 0;
+  uint64_t flush_dropped_records = 0;
+  uint64_t flush_dropped_hidden_records = 0;
+  uint64_t flush_dropped_obsolete_records = 0;
+  uint64_t flush_dropped_user_records = 0;
+  uint64_t flush_dropped_range_del_records = 0;
+
   FlushReason flush_reason;
 
   // Compression algorithm used for blob output files

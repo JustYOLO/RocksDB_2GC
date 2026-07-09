@@ -359,7 +359,8 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
 
   // When measure_io_stats_ is true, the default 512 bytes is not enough.
   auto stream = event_logger_->LogToBuffer(log_buffer_, 1024);
-  stream << "job" << job_context_->job_id << "event" << "flush_finished";
+  stream << "job" << job_context_->job_id << "event"
+         << "flush_finished";
   stream << "output_compression"
          << CompressionTypeToString(output_compression_);
   stream << "lsm_state";
@@ -978,7 +979,8 @@ Status FlushJob::WriteLevel0Table() {
     }
 
     event_logger_->Log() << "job" << job_context_->job_id << "event"
-                         << "flush_started" << "num_memtables" << mems_.size()
+                         << "flush_started"
+                         << "num_memtables" << mems_.size()
                          << "total_num_input_entries" << total_num_input_entries
                          << "num_deletes" << total_num_deletes
                          << "total_data_size" << total_data_size
@@ -1024,6 +1026,10 @@ Status FlushJob::WriteLevel0Table() {
 
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;
+      flush_iteration_stats_ = CompactionIterationStats();
+      flush_input_records_ = 0;
+      flush_output_records_ = 0;
+      flush_dropped_records_ = 0;
       IOStatus io_s;
 
       const std::string* const full_history_ts_low =
@@ -1055,7 +1061,11 @@ Status FlushJob::WriteLevel0Table() {
           seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
           &table_properties_, write_hint, full_history_ts_low, blob_callback_,
           base_, &memtable_payload_bytes, &memtable_garbage_bytes, &flush_stats,
-          blob_file_garbages_for_filtering, fast_sst_open_);
+          blob_file_garbages_for_filtering, fast_sst_open_,
+          &flush_iteration_stats_);
+      flush_input_records_ = flush_stats.num_input_records;
+      flush_output_records_ = flush_stats.num_output_records;
+      flush_dropped_records_ = flush_stats.num_dropped_records;
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
@@ -1222,6 +1232,17 @@ std::unique_ptr<FlushJobInfo> FlushJob::GetFlushJobInfo() const {
   info->smallest_seqno = meta_.fd.smallest_seqno;
   info->largest_seqno = meta_.fd.largest_seqno;
   info->table_properties = table_properties_;
+  info->flush_input_records = flush_input_records_;
+  info->flush_output_records = flush_output_records_;
+  info->flush_dropped_hidden_records =
+      static_cast<uint64_t>(flush_iteration_stats_.num_record_drop_hidden);
+  info->flush_dropped_obsolete_records =
+      static_cast<uint64_t>(flush_iteration_stats_.num_record_drop_obsolete);
+  info->flush_dropped_user_records =
+      static_cast<uint64_t>(flush_iteration_stats_.num_record_drop_user);
+  info->flush_dropped_range_del_records =
+      static_cast<uint64_t>(flush_iteration_stats_.num_record_drop_range_del);
+  info->flush_dropped_records = flush_dropped_records_;
   info->flush_reason = flush_reason_;
   info->blob_compression_type = mutable_cf_options_.blob_compression_type;
 

@@ -1,0 +1,1135 @@
+db_bench: 
+USAGE:
+./db_bench [OPTIONS]...
+
+  Flags from /build/gflags-WDCpEz/gflags-2.2.2/src/gflags.cc:
+    -flagfile (load flags from file) type: string default: ""
+    -fromenv (set flags from the environment [use 'export FLAGS_flag1=value'])
+      type: string default: ""
+    -tryfromenv (set flags from the environment if present) type: string
+      default: ""
+    -undefok (comma-separated list of flag names that it is okay to specify on
+      the command line even if the program does not define a flag with that
+      name.  IMPORTANT: flags in this list that have arguments MUST use the
+      flag=value format) type: string default: ""
+
+  Flags from /build/gflags-WDCpEz/gflags-2.2.2/src/gflags_completions.cc:
+    -tab_completion_columns (Number of columns to use in output for tab
+      completion) type: int32 default: 80
+    -tab_completion_word (If non-empty, HandleCommandLineCompletions() will
+      hijack the process and attempt to do bash-style command line flag
+      completion on this value.) type: string default: ""
+
+  Flags from /build/gflags-WDCpEz/gflags-2.2.2/src/gflags_reporting.cc:
+    -help (show help on all flags [tip: all flags can have two dashes])
+      type: bool default: false currently: true
+    -helpfull (show help on all flags -- same as -help) type: bool
+      default: false
+    -helpmatch (show help on modules whose name contains the specified substr)
+      type: string default: ""
+    -helpon (show help on the modules named by this flag value) type: string
+      default: ""
+    -helppackage (show help on all modules in the main package) type: bool
+      default: false
+    -helpshort (show help on only the main module for this program) type: bool
+      default: false
+    -helpxml (produce an xml version of help) type: bool default: false
+    -version (show version and build info and exit) type: bool default: false
+
+
+
+  Flags from tools/db_bench_tool.cc:
+    -adaptive_readahead (carry forward internal auto readahead size from one
+      file to next file at each level during iteration) type: bool
+      default: false
+    -advise_random_on_open (Advise random access on table file open) type: bool
+      default: true
+    -allow_concurrent_memtable_write (Allow multi-writers to update mem tables
+      in parallel.) type: bool default: true
+    -allow_data_in_errors (If true, allow logging data, e.g. key, value in LOG
+      files.) type: bool default: false
+    -arena_block_size (The size, in bytes, of one block in arena memory
+      allocation.) type: int64 default: 0
+    -async_io (When set true, RocksDB does asynchronous reads for internal auto
+      readahead prefetching.) type: bool default: false
+    -async_wal_precreate (See Options.async_wal_precreate) type: bool
+      default: false
+    -auto_prefix_mode (Set auto_prefix_mode for seek benchmark) type: bool
+      default: false
+    -auto_readahead_size (When set true, RocksDB does auto tuning of readahead
+      size during Scans) type: bool default: false
+    -auto_refresh_iterator_with_snapshot (When set to true, RocksDB iterator
+      will automatically refresh itself upon detecting stale superversion -
+      preserving its' original snapshot) type: bool default: false
+    -avoid_flush_during_recovery (If true, avoids flushing the recovered WAL
+      data where possible.) type: bool default: false
+    -avoid_flush_during_shutdown (If true, avoids flushing the recovered WAL
+      data where possible.) type: bool default: false
+    -backup_dir (If not empty string, use the given dir for backup.)
+      type: string default: ""
+    -backup_rate_limit (If non-zero, db_bench will rate limit reads and writes
+      for DB backup. This is the global rate in ops/second.) type: uint64
+      default: 0
+    -batch_size (Batch size) type: int64 default: 1
+    -benchmark_read_rate_limit (If non-zero, db_bench will rate-limit the reads
+      from RocksDB. This is the global rate in ops/second.) type: uint64
+      default: 0
+    -benchmark_write_rate_limit (If non-zero, db_bench will rate-limit the
+      writes going into RocksDB. This is the global rate in bytes/second.)
+      type: uint64 default: 0
+    -benchmarks (Comma-separated list of operations to run in the specified
+      order. Available benchmarks:
+      	fillseq       -- write N values in sequential key order in async mode
+      	fillseqdeterministic       -- write N values in the specified key order
+      and keep the shape of the LSM tree
+      	fillrandom    -- write N values in random key order in async mode
+      	filluniquerandomdeterministic       -- write N values in a random key
+      order and keep the shape of the LSM tree
+      	overwrite     -- overwrite N values in random key order in async mode
+      	fillsync      -- write N/1000 values in random key order in sync mode
+      	fill100K      -- write N/1000 100K values in random order in async mode
+      	deleteseq     -- delete N keys in sequential order
+      	deleterandom  -- delete N keys in random order
+      	readseq       -- read N times sequentially
+      	readtocache   -- 1 thread reading database sequentially
+      	readreverse   -- read N times in reverse order
+      	readrandom    -- read N times in random order
+      	readmissing   -- read N missing keys in random order
+      	readwhilewriting      -- 1 writer, N threads doing random reads
+      	readwhilemerging      -- 1 merger, N threads doing random reads
+      	readwhilescanning     -- 1 thread doing full table scan, N threads doing
+      random reads
+      	readrandomwriterandom -- N threads doing random-read, random-write
+      	updaterandom  -- N threads doing read-modify-write for random keys
+      	xorupdaterandom  -- N threads doing read-XOR-write for random keys
+      	appendrandom  -- N threads doing read-modify-write with growing values
+      	mergerandom   -- same as updaterandom/appendrandom using merge operator.
+      Must be used with merge_operator
+      	readrandommergerandom -- perform N random read-or-merge operations. Must
+      be used with merge_operator
+      	newiterator   -- repeated iterator creation
+      	seekrandom    -- N random seeks, call Next seek_nexts times per seek
+      	seekrandomwhilewriting -- seekrandom and 1 thread doing overwrite
+      	seekrandomwhilemerging -- seekrandom and 1 thread doing merge
+      	crc32c        -- repeated crc32c of <block size> data
+      	xxhash        -- repeated xxHash of <block size> data
+      	xxhash64      -- repeated xxHash64 of <block size> data
+      	xxh3          -- repeated XXH3 of <block size> data
+      	compressreject -- repeated compression of <block size> data forced to be
+      rejected (output buffer ~10% of input smaller than the predicted
+      compressed size), to measure the cost of attempting then declining
+      compression
+      	acquireload   -- load N*1000 times
+      	fillseekseq   -- write N values in sequential key, then read them by
+      seeking to each key
+      	randomtransaction     -- execute N random transactions and verify
+      correctness
+      	randomreplacekeys     -- randomly replaces N keys by deleting the old
+      version and putting the new version
+      
+      	timeseries            -- 1 writer generates time series data and
+      multiple readers doing random reads on id
+      
+      Meta operations:
+      	compact     -- Compact the entire DB; If multiple, randomly choose one
+      	compactall  -- Compact the entire DB
+      	compact0  -- compact L0 into L1
+      	compact1  -- compact L1 into L2
+      	waitforcompaction - pause until compaction is (probably) done
+      	flush - flush the memtable
+      	ingestexternalfile -- Create external SST files and ingest them into the
+      DB via IngestExternalFile
+      	openandcompact -- Open DB and compact all files to bottommost level,
+      writing output to separate directory without modifying source DB.
+      Designed for remote compaction service testing
+      	stats       -- Print DB stats
+      	resetstats  -- Reset DB stats
+      	levelstats  -- Print the number of files and bytes per level
+      	memstats  -- Print memtable stats
+      	sstables    -- Print sstable info
+      	heapprofile -- Dump a heap profile (if supported by this port)
+      	replay      -- replay the trace file specified with trace_file
+      	getmergeoperands -- Insert lots of merge records which are a list of
+      sorted ints for a key and then compare performance of lookup for another
+      key by doing a Get followed by binary searching in the large sorted list
+      vs doing a GetMergeOperands and binary searching in the operands which
+      are sorted sub-lists. The MergeOperator used is sortlist.h
+      	readrandomoperands -- read random keys using `GetMergeOperands()`. An
+      operation includes a rare but possible retry in case it got
+      `Status::Incomplete()`. This happens upon encountering more keys than
+      have ever been seen by the thread (or eight initially)
+      	backup --  Create a backup of the current DB and verify that a new
+      backup is corrected. Rate limit can be specified through
+      --backup_rate_limit
+      	restore -- Restore the DB from the latest backup available, rate limit
+      can be specified through --restore_rate_limit
+      	testzipf -- Print a sample Zipf distribution using --zipf_const
+      	twittertrace -- Replay Twitter cache trace CSV from --twitter_trace_file
+      	approximatememtablestats -- Tests accuracy of
+      GetApproximateMemTableStats, ideally
+      after fillrandom, where actual answer is batch_size) type: string
+      default: "fillseq,fillseqdeterministic,fillsync,fillrandom,filluniquerandomdeterministic,overwrite,readrandom,newiterator,newiteratorwhilewriting,seekrandom,seekrandomwhilewriting,seekrandomwhilemerging,readseq,readreverse,compact,compactall,flush,compact0,compact1,waitforcompaction,multireadrandom,multiscan,multiscanrandom,mixgraph,readseq,readtorowcache,readtocache,readreverse,readwhilewriting,readwhilemerging,readwhilescanning,readrandomwriterandom,updaterandom,xorupdaterandom,approximatesizerandom,randomwithverify,fill100K,crc32c,xxhash,xxhash64,xxh3,compress,uncompress,acquireload,fillseekseq,randomtransaction,randomreplacekeys,timeseries,getmergeoperands,readrandomoperands,backup,restore,testzipf,openandcompact,approximatememtablestats"
+    -bgwriter_num (If > 0, the background-writer thread used by
+      readwhilewriting / readwhilemerging / multireadwhilewriting writes random
+      keys over [0, bgwriter_num) instead of [0, num). Lets the reader thread
+      group operate on a small hot subset (--num) while the writer spreads its
+      puts across a much larger keyspace, which is what drives continuous
+      flushes and compaction. Designed for benchmarking compaction-time effects
+      on user reads.) type: int64 default: 0
+    -blob_cache_numshardbits ([Integrated BlobDB] Number of shards for the blob
+      cache is 2 ** blob_cache_numshardbits. Negative means use default
+      settings. It only takes effect if blob_cache_size is greater than 0, and
+      the block and blob caches are different (use_shared_block_and_blob_cache
+      = false).) type: int32 default: 6
+    -blob_cache_size ([Integrated BlobDB] Number of bytes to use as a cache of
+      blobs. It only takes effect if the block and blob caches are different
+      (use_shared_block_and_blob_cache = false).) type: uint64 default: 8388608
+    -blob_compaction_readahead_size ([Integrated BlobDB] Compaction readahead
+      for blob files.) type: uint64 default: 0
+    -blob_compression_type ([Integrated BlobDB] The compression algorithm to
+      use for large values stored in blob files.) type: string default: "none"
+    -blob_db_enable_gc ([Stacked BlobDB] Enable BlobDB garbage collection.)
+      type: bool default: false
+    -blob_db_file_size ([Stacked BlobDB] Target size of each blob file.)
+      type: uint64 default: 268435456
+    -blob_db_max_db_size ([Stacked BlobDB] Max size limit of the directory
+      where blob files are stored.) type: uint64 default: 0
+    -blob_db_max_ttl_range ([Stacked BlobDB] TTL range to generate BlobDB data
+      (in seconds). 0 means no TTL.) type: uint64 default: 0
+    -blob_db_ttl_range_secs ([Stacked BlobDB] TTL bucket size to use when
+      creating blob files.) type: uint64 default: 3600
+    -blob_direct_write_partitions ([Integrated BlobDB] Number of partitions for
+      direct-write blob files.) type: uint64 default: 1
+    -blob_file_size ([Integrated BlobDB] The size limit for blob files.)
+      type: uint64 default: 268435456
+    -blob_file_starting_level ([Integrated BlobDB] The starting level for blob
+      files.) type: int32 default: 0
+    -blob_garbage_collection_age_cutoff ([Integrated BlobDB] The cutoff in
+      terms of blob file age for garbage collection.) type: double
+      default: 0.25
+    -blob_garbage_collection_force_threshold ([Integrated BlobDB] The threshold
+      for the ratio of garbage in the eligible blob files for forcing garbage
+      collection.) type: double default: 1
+    -block_align (Align data blocks on page size) type: bool default: false
+    -block_cache_trace_file (Block cache trace file path.) type: string
+      default: ""
+    -block_cache_trace_max_trace_file_size_in_bytes (The maximum block cache
+      trace file size in bytes. Block cache accesses will not be logged if the
+      trace file size exceeds this threshold. Default is 64 GB.) type: int64
+      default: 68719476736
+    -block_cache_trace_sampling_frequency (Block cache trace sampling
+      frequency, termed s. It uses spatial downsampling and samples accesses to
+      one out of s blocks.) type: int32 default: 1
+    -block_protection_bytes_per_key (Enable block per key-value checksum
+      protection. Supported values: 0, 1, 2, 4, 8.) type: uint32 default: 0
+    -block_restart_interval (Number of keys between restart points for delta
+      encoding of keys in data block.) type: int32 default: 16
+    -block_size (Number of bytes in a block.) type: int32 default: 4096
+    -bloom_bits (Bloom filter bits per key. Negative means use default.Zero
+      disables.) type: int32 default: -1
+    -bloom_locality (Control bloom filter probes locality) type: int32
+      default: 0
+    -build_info (Print the build info via GetRocksBuildInfoAsString) type: bool
+      default: false
+    -bytes_per_sync (Allows OS to incrementally sync SST files to disk while
+      they are being written, in the background. Issue one request for every
+      bytes_per_sync written. 0 turns it off.) type: uint64 default: 0
+    -cache_high_pri_pool_ratio (Ratio of block cache reserve for high pri
+      blocks. If > 0.0, we also enable
+      cache_index_and_filter_blocks_with_high_priority.) type: double
+      default: 0
+    -cache_index_and_filter_blocks (Cache index/filter blocks in block cache.)
+      type: bool default: false
+    -cache_low_pri_pool_ratio (Ratio of block cache reserve for low pri
+      blocks.) type: double default: 0
+    -cache_numshardbits (Number of shards for the block cache is 2 **
+      cache_numshardbits. Negative means use default settings. This is applied
+      only if FLAGS_cache_size is non-negative.) type: int32 default: -1
+    -cache_size (Number of bytes to use as a cache of uncompressed data)
+      type: int64 default: 33554432
+    -cache_type (Type of block cache.) type: string
+      default: "hyper_clock_cache"
+    -cache_uri (Full URI for creating a custom cache object) type: string
+      default: ""
+    -charge_blob_cache (Setting for CacheEntryRoleOptions::charged of
+      CacheEntryRole::kBlobCache) type: bool default: false
+    -charge_compression_dictionary_building_buffer (Setting for
+      CacheEntryRoleOptions::charged of
+      CacheEntryRole::kCompressionDictionaryBuildingBuffer) type: bool
+      default: false
+    -charge_file_metadata (Setting for CacheEntryRoleOptions::charged of
+      CacheEntryRole::kFileMetadata) type: bool default: false
+    -charge_filter_construction (Setting for CacheEntryRoleOptions::charged of
+      CacheEntryRole::kFilterConstruction) type: bool default: false
+    -charge_table_reader (Setting for CacheEntryRoleOptions::charged of
+      CacheEntryRole::kBlockBasedTableReader) type: bool default: false
+    -checksum_type (ChecksumType as an int) type: int32 default: 4
+    -column_family_distribution (Comma-separated list of percentages, where the
+      ith element indicates the probability of an op using the ith column
+      family. The number of elements must be `num_hot_column_families` if
+      specified; otherwise, it must be `num_column_families`. The sum of
+      elements must be 100. E.g., if `num_column_families=4`, and
+      `num_hot_column_families=0`, a valid list could be "10,20,30,40".)
+      type: string default: ""
+    -compaction_pri (priority of files to compaction: by size or by data age)
+      type: int32 default: 3
+    -compaction_readahead_size (Compaction readahead size) type: uint64
+      default: 2097152
+    -compaction_style (style of compaction: level-based, universal and fifo)
+      type: int32 default: 0
+    -compressed_cache_size (Number of bytes to use as a cache of compressed
+      data.) type: int64 default: -1
+    -compressed_secondary_cache_compression_level (Compression level. The
+      meaning of this value is library-dependent. If unset, we try to use the
+      default for the library specified in
+      `--compressed_secondary_cache_compression_type`) type: int32
+      default: 32767
+    -compressed_secondary_cache_compression_type (The compression algorithm to
+      use for large values stored in CompressedSecondaryCache.) type: string
+      default: "lz4"
+    -compressed_secondary_cache_high_pri_pool_ratio (Ratio of block cache
+      reserve for high pri blocks. If > 0.0, we also enable
+      cache_index_and_filter_blocks_with_high_priority.) type: double
+      default: 0
+    -compressed_secondary_cache_low_pri_pool_ratio (Ratio of block cache
+      reserve for low pri blocks.) type: double default: 0
+    -compressed_secondary_cache_numshardbits (Number of shards for the block
+      cache is 2 ** compressed_secondary_cache_numshardbits. Negative means use
+      default settings. This is applied only if FLAGS_cache_size is
+      non-negative.) type: int32 default: 6
+    -compressed_secondary_cache_size (Number of bytes to use as a cache of
+      data) type: int64 default: 33554432
+    -compression_level (Compression level. The meaning of this value is
+      library-dependent. If unset, we try to use the default for the library
+      specified in `--compression_type`) type: int32 default: 32767
+    -compression_manager (Set the compression manager type to mixed(roundrobin)
+      or other type. None for BuilInCompressor) type: string default: "none"
+    -compression_max_dict_buffer_bytes (Maximum bytes to buffer to collect
+      samples for dictionary.) type: uint64 default: 0
+    -compression_max_dict_bytes (Maximum size of dictionary used to prime the
+      compression library.) type: int32 default: 0
+    -compression_parallel_threads (Number of threads for parallel compression.
+      NOTE: known *fast* compression configurations can quietly override this
+      setting to non-parallel, for efficiency) type: int32 default: 1
+    -compression_ratio (Arrange to generate values that shrink to this fraction
+      of their original size after compression) type: double default: 0.5
+    -compression_type (Algorithm to use to compress the database) type: string
+      default: "snappy"
+    -compression_use_zstd_dict_trainer (If true, use ZSTD_TrainDictionary() to
+      create dictionary, elseuse ZSTD_FinalizeDictionary() to create
+      dictionary) type: bool default: true
+    -compression_zstd_max_train_bytes (Maximum size of training data passed to
+      zstd's dictionary trainer.) type: int32 default: 0
+    -confidence_interval_only (Print 95% confidence interval upper and lower
+      bounds only for aggregate stats.) type: bool default: false
+    -cost_write_buffer_to_cache (The usage of memtable is costed to the block
+      cache) type: bool default: false
+    -cuckoo_hash_ratio (Hash ratio for Cuckoo SST table.) type: double
+      default: 0.90000000000000002
+    -data_block_hash_table_util_ratio (util ratio for data block hash index
+      table. This is only valid if use_data_block_hash_index is set to true)
+      type: double default: 0.75
+    -db (Use the db with the following name.) type: string default: ""
+    -db_write_buffer_size (Number of bytes to buffer in all memtables before
+      compacting) type: int64 default: 0
+    -decouple_partitioned_filters (Decouple filter partitioning from index
+      partitioning.) type: bool default: true
+    -delayed_write_rate (Limited bytes allowed to DB when soft_rate_limit or
+      level0_slowdown_writes_trigger triggers) type: uint64 default: 8388608
+    -delete_obsolete_files_period_micros (Ignored. Left here for backward
+      compatibility) type: uint64 default: 0
+    -deletepercent (Percentage of deletes out of reads/writes/deletes (used in
+      RandomWithVerify only). RandomWithVerify calculates writepercent as (100
+      - FLAGS_readwritepercent - deletepercent), so deletepercent must be
+      smaller than (100 - FLAGS_readwritepercent)) type: int32 default: 2
+    -deletes (Number of delete operations to do.  If negative, do FLAGS_num
+      deletions.) type: int64 default: -1
+    -disable_auto_compactions (Do not auto trigger compactions) type: bool
+      default: false
+    -disable_seek_compaction (Not used, left here for backwards compatibility)
+      type: int32 default: 0
+    -disable_wal (If true, do not write WAL for write.) type: bool
+      default: false
+    -disposable_entries_batch_size (Number of consecutively inserted disposable
+      KV entries that will be deleted after 'delete_delay' microseconds. A
+      series of Deletes is always issued once all the disposable KV entries it
+      targets have been inserted into the DB. When 0 no deletes are issued and
+      a regular 'filluniquerandom' benchmark occurs. (only compatible with
+      fillanddeleteuniquerandom benchmark)) type: uint64 default: 0
+    -disposable_entries_delete_delay (Minimum delay in microseconds for the
+      series of Deletes to be issued. When 0 the insertion of the last
+      disposable entry is immediately followed by the issuance of the Deletes.
+      (only compatible with fillanddeleteuniquerandom benchmark).) type: uint64
+      default: 0
+    -disposable_entries_value_size (Size of the values (in bytes) of the
+      entries targeted by selective deletes. (only compatible with
+      fillanddeleteuniquerandom benchmark)) type: int32 default: 64
+    -dump_malloc_stats (Dump malloc stats in LOG ) type: bool default: true
+    -duration (Time in seconds for the random-ops tests to run. When 0 then num
+      & reads determine the test duration) type: int32 default: 0
+    -enable_blob_direct_write ([Integrated BlobDB] Enable direct-write blob
+      file creation on the write path.) type: bool default: false
+    -enable_blob_files ([Integrated BlobDB] Enable writing large values to
+      separate blob files.) type: bool default: false
+    -enable_blob_garbage_collection ([Integrated BlobDB] Enable blob garbage
+      collection.) type: bool default: false
+    -enable_cpu_prio (Lower the background flush/compaction threads' CPU
+      priority) type: bool default: false
+    -enable_index_compression (Compress the index block) type: bool
+      default: true
+    -enable_io_prio (Lower the background flush/compaction threads' IO
+      priority) type: bool default: false
+    -enable_numa (Make operations aware of NUMA architecture and bind memory
+      and cpus corresponding to nodes together. In NUMA, memory in same node as
+      CPUs are closer when compared to memory in other nodes. Reads can be
+      faster when the process is bound to CPU and memory of same node. Use
+      "$numactl --hardware" command to see NUMA memory architecture.)
+      type: bool default: false
+    -enable_pipelined_write (Allow WAL and memtable writes to be pipelined)
+      type: bool default: true
+    -enable_write_thread_adaptive_yield (Use a yielding spin loop for brief
+      writer thread waits.) type: bool default: true
+    -env_uri (URI for registry Env lookup. Mutually exclusive with --fs_uri)
+      type: string default: ""
+    -expand_range_tombstones (Expand range tombstone into sequential regular
+      tombstones.) type: bool default: false
+    -experimental_mempurge_threshold (Maximum useful payload ratio estimate
+      that triggers a mempurge (memtable garbage collection).) type: double
+      default: 0
+    -expire_style (Style to remove expired time entries. Can be one of the
+      options below: none (do not expired data), compaction_filter (use a
+      compaction filter to remove expired data), delete (seek IDs and remove
+      expired data) (used in TimeSeries only).) type: string default: "none"
+    -explicit_snapshot (When set to true iterators will be initialized with
+      explicit snapshot) type: bool default: false
+    -fatal_shutdown_watchdog_seconds (Maximum seconds to wait for graceful
+      shutdown after a fatal benchmark error before forcing an immediate
+      _exit(). Guards against a hang while joining background threads or
+      tearing down a misbehaving Env/FileSystem. 0 disables the watchdog.)
+      type: uint64 default: 180
+    -fault_injection_read_after_reads (Test only: if > 0, wrap the FileSystem
+      so that random-access reads start returning a non-retryable IOError after
+      this many reads. Used to exercise graceful fatal-shutdown of RocksDB and
+      user callbacks (Env/FileSystem) under adverse conditions. 0 disables.)
+      type: int64 default: 0
+    -fifo_age_for_warm (age_for_warm for FIFO compaction.) type: uint64
+      default: 0
+    -fifo_compaction_allow_compaction (Allow compaction in FIFO compaction.)
+      type: bool default: true
+    -fifo_compaction_max_data_files_size_mb (Combined SST + blob file size
+      limit for FIFO compaction trimming. 0 means use max_table_files_size
+      (SST-only).) type: uint64 default: 0
+    -fifo_compaction_max_table_files_size_mb (The limit of total table file
+      sizes to trigger FIFO compaction) type: uint64 default: 0
+    -fifo_compaction_ttl (TTL for the SST Files in seconds.) type: uint64
+      default: 0
+    -fifo_compaction_use_kv_ratio_compaction (Enable capacity-derived intra-L0
+      compaction for FIFO with BlobDB. Requires
+      fifo_compaction_max_data_files_size_mb > 0.) type: bool default: false
+    -file_checksum (When true use FileChecksumGenCrc32cFactory for
+      file_checksum_gen_factory.) type: bool default: false
+    -file_opening_threads (If open_files is set to -1, this option set the
+      number of threads that will be used to open files during DB::Open())
+      type: int32 default: 16
+    -finish_after_writes (Write thread terminates after all writes are
+      finished) type: bool default: false
+    -force_consistency_checks (Runs consistency checks on the LSM every time a
+      change is applied.) type: bool default: true
+    -format_version (Format version of SST files.) type: int32 default: 7
+    -fs_uri (URI for registry Filesystem lookup. Mutually exclusive with
+      --env_uri. Creates a default environment with the specified filesystem.)
+      type: string default: ""
+    -hard_pending_compaction_bytes_limit (Stop writes if pending compaction
+      bytes exceed this number) type: uint64 default: 137438953472
+    -hash_bucket_count (hash bucket count) type: int64 default: 1048576
+    -histogram (Print histogram of operation timings) type: bool default: false
+    -identity_as_first_hash (the first hash function of cuckoo table becomes an
+      identity function. This is only valid when key is 8 bytes) type: bool
+      default: false
+    -index_block_restart_interval (Number of keys between restart points for
+      delta encoding of keys in index block.) type: int32 default: 1
+    -index_block_search_type (Search algorithm for reading index blocks:
+      binary_search, interpolation_search, or auto_search.) type: string
+      default: "binary_search"
+    -index_shortening_mode (mode to shorten index: 0 for no shortening; 1 for
+      only shortening separaters; 2 for shortening shortening and successor)
+      type: int64 default: 2
+    -index_with_first_key (Include first key in the index) type: bool
+      default: false
+    -ingest_external_file_batch_size (Number of SST files ingested per
+      IngestExternalFile call (one batch) in the ingestexternalfile benchmark.)
+      type: int32 default: 10
+    -ingest_external_file_file_opening_threads
+      (IngestExternalFileOptions::file_opening_threads used by the
+      ingestexternalfile benchmark (threads for opening table readers during
+      commit).) type: int32 default: 1
+    -ingest_external_file_fill_cache (If true, the ingestexternalfile benchmark
+      allows file ingestion reads to populate block cache.) type: bool
+      default: true
+    -ingest_external_file_num_batches (Number of IngestExternalFile calls
+      (batches) in the ingestexternalfile benchmark. Total files ingested is
+      batch_size * num_batches; each file holds --num keys.) type: int32
+      default: 1
+    -ingest_external_file_prefetch_lmax_index_and_filter_blocks (If true, the
+      ingestexternalfile benchmark prefetches index and filter blocks while
+      opening table readers during commit.) type: bool default: true
+    -ingest_external_file_use_file_info (If true, the ingestexternalfile
+      benchmark passes each file's metadata (from SstFileWriter::Finish) via
+      IngestExternalFileArg::file_infos, so ingestion reuses it instead of
+      re-opening and scanning the files.) type: bool default: false
+    -initial_auto_readahead_size (RocksDB does auto-readahead for iterators on
+      noticing more than two reads for a table file if user doesn't provide
+      readahead_size. The readahead size starts at initial_auto_readahead_size)
+      type: uint64 default: 8192
+    -inplace_update_num_locks (Number of RW locks to protect in-place memtable
+      updates) type: uint64 default: 10000
+    -inplace_update_support (Support in-place memtable update for smaller or
+      same-size values) type: bool default: false
+    -io_dispatcher_max_prefetch_memory_bytes (Maximum memory (in bytes) for
+      IODispatcher prefetching across all ReadSets. When this limit is reached,
+      SubmitJob() blocks until memory is released. 0 means unlimited.)
+      type: uint64 default: 0
+    -io_uring_enabled (If true, enable the use of IO uring if the platform
+      supports it) type: bool default: true
+    -iter_k (The parameter 'k' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double
+      default: 2.5169999999999999
+    -iter_sigma (The parameter 'sigma' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double
+      default: 14.236000000000001
+    -iter_theta (The parameter 'theta' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double default: 0
+    -key_dist_a (The parameter 'a' of key access distribution model f(x)=a*x^b)
+      type: double default: 0
+    -key_dist_b (The parameter 'b' of key access distribution model f(x)=a*x^b)
+      type: double default: 0
+    -key_id_range (Range of possible value of key id (used in TimeSeries
+      only).) type: int32 default: 100000
+    -key_size (size of each key) type: int32 default: 16
+    -keyrange_dist_a (The parameter 'a' of prefix average access distribution
+      f(x)=a*exp(b*x)+c*exp(d*x)) type: double default: 0
+    -keyrange_dist_b (The parameter 'b' of prefix average access distribution
+      f(x)=a*exp(b*x)+c*exp(d*x)) type: double default: 0
+    -keyrange_dist_c (The parameter 'c' of prefix average access
+      distributionf(x)=a*exp(b*x)+c*exp(d*x)) type: double default: 0
+    -keyrange_dist_d (The parameter 'd' of prefix average access
+      distributionf(x)=a*exp(b*x)+c*exp(d*x)) type: double default: 0
+    -keyrange_num (The number of key ranges that are in the same prefix group,
+      each prefix range will have its key access distribution) type: int64
+      default: 1
+    -keys_per_prefix (control average number of keys generated per prefix, 0
+      means no special handling of the prefix, i.e. use the prefix comes with
+      the generated random number.) type: int64 default: 0
+    -leader_path (Path to the directory of the leader DB) type: string
+      default: ""
+    -level0_file_num_compaction_trigger (Number of files in level-0 when
+      compactions start.) type: int32 default: 4
+    -level0_slowdown_writes_trigger (Number of files in level-0 that will slow
+      down writes.) type: int32 default: 20
+    -level0_stop_writes_trigger (Number of files in level-0 that will trigger
+      put stop.) type: int32 default: 36
+    -level_compaction_dynamic_level_bytes (Whether level size base is dynamic)
+      type: bool default: false
+    -log_readahead_size (WAL and manifest readahead size) type: int32
+      default: 0
+    -manual_wal_flush (If true, buffer WAL until buffer is full or a manual
+      FlushWAL().) type: bool default: false
+    -max_auto_readahead_size (Rocksdb implicit readahead starts at
+      BlockBasedTableOptions.initial_auto_readahead_size and doubles on every
+      additional read upto max_auto_readahead_size) type: uint64
+      default: 262144
+    -max_background_compactions (The maximum number of concurrent background
+      compactions that can occur in parallel.) type: int32 default: -1
+    -max_background_flushes (The maximum number of concurrent background
+      flushes that can occur in parallel.) type: int32 default: -1
+    -max_background_jobs (The maximum number of concurrent background jobs that
+      can occur in parallel.) type: int32 default: 2
+    -max_bytes_for_level_base (Max bytes for level-1) type: uint64
+      default: 268435456
+    -max_bytes_for_level_multiplier (A multiplier to compute max bytes for
+      level-N (N >= 2)) type: double default: 10
+    -max_bytes_for_level_multiplier_additional (A vector that specifies
+      additional fanout per level) type: string default: ""
+    -max_compaction_bytes (Max bytes allowed in one compaction) type: uint64
+      default: 0
+    -max_compaction_trigger_wakeup_seconds (Maximum interval in seconds between
+      periodic compaction trigger checks.) type: uint64 default: 43200
+    -max_manifest_file_size (Max manifest file size (or minimum max with
+      auto-tuning)) type: int64 default: 1073741824
+    -max_manifest_space_amp_pct (Max manifest space amp percentage for
+      auto-tuning) type: int32 default: 500
+    -max_num_range_tombstones (Maximum number of range tombstones to insert.)
+      type: int64 default: 0
+    -max_scan_distance (Used to define iterate_upper_bound (or
+      iterate_lower_bound if FLAGS_reverse_iterator is set to true) when value
+      is nonzero) type: int64 default: 0
+    -max_successive_merges (Maximum number of successive merge operations on a
+      key in the memtable) type: int32 default: 0
+    -max_total_wal_size (Set total max WAL size) type: uint64 default: 0
+    -max_write_buffer_number (The number of in-memory memtables. Each memtable
+      is of size write_buffer_size bytes.) type: int32 default: 2
+    -max_write_buffer_size_to_maintain (The total maximum size of write buffers
+      to maintain in memory including copies of buffers that have already been
+      flushed. Unlike max_write_buffer_number, this parameter does not affect
+      flushing. This controls the minimum amount of write history that will be
+      available in memory for conflict checking when Transactions are used. If
+      this value is too low, some transactions may fail at commit time due to
+      not being able to determine whether there were any write conflicts.
+      Setting this value to 0 will cause write buffers to be freed immediately
+      after they are flushed.  If this value is set to -1,
+      'max_write_buffer_number' will be used.) type: int64 default: 0
+    -memtable_batch_lookup_optimization (Use batch lookup optimization for
+      memtable MultiGet.) type: bool default: false
+    -memtable_bloom_size_ratio (Ratio of memtable size used for bloom filter. 0
+      means no bloom filter.) type: double default: 0
+    -memtable_insert_with_hint_prefix_size (If non-zero, enable memtable insert
+      with hint with the given prefix size.) type: int32 default: 0
+    -memtable_op_scan_flush_trigger (Setting for CF option
+      memtable_op_scan_flush_trigger.) type: uint32 default: 0
+    -memtable_protection_bytes_per_key (Enable memtable per key-value checksum
+      protection. Each entry in memtable will be suffixed by a per key-value
+      checksum. This options determines the size of such checksums. Supported
+      values: 0, 1, 2, 4, 8.) type: uint32 default: 0
+    -memtable_use_huge_page (Try to use huge page in memtables.) type: bool
+      default: false
+    -memtable_verify_per_key_checksum_on_seek (Sets CF option
+      memtable_verify_per_key_checksum_on_seek) type: bool default: false
+    -memtable_whole_key_filtering (Try to use whole key bloom filter in
+      memtables.) type: bool default: false
+    -memtablerep () type: string default: "skip_list"
+    -merge_keys (Number of distinct keys to use for MergeRandom and
+      ReadRandomMergeRandom. If negative, there will be FLAGS_num keys.)
+      type: int64 default: -1
+    -merge_operator (The merge operator to use with the database.If a new merge
+      operator is specified, be sure to use fresh database The possible merge
+      operators are defined in utilities/merge_operators.h) type: string
+      default: ""
+    -mergereadpercent (Ratio of merges to merges&reads (expressed as
+      percentage) for the ReadRandomMergeRandom workload. The default value 70
+      means 70% out of all read and merge operations are merges. In other
+      words, 7 merges for every 3 gets.) type: int32 default: 70
+    -metadata_block_size (Max partition size when partitioning index/filters)
+      type: int64 default: 4096
+    -min_blob_size ([Integrated BlobDB] The size of the smallest value to be
+      stored separately in a blob file.) type: uint64 default: 0
+    -min_level_to_compress (If non-negative, compression starts from this
+      level. Levels with number < min_level_to_compress are not compressed.
+      Otherwise, apply compression_type to all levels.) type: int32 default: -1
+    -min_tombstones_for_range_conversion (Setting for CF option
+      min_tombstones_for_range_conversion.) type: uint32 default: 0
+    -min_write_buffer_number_to_merge (The minimum number of write buffers that
+      will be merged togetherbefore writing to storage. This is cheap because
+      it is anin-memory merge. If this feature is not enabled, then all
+      thesewrite buffers are flushed to L0 as separate files and this increases
+      read amplification because a get request has to check in all of these
+      files. Also, an in-memory merge may result in writing less data to
+      storage if there are duplicate records  in each of these individual write
+      buffers.) type: int32 default: 1
+    -mix_accesses (The total query accesses of mix_graph workload) type: int64
+      default: -1
+    -mix_get_ratio (The ratio of Get queries of mix_graph workload)
+      type: double default: 1
+    -mix_max_scan_len (The max scan length of Iterator) type: int64
+      default: 10000
+    -mix_max_value_size (The max value size of this workload) type: int64
+      default: 1024
+    -mix_put_ratio (The ratio of Put queries of mix_graph workload)
+      type: double default: 0
+    -mix_seek_ratio (The ratio of Seek queries of mix_graph workload)
+      type: double default: 0
+    -mmap_read (Allow reads to occur via mmap-ing files) type: bool
+      default: false
+    -mmap_write (Allow writes to occur via mmap-ing files) type: bool
+      default: false
+    -multiread_batched (Use the new MultiGet API) type: bool default: false
+    -multiread_stride (Stride length for the keys in a MultiGet batch)
+      type: int64 default: 0
+    -multiscan_coalesce_threshold (Configures io coalescing threshold for
+      multiscans) type: uint64 default: 16384
+    -multiscan_max_prefetch_size (Maximum per-file prefetch size (in bytes) for
+      MultiScan. Limits cumulative compressed data block size pinned per SST
+      file. 0 means unlimited.) type: uint64 default: 0
+    -multiscan_size (MultiScan size - number of multiscans of size
+      `batch_size`) type: int64 default: 10
+    -multiscan_stride (The amount of keys between two successive Scan
+      operations in multiscan) type: int64 default: 100
+    -multiscan_use_async_io (Sets MultiScanArgs::use_async_io) type: bool
+      default: false
+    -num (Number of key/values to place in database) type: int64
+      default: 1000000
+    -num_bottom_pri_threads (The number of threads in the bottom-priority
+      thread pool (used by universal compaction only).) type: int32 default: 0
+    -num_column_families (Number of Column Families to use.) type: int32
+      default: 1
+    -num_deletion_threads (Number of threads to do deletion (used in TimeSeries
+      and delete expire_style only).) type: int32 default: 1
+    -num_file_reads_for_auto_readahead (Rocksdb implicit readahead is enabled
+      if reads are sequential and num_file_reads_for_auto_readahead indicates
+      after how many sequential reads into that file internal auto prefetching
+      should be start.) type: uint64 default: 2
+    -num_high_pri_threads (The maximum number of concurrent background
+      compactions that can occur in parallel.) type: int32 default: 0
+    -num_hot_column_families (Number of Hot Column Families. If more than 0,
+      only write to this number of column families. After finishing all the
+      writes to them, create new set of column families and insert to them.
+      Only used when num_column_families > 1.) type: int32 default: 0
+    -num_levels (The total number of levels) type: int32 default: 7
+    -num_low_pri_threads (The maximum number of concurrent background
+      compactions that can occur in parallel.) type: int32 default: 0
+    -num_multi_db (Number of DBs used in the benchmark. 0 means single DB.)
+      type: int32 default: 0
+    -numdistinct (Number of distinct keys to use. Used in RandomWithVerify to
+      read/write on fewer keys so that gets are more likely to find the key and
+      puts are more likely to update the same key) type: int64 default: 1000
+    -open_as_follower (Open a RocksDB DB as a follower. The leader instance can
+      be running in another db_bench process.) type: bool default: false
+    -open_files (Maximum number of files to keep open at the same time (use
+      default if == 0)) type: int32 default: -1
+    -open_files_async (Open SST files asynchronously during DB open) type: bool
+      default: false
+    -openandcompact_allow_resumption (Whether to keep existing progress and
+      enable resume compaction in OpenAndCompact benchmark) type: bool
+      default: false
+    -openandcompact_cancel_after_millseconds (Time to wait before cancelling
+      compaction in odd runs when openandcompact_test_cancel_on_odd is true)
+      type: uint32 default: 1
+    -openandcompact_test_cancel_on_odd (During OpenAndCompact[Xn], odd runs
+      gets cancelled after specified `openandcompact_cancel_after_millseconds`)
+      type: bool default: false
+    -ops_between_duration_checks (Check duration limit every x ops) type: int32
+      default: 1000
+    -optimistic_transaction_db (Open a OptimisticTransactionDB instance.
+      Required for randomtransaction benchmark.) type: bool default: false
+    -optimize_filters_for_hits (Optimizes bloom filters for workloads for most
+      lookups return a value. For now this doesn't create bloom filters for the
+      max level of the LSM to reduce metadata that should fit in RAM. )
+      type: bool default: false
+    -optimize_filters_for_memory (Minimize memory footprint of filters)
+      type: bool default: true
+    -optimize_multiget_for_io (When set true, RocksDB does asynchronous reads
+      for SST files in multiple levels for MultiGet.) type: bool default: true
+    -options_file (The path to a RocksDB options file.  If specified, then
+      db_bench will run with the RocksDB options in the default column family
+      of the specified options file. Note that with this setting, db_bench will
+      ONLY accept the following RocksDB options related command-line arguments,
+      all other arguments that are related to RocksDB options will be ignored:
+      	--use_existing_db
+      	--use_existing_keys
+      	--statistics
+      	--row_cache_size
+      	--row_cache_numshardbits
+      	--enable_io_prio
+      	--dump_malloc_stats
+      	--num_multi_db
+      ) type: string default: ""
+    -overwrite_probability (Used in 'filluniquerandom' benchmark: for each
+      write operation, we give a probability to perform an overwrite instead.
+      The key used for the overwrite is randomly chosen from the last
+      'overwrite_window_size' keys previously inserted into the DB. Valid
+      overwrite_probability values: [0.0, 1.0].) type: double default: 0
+    -overwrite_window_size (Used in 'filluniquerandom' benchmark. For each
+      write operation, when the overwrite_probability flag is set by the user,
+      the key used to perform an overwrite is randomly chosen from the last
+      'overwrite_window_size' keys previously inserted into DB. Warning: large
+      values can affect throughput. Valid overwrite_window_size values: [1,
+      kMaxUint32].) type: uint32 default: 1
+    -paranoid_checks (RocksDB will aggressively check consistency of the data.)
+      type: bool default: true
+    -paranoid_memory_checks (Sets CF option paranoid_memory_checks) type: bool
+      default: false
+    -partition_index (Partition index blocks) type: bool default: false
+    -partition_index_and_filters (Partition index and filter blocks.)
+      type: bool default: false
+    -perf_level (Level of perf collection) type: int32 default: 1
+    -periodic_compaction_seconds (Files older than this will be picked up for
+      compaction and rewritten to the same level) type: uint64
+      default: 18446744073709551614
+    -persist_stats_to_disk (whether to persist stats to disk) type: bool
+      default: false
+    -persistent_entries_batch_size (Number of KV entries being inserted right
+      before the deletes targeting the disposable KV entries are issued. These
+      persistent keys are not targeted by the deletes, and will always remain
+      valid in the DB. (only compatible with
+      --benchmarks='fillanddeleteuniquerandom' and used
+      when--disposable_entries_batch_size is > 0).) type: uint64 default: 0
+    -persistent_entries_value_size (Size of the values (in bytes) of the
+      entries not targeted by deletes. (only compatible with
+      --benchmarks='fillanddeleteuniquerandom' and used
+      when--disposable_entries_batch_size is > 0).) type: int32 default: 64
+    -pin_l0_filter_and_index_blocks_in_cache (Pin index/filter blocks of L0
+      files in block cache.) type: bool default: false
+    -pin_top_level_index_and_filter (Pin top-level index of partitioned
+      index/filter blocks in block cache.) type: bool default: false
+    -preclude_last_level_data_seconds (Preclude the latest data from the last
+      level. (Used for tiered storage)) type: int64 default: 0
+    -prefix_same_as_start (Enforce iterator to return keys with prefix same as
+      seek key.) type: bool default: false
+    -prefix_size (control the prefix size for HashSkipList and plain table)
+      type: int32 default: 0
+    -prepopulate_blob_cache ([Integrated BlobDB] Pre-populate hot/warm blobs in
+      blob cache. 0 to disable and 1 to insert during flush.) type: int32
+      default: 0
+    -prepopulate_block_cache (Pre-populate hot/warm blocks in block cache. 0 to
+      disable, 1 to insert during flush, and 2 to insert during flush and
+      compaction) type: int64 default: 0
+    -preserve_internal_time_seconds (Preserve the internal time information
+      which stores with SST.) type: int64 default: 0
+    -print_malloc_stats (Print malloc stats to stdout after benchmarks finish.)
+      type: bool default: false
+    -progress_reports (If true, db_bench will report number of finished
+      operations.) type: bool default: true
+    -range_tombstone_width (Number of keys in tombstone's range) type: int64
+      default: 100
+    -rate_limit_auto_wal_flush (When true use Env::IO_USER priority level to
+      charge internal rate limiter for automatic WAL flush
+      (`Options::manual_wal_flush` == false) after the user write operation.)
+      type: bool default: false
+    -rate_limit_bg_reads (Use options.rate_limiter on compaction reads)
+      type: bool default: false
+    -rate_limit_user_ops (When true use Env::IO_USER priority level to charge
+      internal rate limiter for reads associated with user operations.)
+      type: bool default: false
+    -rate_limiter_auto_tuned (Enable dynamic adjustment of rate limit according
+      to demand for background I/O) type: bool default: false
+    -rate_limiter_bytes_per_sec (Set options.rate_limiter value.) type: uint64
+      default: 0
+    -rate_limiter_refill_period_us (Set refill period on rate limiter.)
+      type: int64 default: 100000
+    -rate_limiter_single_burst_bytes (Set single burst bytes on background I/O
+      rate limiter.) type: int64 default: 0
+    -read_amp_bytes_per_bit (Number of bytes per bit to be used in block
+      read-amp bitmap) type: int32 default: 0
+    -read_cache_direct_read (Whether to use Direct IO for reading from read
+      cache) type: bool default: true
+    -read_cache_direct_write (Whether to use Direct IO for writing to the read
+      cache) type: bool default: true
+    -read_cache_path (If not empty string, a read cache will be used in this
+      path) type: string default: ""
+    -read_cache_size (Maximum size of the read cache) type: int64
+      default: 4294967296
+    -read_random_exp_range (Read random's key will be generated using
+      distribution of num * exp(-r) where r is uniform number from 0 to this
+      value. The larger the number is, the more skewed the reads are. Only used
+      in readrandom and multireadrandom benchmarks.) type: double default: 0
+    -read_triggered_compaction_threshold (Threshold for read-triggered
+      compaction. An SST file is marked for compaction when its sampled read
+      frequency (sampled_reads / file_size) exceeds this value. Collapsible
+      reads (NotFound, Merge, Delete results) are sampled. 0 disables the
+      feature.) type: double default: 0
+    -read_with_latest_user_timestamp (If true, always use the current latest
+      timestamp for read. If false, choose a random timestamp from the past.)
+      type: bool default: true
+    -readahead_size (Iterator readahead size) type: int32 default: 0
+    -readonly (Run read only benchmarks.) type: bool default: false
+    -reads (Number of read operations to do.  If negative, do FLAGS_num reads.)
+      type: int64 default: -1
+    -readwritepercent (Ratio of reads to reads/writes (expressed as percentage)
+      for the ReadRandomWriteRandom workload. The default value 90 means 90%
+      operations out of all reads and writes operations are reads. In other
+      words, 9 gets for every 1 put.) type: int32 default: 90
+    -report_bg_io_stats (Measure times spents on I/Os while in compactions. )
+      type: bool default: false
+    -report_file (Filename where some simple stats are reported to (if
+      --report_interval_seconds is bigger than 0)) type: string
+      default: "report.csv"
+    -report_file_operations (if report number of file operations) type: bool
+      default: false
+    -report_interval_seconds (If greater than zero, it will write simple stats
+      in CSV format to --report_file every N seconds) type: int64 default: 0
+    -report_open_timing (if report open timing) type: bool default: false
+    -restore_dir (If not empty string, use the given dir for restore.)
+      type: string default: ""
+    -restore_rate_limit (If non-zero, db_bench will rate limit reads and writes
+      for DB restore. This is the global rate in ops/second.) type: uint64
+      default: 0
+    -reverse_iterator (When true use Prev rather than Next for iterators that
+      do Seek and then Next) type: bool default: false
+    -row_cache_size (Number of bytes to use as a cache of individual rows (0 =
+      disabled).) type: int64 default: 0
+    -same_value_percentage (Percentage of time value will be same i.e good for
+      compression of the block) type: int32 default: 0
+    -sample_for_compression (Sample every N block for compression) type: int64
+      default: 0
+    -secondary_cache_uri (Full URI for creating a custom secondary cache
+      object) type: string default: ""
+    -secondary_path (Path to a directory used by the secondary instance to
+      store private files, e.g. info log.) type: string default: ""
+    -secondary_update_interval (Secondary instance attempts to catch up with
+      the primary every secondary_update_interval seconds.) type: int32
+      default: 5
+    -seed (Seed base for random number generators. When 0 it is derived from
+      the current time.) type: int64 default: 0
+    -seek_missing_prefix (Iterator seek to keys with non-exist prefixes.
+      Require prefix_size > 8) type: bool default: false
+    -seek_nexts (How many times to call Next() after Seek() in fillseekseq,
+      seekrandom, seekrandomwhilewriting and seekrandomwhilemerging)
+      type: int32 default: 0
+    -seek_nexts_to_delete (After completing seek_nexts iterations in
+      seekrandom, delete this many subsequent keys via point deletes. Useful
+      for benchmarking read-path range tombstone insertion.) type: int32
+      default: 0
+    -separate_key_value_in_data_block (If true, data blocks store keys and
+      values separately.) type: bool default: false
+    -show_table_properties (If true, then per-level table properties will be
+      printed on every stats-interval when stats_interval is set and
+      stats_per_interval is on.) type: bool default: false
+    -simcache_size (Number of bytes to use as a simcache of uncompressed data.
+      Nagative value disables simcache.) type: int64 default: -1
+    -simulate_hdd (Simulate read/write latency on HDD.) type: bool
+      default: false
+    -simulate_hybrid_fs_file (File for Store Metadata for Simulate hybrid FS.
+      Empty means disable the feature. Now, if it is set,
+      last_level_temperature is set to kWarm.) type: string default: ""
+    -simulate_hybrid_hdd_multipliers (In simulate_hybrid_fs_file or
+      simulate_hdd mode, how many HDDs are simulated.) type: int32 default: 1
+    -sine_a (A in f(x) = A sin(bx + c) + d) type: double default: 1
+    -sine_b (B in f(x) = A sin(bx + c) + d) type: double default: 1
+    -sine_c (C in f(x) = A sin(bx + c) + d) type: double default: 0
+    -sine_d (D in f(x) = A sin(bx + c) + d) type: double default: 1
+    -sine_mix_rate (Enable the sine QPS control on the mix workload) type: bool
+      default: false
+    -sine_mix_rate_interval_milliseconds (Interval of which the sine wave
+      read_rate_limit is recalculated) type: uint64 default: 10000
+    -sine_mix_rate_noise (Add the noise ratio to the sine rate, it is between
+      0.0 and 1.0) type: double default: 0
+    -sine_write_rate (Use a sine wave write_rate_limit) type: bool
+      default: false
+    -sine_write_rate_interval_milliseconds (Interval of which the sine wave
+      write_rate_limit is recalculated) type: uint64 default: 10000
+    -skip_list_lookahead (Used with skip_list memtablerep; try linear search
+      first for this many steps from the previous position) type: int32
+      default: 0
+    -skip_stats_update_on_db_open (Skip loading table properties to update
+      stats during DB open) type: bool default: false
+    -slow_usecs (A message is printed for operations that take at least this
+      many microseconds.) type: uint64 default: 1000000
+    -soft_pending_compaction_bytes_limit (Slowdown writes if pending compaction
+      bytes exceed this number) type: uint64 default: 68719476736
+    -statistics (Database statistics) type: bool default: false
+    -statistics_string (Serialized statistics string) type: string default: ""
+    -stats_dump_period_sec (Gap between printing stats to log in seconds)
+      type: uint64 default: 600
+    -stats_history_buffer_size (Max number of stats snapshots to keep in
+      memory) type: uint64 default: 1048576
+    -stats_interval (Stats are reported every N operations when this is greater
+      than zero. When 0 the interval grows over time.) type: int64 default: 0
+    -stats_interval_seconds (Report stats every N seconds. This overrides
+      stats_interval when both are > 0.) type: int64 default: 0
+    -stats_level (stats level for statistics) type: int32 default: 3
+    -stats_per_interval (Reports additional stats per interval when this is
+      greater than 0.) type: int32 default: 0
+    -stats_persist_period_sec (Gap between persisting stats in seconds)
+      type: uint64 default: 600
+    -stddev (Standard deviation of normal distribution used for picking keys
+      (used in RandomReplaceKeys only).) type: double default: 2000
+    -strict_max_successive_merges (Whether to issue filesystem reads to keep
+      within `max_successive_merges` limit) type: bool default: false
+    -subcompactions (For CompactRange, set max_subcompactions for each
+      compaction job in this CompactRange, for auto compactions, this is
+      Maximum number of subcompactions to divide L0-L1 compactions into.)
+      type: uint64 default: 1
+    -super_block_alignment_size (Configure super block size) type: uint64
+      default: 0
+    -super_block_alignment_space_overhead_ratio (Configure space overhead for
+      super block alignment) type: uint64 default: 128
+    -sync (Sync all writes to disk) type: bool default: false
+    -table_cache_numshardbits () type: int32 default: 4
+    -target_file_size_base (Target file size at level-1) type: int64
+      default: 67108864
+    -target_file_size_multiplier (A multiplier to compute target level-N file
+      size (N >= 2)) type: int32 default: 1
+    -thread_status_per_interval (Takes and report a snapshot of the current
+      status of each thread when this is greater than 0.) type: int32
+      default: 0
+    -threads (Number of concurrent threads to run.) type: int32 default: 1
+    -tiered_adm_policy (Admission policy to use for the secondary cache(s) in
+      the tiered cache. Allowed values are auto, placeholder, allow_cache_hits,
+      and three_queue.) type: string default: "auto"
+    -time_range (Range of timestamp that store in the database (used in
+      TimeSeries only).) type: uint64 default: 100000
+    -total_order_seek (Enable total order seek regardless of index format.)
+      type: bool default: false
+    -trace_file (Trace workload to a file. ) type: string default: ""
+    -trace_replay_fast_forward (Fast forward trace replay, must > 0.0.)
+      type: double default: 1
+    -trace_replay_threads (The number of threads to replay, must >=1.)
+      type: int32 default: 1
+    -track_and_verify_wals (See Options.track_and_verify_wals) type: bool
+      default: false
+    -track_and_verify_wals_in_manifest (If true, enable WAL tracking in the
+      MANIFEST) type: bool default: false
+    -transaction_db (Open a TransactionDB instance. Required for
+      randomtransaction benchmark.) type: bool default: false
+    -transaction_lock_timeout (If using a transaction_db, specifies the lock
+      wait timeout in milliseconds before failing a transaction waiting on a
+      lock) type: uint64 default: 100
+    -transaction_set_snapshot (Setting to true will have each transaction call
+      SetSnapshot() upon creation.) type: bool default: false
+    -transaction_sets (Number of keys each transaction will modify (use in
+      RandomTransaction only).  Max: 9999) type: uint64 default: 2
+    -transaction_sleep (Max microseconds to sleep in between reading and
+      writing a value (used in RandomTransaction only). ) type: int32
+      default: 0
+    -truth_db (Truth key/values used when using verify) type: string
+      default: "/dev/shm/truth_db/dbbench"
+    -ttl_seconds (Set options.ttl) type: uint64 default: 18446744073709551614
+    -twitter_chunk_bytes (Twitter trace progress reporting interval in input
+      text bytes. 0 means report only at EOF.) type: uint64
+      default: 10737418240
+    -twitter_queue_bytes (Maximum bytes of Twitter trace text buffered between
+      reader and replayer. 0 means unbounded.) type: uint64 default: 268435456
+    -twitter_trace_file (Path to Twitter trace file. Expected CSV format:
+      timestamp,key,key_size,value_size,client_id,op,ttl.) type: string
+      default: ""
+    -twittertrace_put_limit (Stop twittertrace after this many replayed put
+      operations. 0 means no limit.) type: uint64 default: 0
+    -twittertrace_skip_reads (Skip Get ops in twittertrace, replaying writes
+      only.) type: bool default: false
+    -uncache_aggressiveness (Aggressiveness of erasing cache entries that are
+      likely obsolete. 0 = disabled, 1 = minimum, 100 = moderate, 10000 =
+      normal max) type: uint32 default: 0
+    -uniform_cv_threshold (Coefficient of variation threshold for determining
+      if keys in an index block are uniformly distributed.) type: double
+      default: -1
+    -universal_allow_trivial_move (Allow trivial move in universal compaction.)
+      type: bool default: false
+    -universal_compression_size_percent (The percentage of the database to
+      compress for universal compaction. -1 means compress everything.)
+      type: int32 default: -1
+    -universal_incremental (Enable incremental compactions in universal
+      compaction.) type: bool default: false
+    -universal_max_merge_width (The max number of files to compact in universal
+      style compaction) type: int32 default: 0
+    -universal_max_read_amp (The limit on the number of sorted runs)
+      type: int32 default: -1
+    -universal_max_size_amplification_percent (The max size amplification for
+      universal style compaction) type: int32 default: 0
+    -universal_min_merge_width (The minimum number of files in a single
+      compaction run (for universal compaction only).) type: int32 default: 0
+    -universal_reduce_file_locking (See
+      Options().compaction_options_universal.reduce_file_locking) type: bool
+      default: true
+    -universal_size_ratio (Percentage flexibility while comparing file size
+      (for universal compaction only).) type: int32 default: 0
+    -universal_stop_style (Universal compaction stop style.) type: int32
+      default: 1
+    -unordered_write (Enable the unordered write feature, which provides higher
+      throughput but relaxes the guarantees around atomic reads and immutable
+      snapshots) type: bool default: false
+    -use_adaptive_mutex (Use adaptive mutex) type: bool default: false
+    -use_blob_cache ([Integrated BlobDB] Enable blob cache.) type: bool
+      default: false
+    -use_blob_db ([Stacked BlobDB] Open a BlobDB instance.) type: bool
+      default: false
+    -use_cache_jemalloc_no_dump_allocator (Use JemallocNodumpAllocator for
+      block/blob cache.) type: bool default: false
+    -use_cache_memkind_kmem_allocator (Use memkind kmem allocator for
+      block/blob cache.) type: bool default: false
+    -use_compressed_secondary_cache (Use the CompressedSecondaryCache as the
+      secondary cache.) type: bool default: false
+    -use_cuckoo_table (if use cuckoo table format) type: bool default: false
+    -use_data_block_hash_index (if use kDataBlockBinaryAndHash instead of
+      kDataBlockBinarySearch. This is valid if only we use BlockTable)
+      type: bool default: false
+    -use_direct_io_for_compaction_reads (Use O_DIRECT for compaction-input SST
+      reads only, while keeping user reads buffered) type: bool default: false
+    -use_direct_io_for_flush_and_compaction (Use O_DIRECT for background flush
+      and compaction writes) type: bool default: false
+    -use_direct_reads (Use O_DIRECT for reading data) type: bool default: false
+    -use_existing_db (If true, do not destroy the existing database.  If you
+      set this flag and also specify a benchmark that wants a fresh database,
+      that benchmark will fail.) type: bool default: false
+    -use_existing_keys (If true, uses existing keys in the DB, rather than
+      generating new ones. This involves some startup latency to load all keys
+      into memory. It is supported for the same read/overwrite benchmarks as
+      `-use_existing_db=true`, which must also be set for this flag to be
+      enabled. When this flag is set, the value for `-num` will be ignored.)
+      type: bool default: false
+    -use_fsync (If true, issue fsync instead of fdatasync) type: bool
+      default: false
+    -use_hash_search (if use kHashSearch instead of kBinarySearch. This is
+      valid if only we use BlockTable) type: bool default: false
+    -use_keep_filter (Whether to use a noop compaction filter) type: bool
+      default: false
+    -use_multiscan (If true, multiscanrandom uses MultiScan API. If false, uses
+      normal iterators (Seek + Next) for each range.) type: bool default: true
+    -use_plain_table (if use plain table instead of block-based table format)
+      type: bool default: false
+    -use_ribbon_filter (Use Ribbon instead of Bloom filter) type: bool
+      default: false
+    -use_secondary_db (Open a RocksDB secondary instance. A primary instance
+      can be running in another db_bench process.) type: bool default: false
+    -use_shared_block_and_blob_cache ([Integrated BlobDB] Use a shared backing
+      cache for both block cache and blob cache. It only takes effect if
+      use_blob_cache is enabled.) type: bool default: true
+    -use_single_deletes (Use single deletes (used in RandomReplaceKeys only).)
+      type: bool default: true
+    -use_stderr_info_logger (Write info logs to stderr instead of to LOG file.
+      ) type: bool default: false
+    -use_tailing_iterator (Use tailing iterator to access a series of keys
+      instead of get) type: bool default: false
+    -use_tiered_cache (If use_compressed_secondary_cache is true and
+      use_tiered_volatile_cache is true, then allocate a tiered cache that
+      distributes cache reservations proportionally over both the caches.)
+      type: bool default: false
+    -use_trie_index (Use trie-based user-defined index (UDI) for block-based
+      tables. Builds a LOUDS-encoded succinct trie from separator keys,
+      providing space reduction compared to the default binary search index.
+      Requires BytewiseComparator.) type: bool default: false
+    -use_uint64_comparator (use Uint64 user comparator) type: bool
+      default: false
+    -user_timestamp_size (number of bytes in a user-defined timestamp)
+      type: int32 default: 0
+    -value_k (The parameter 'k' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double
+      default: 0.26150000000000001
+    -value_sigma (The parameter 'theta' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double
+      default: 25.449999999999999
+    -value_size (Size of each value in fixed distribution) type: int32
+      default: 100
+    -value_size_distribution_type (Value size distribution type: fixed,
+      uniform, normal) type: string default: "fixed"
+    -value_size_max (Max size of random value) type: int32 default: 102400
+    -value_size_min (Min size of random value) type: int32 default: 100
+    -value_theta (The parameter 'theta' of Generized Pareto Distribution
+      f(x)=(1/sigma)*(1+k*(x-theta)/sigma)^-(1/k+1)) type: double default: 0
+    -verify_checksum (Verify checksum for every block read from storage)
+      type: bool default: true
+    -verify_compression (See BlockBasedTableOptions::verify_compression)
+      type: bool default: false
+    -verify_manifest_content_on_close (If true, verify MANIFEST content (CRC +
+      decode) on DB close) type: bool default: false
+    -wal_bytes_per_sync (Allows OS to incrementally sync WAL files to disk
+      while they are being written, in the background. Issue one request for
+      every wal_bytes_per_sync written. 0 turns it off.) type: uint64
+      default: 0
+    -wal_compression (Algorithm to use for WAL compression. none to disable.)
+      type: string default: "none"
+    -wal_dir (If not empty, use the given dir for WAL) type: string default: ""
+    -wal_size_limit_MB (Set the size limit for the WAL Files in MB.)
+      type: uint64 default: 0
+    -wal_ttl_seconds (Set the TTL for the WAL Files in seconds.) type: uint64
+      default: 0
+    -whole_key_filtering (Use whole keys (in addition to prefixes) in SST bloom
+      filter.) type: bool default: true
+    -writable_file_max_buffer_size (Maximum write buffer for Writable File)
+      type: int32 default: 1048576
+    -write_batch_protection_bytes_per_key (Size of per-key-value checksum in
+      each write batch. Currently only value 0 and 8 are supported.)
+      type: uint32 default: 0
+    -write_buffer_size (Number of bytes to buffer in memtable before
+      compacting) type: int64 default: 67108864
+    -write_thread_max_yield_usec (Maximum microseconds for
+      enable_write_thread_adaptive_yield operation.) type: uint64 default: 100
+    -write_thread_slow_yield_usec (The threshold at which a slow yield is
+      considered a signal that other processes or threads want the core.)
+      type: uint64 default: 3
+    -writes (Number of write operations to do. If negative, do --num reads.)
+      type: int64 default: -1
+    -writes_before_delete_range (Number of writes before DeleteRange is called
+      regularly.) type: int64 default: 0
+    -writes_per_range_tombstone (Number of writes between range tombstones)
+      type: int64 default: 0
+    -zipf_const (Zipfian constant for Zipf distribution) type: double
+      default: 0.98999999999999999

@@ -19,6 +19,7 @@
 
 #include "db/blob/blob_file_completion_callback.h"
 #include "db/column_family.h"
+#include "db/compaction/compaction_iteration_stats.h"
 #include "db/flush_scheduler.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
@@ -207,6 +208,10 @@ class FlushJob {
   Statistics* stats_;
   EventLogger* event_logger_;
   TableProperties table_properties_;
+  CompactionIterationStats flush_iteration_stats_;
+  uint64_t flush_input_records_ = 0;
+  uint64_t flush_output_records_ = 0;
+  uint64_t flush_dropped_records_ = 0;
   bool measure_io_stats_;
   // True if this flush job should call fsync on the output directory. False
   // otherwise.

@@ -91,7 +91,8 @@ Status BuildTable(
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
     InternalStats::CompactionStats* flush_stats,
-    std::vector<BlobFileGarbage>* blob_file_garbages, bool fast_sst_open) {
+    std::vector<BlobFileGarbage>* blob_file_garbages, bool fast_sst_open,
+    CompactionIterationStats* compaction_iteration_stats) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -368,8 +369,18 @@ Status BuildTable(
     const bool empty = builder->IsEmpty();
     if (flush_stats) {
       assert(c_iter.HasNumInputEntryScanned());
+      const CompactionIterationStats& ci_stats = c_iter.iter_stats();
       flush_stats->num_input_records =
           c_iter.NumInputEntryScanned() + num_unfragmented_tombstones;
+      const int64_t num_dropped_records = ci_stats.num_record_drop_user +
+                                          ci_stats.num_record_drop_hidden +
+                                          ci_stats.num_record_drop_obsolete;
+      flush_stats->num_dropped_records =
+          num_dropped_records > 0 ? static_cast<uint64_t>(num_dropped_records)
+                                  : 0;
+    }
+    if (compaction_iteration_stats != nullptr) {
+      *compaction_iteration_stats = c_iter.iter_stats();
     }
     if (!s.ok() || empty) {
       builder->Abandon();

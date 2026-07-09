@@ -32,7 +32,9 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -92,6 +94,7 @@
 #include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "util/xxhash.h"
+#include "util/zipf.h"
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/counted_fs.h"
 #include "utilities/merge_operators.h"
@@ -166,6 +169,8 @@ DEFINE_string(
     "readrandomoperands,"
     "backup,"
     "restore,"
+    "fillzipf,"
+    "testzipf,"
     "openandcompact,"
     "approximatememtablestats",
 
@@ -268,6 +273,10 @@ DEFINE_string(
     "Rate limit can be specified through --backup_rate_limit\n"
     "\trestore -- Restore the DB from the latest backup available, rate limit "
     "can be specified through --restore_rate_limit\n"
+    "\tfillzipf -- write N values using a Zipfian key distribution\n"
+    "\ttestzipf -- Print a sample Zipf distribution using --zipf_const\n"
+    "\ttwittertrace -- Replay Twitter cache trace CSV from "
+    "--twitter_trace_file\n"
     "\tapproximatememtablestats -- Tests accuracy of "
     "GetApproximateMemTableStats, ideally\n"
     "after fillrandom, where actual answer is batch_size");
@@ -392,6 +401,11 @@ DEFINE_int32(user_timestamp_size, 0,
 
 DEFINE_int32(num_multi_db, 0,
              "Number of DBs used in the benchmark. 0 means single DB.");
+
+DEFINE_double(zipf_const, 0.99, "Zipfian constant for Zipf distribution");
+
+DEFINE_int64(zipf_key_range, 0,
+             "Key range for fillzipf. 0 means use --num as the key range.");
 
 DEFINE_double(compression_ratio, 0.5,
               "Arrange to generate values that shrink to this fraction of "
@@ -903,6 +917,9 @@ DEFINE_bool(statistics, false, "Database statistics");
 DEFINE_int32(stats_level, ROCKSDB_NAMESPACE::StatsLevel::kExceptDetailedTimers,
              "stats level for statistics");
 DEFINE_string(statistics_string, "", "Serialized statistics string");
+DEFINE_bool(report_flush_dropped_garbage, false,
+            "Print per-flush and total records dropped by flush-time "
+            "deduplication/filtering.");
 static class std::shared_ptr<ROCKSDB_NAMESPACE::Statistics> dbstats;
 
 DEFINE_int64(writes, -1,
@@ -1765,6 +1782,14 @@ DEFINE_uint64(
 DEFINE_int64(mix_accesses, -1,
              "The total query accesses of mix_graph workload");
 
+DEFINE_bool(mix_skip_reads, false,
+            "For mixgraph, skip Get and Seek operations and execute only Put "
+            "operations selected by the mix distribution.");
+
+DEFINE_int64(mix_put_limit, 0,
+             "For mixgraph, stop after this many Put operations. 0 means no "
+             "Put-specific limit.");
+
 DEFINE_uint64(
     benchmark_read_rate_limit, 0,
     "If non-zero, db_bench will rate-limit the reads from RocksDB. This "
@@ -2005,6 +2030,26 @@ DEFINE_bool(build_info, false,
 
 DEFINE_bool(track_and_verify_wals_in_manifest, false,
             "If true, enable WAL tracking in the MANIFEST");
+
+DEFINE_string(twitter_trace_file, "",
+              "Path to Twitter trace file. Expected CSV format: "
+              "timestamp,key,key_size,value_size,client_id,op,ttl.");
+
+DEFINE_uint64(twitter_chunk_bytes, 10ULL * 1024 * 1024 * 1024,
+              "Twitter trace progress reporting interval in input text bytes. "
+              "0 means report only at EOF.");
+
+DEFINE_uint64(
+    twitter_queue_bytes, 256ULL * 1024 * 1024,
+    "Maximum bytes of Twitter trace text buffered between reader and replayer. "
+    "0 means unbounded.");
+
+DEFINE_bool(twittertrace_skip_reads, false,
+            "Skip Get ops in twittertrace, replaying writes only.");
+
+DEFINE_uint64(twittertrace_put_limit, 0,
+              "Stop twittertrace after this many replayed put operations. "
+              "0 means no limit.");
 
 DEFINE_bool(track_and_verify_wals, false, "See Options.track_and_verify_wals");
 
@@ -3191,6 +3236,57 @@ class Benchmark {
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
 
+  struct TwitterTraceRecord {
+    uint64_t timestamp = 0;
+    std::string key;
+    uint32_t key_size = 0;
+    uint32_t value_size = 0;
+    uint32_t client_id = 0;
+    std::string op;
+    uint32_t ttl = 0;
+  };
+
+  bool ParseTwitterTraceLine(const std::string& line, TwitterTraceRecord* rec) {
+    if (line.empty()) {
+      return false;
+    }
+
+    std::vector<std::string> cols;
+    cols.reserve(7);
+
+    size_t start = 0;
+    while (true) {
+      size_t pos = line.find(',', start);
+      if (pos == std::string::npos) {
+        cols.emplace_back(line.substr(start));
+        break;
+      }
+      cols.emplace_back(line.substr(start, pos - start));
+      start = pos + 1;
+      if (cols.size() > 7) {
+        break;
+      }
+    }
+
+    if (cols.size() != 7) {
+      return false;
+    }
+
+    try {
+      rec->timestamp = static_cast<uint64_t>(std::stoull(cols[0]));
+      rec->key = cols[1];
+      rec->key_size = static_cast<uint32_t>(std::stoul(cols[2]));
+      rec->value_size = static_cast<uint32_t>(std::stoul(cols[3]));
+      rec->client_id = static_cast<uint32_t>(std::stoul(cols[4]));
+      rec->op = cols[5];
+      rec->ttl = static_cast<uint32_t>(std::stoul(cols[6]));
+    } catch (...) {
+      return false;
+    }
+
+    return true;
+  }
+
   class ErrorHandlerListener : public EventListener {
    public:
     ErrorHandlerListener()
@@ -3239,7 +3335,62 @@ class Benchmark {
     bool recovery_complete_;
   };
 
+  class FlushDroppedGarbageStatsListener : public EventListener {
+   public:
+    const char* Name() const override { return kClassName(); }
+    static const char* kClassName() {
+      return "FlushDroppedGarbageStatsListener";
+    }
+
+    void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& info) override {
+      std::lock_guard<std::mutex> lock(mutex_);
+      flushes_++;
+      input_records_ += info.flush_input_records;
+      output_records_ += info.flush_output_records;
+      dropped_records_ += info.flush_dropped_records;
+      dropped_hidden_records_ += info.flush_dropped_hidden_records;
+      dropped_obsolete_records_ += info.flush_dropped_obsolete_records;
+      dropped_user_records_ += info.flush_dropped_user_records;
+      dropped_range_del_records_ += info.flush_dropped_range_del_records;
+
+      fprintf(stdout,
+              "FLUSH_DROPPED_GARBAGE job=%d file=%" PRIu64 " input=%" PRIu64
+              " output=%" PRIu64 " dropped=%" PRIu64 " hidden=%" PRIu64
+              " obsolete=%" PRIu64 " user=%" PRIu64 " range_del=%" PRIu64 "\n",
+              info.job_id, info.file_number, info.flush_input_records,
+              info.flush_output_records, info.flush_dropped_records,
+              info.flush_dropped_hidden_records,
+              info.flush_dropped_obsolete_records,
+              info.flush_dropped_user_records,
+              info.flush_dropped_range_del_records);
+    }
+
+    void PrintSummary() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      fprintf(stdout,
+              "FLUSH_DROPPED_GARBAGE_TOTAL flushes=%" PRIu64 " input=%" PRIu64
+              " output=%" PRIu64 " dropped=%" PRIu64 " hidden=%" PRIu64
+              " obsolete=%" PRIu64 " user=%" PRIu64 " range_del=%" PRIu64 "\n",
+              flushes_, input_records_, output_records_, dropped_records_,
+              dropped_hidden_records_, dropped_obsolete_records_,
+              dropped_user_records_, dropped_range_del_records_);
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    uint64_t flushes_ = 0;
+    uint64_t input_records_ = 0;
+    uint64_t output_records_ = 0;
+    uint64_t dropped_records_ = 0;
+    uint64_t dropped_hidden_records_ = 0;
+    uint64_t dropped_obsolete_records_ = 0;
+    uint64_t dropped_user_records_ = 0;
+    uint64_t dropped_range_del_records_ = 0;
+  };
+
   std::shared_ptr<ErrorHandlerListener> listener_;
+  std::shared_ptr<FlushDroppedGarbageStatsListener>
+      flush_dropped_garbage_listener_;
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
@@ -3748,6 +3899,10 @@ class Benchmark {
     }
 
     listener_.reset(new ErrorHandlerListener());
+    if (FLAGS_report_flush_dropped_garbage) {
+      flush_dropped_garbage_listener_.reset(
+          new FlushDroppedGarbageStatsListener());
+    }
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
@@ -4133,6 +4288,10 @@ class Benchmark {
         method = &Benchmark::ReadRandom;
       } else if (name == "newiterator") {
         method = &Benchmark::IteratorCreation;
+      } else if (name == "fillzipf") {
+        method = &Benchmark::FillZipf;
+      } else if (name == "testzipf") {
+        method = &Benchmark::Zipf;
       } else if (name == "newiteratorwhilewriting") {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::IteratorCreationWhileWriting;
@@ -4267,6 +4426,18 @@ class Benchmark {
           ErrorExit();
         }
         method = &Benchmark::Replay;
+      } else if (name == "twittertrace") {
+        if (num_threads > 1) {
+          fprintf(stderr, "twittertrace currently supports only 1 thread\n");
+          ErrorExit();
+        }
+        if (FLAGS_twitter_trace_file.empty()) {
+          fprintf(
+              stderr,
+              "Please set --twitter_trace_file to the Twitter trace path\n");
+          ErrorExit();
+        }
+        method = &Benchmark::TwitterTrace;
       } else if (name == "getmergeoperands") {
         method = &Benchmark::GetMergeOperands;
       } else if (name == "verifychecksum") {
@@ -4433,6 +4604,10 @@ class Benchmark {
                 "Encountered an error ending the block cache tracing, %s\n",
                 s.ToString().c_str());
       }
+    }
+
+    if (flush_dropped_garbage_listener_) {
+      flush_dropped_garbage_listener_->PrintSummary();
     }
 
     if (FLAGS_statistics) {
@@ -5636,7 +5811,20 @@ class Benchmark {
       }
     }
 
-    options.listeners.emplace_back(listener_);
+    auto add_listener_once =
+        [&](const std::shared_ptr<EventListener>& listener) {
+          if (!listener) {
+            return;
+          }
+          for (const auto& existing_listener : options.listeners) {
+            if (existing_listener.get() == listener.get()) {
+              return;
+            }
+          }
+          options.listeners.emplace_back(listener);
+        };
+    add_listener_once(listener_);
+    add_listener_once(flush_dropped_garbage_listener_);
 
     if (options.file_checksum_gen_factory == nullptr) {
       if (FLAGS_file_checksum) {
@@ -7917,6 +8105,9 @@ class Benchmark {
 
     auto duration = thread->shared->MakeDuration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
+      if (FLAGS_mix_put_limit > 0 && puts >= FLAGS_mix_put_limit) {
+        break;
+      }
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
       int64_t ini_rand, rand_v, key_rand, key_seed;
       ini_rand = GetRandomKey(&thread->rand);
@@ -7936,6 +8127,9 @@ class Benchmark {
       }
       GenerateKeyFromInt(key_rand, FLAGS_num, &key);
       int query_type = query.GetType(rand_v);
+      if (FLAGS_mix_skip_reads && query_type != 1) {
+        continue;
+      }
 
       // change the qps
       uint64_t now = FLAGS_env->NowMicros();
@@ -8055,7 +8249,8 @@ class Benchmark {
              " found, "
              "avg size: %.1f value, %.1f scan)\n",
              gets, puts, seek, get_found + seek_found, gets + seek,
-             total_val_size / puts, total_scan_length / seek);
+             puts == 0 ? 0.0 : total_val_size / puts,
+             seek == 0 ? 0.0 : total_scan_length / seek);
 
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
@@ -10049,6 +10244,322 @@ class Benchmark {
     } else {
       fprintf(stderr, "Replay failed. Error: %s\n", s.ToString().c_str());
     }
+  }
+
+  void TwitterTrace(ThreadState* thread) {
+    if (db_.db == nullptr) {
+      fprintf(stderr, "twittertrace: only single-DB mode is supported.\n");
+      ErrorExit();
+    }
+
+    DB* db = db_.db;
+
+    if (FLAGS_twitter_trace_file.empty()) {
+      fprintf(stderr,
+              "twittertrace: --twitter_trace_file must be specified.\n");
+      ErrorExit();
+    }
+
+    std::ifstream in(FLAGS_twitter_trace_file);
+    if (!in) {
+      fprintf(stderr, "twittertrace: failed to open trace file '%s'\n",
+              FLAGS_twitter_trace_file.c_str());
+      ErrorExit();
+    }
+
+    uint64_t file_size = 0;
+    Status fs_s = FLAGS_env->GetFileSize(FLAGS_twitter_trace_file, &file_size);
+    if (!fs_s.ok()) {
+      file_size = 0;
+    }
+
+    const uint64_t report_interval = (FLAGS_twitter_chunk_bytes == 0)
+                                         ? std::numeric_limits<uint64_t>::max()
+                                         : FLAGS_twitter_chunk_bytes;
+    const uint64_t queue_limit = FLAGS_twitter_queue_bytes;
+
+    uint64_t total_lines = 0;
+    uint64_t total_gets = 0;
+    uint64_t total_puts = 0;
+    uint64_t total_found = 0;
+    uint64_t total_bytes = 0;
+    const uint64_t put_limit = FLAGS_twittertrace_put_limit;
+    ReadOptions read_opts = read_options_;
+    WriteOptions write_opts = write_options_;
+
+    std::string value_buf;
+
+    struct TwitterTraceItem {
+      TwitterTraceRecord rec;
+      uint64_t text_bytes = 0;
+    };
+
+    std::mutex queue_mu;
+    std::condition_variable queue_cv_not_empty;
+    std::condition_variable queue_cv_not_full;
+    std::queue<TwitterTraceItem> queue;
+    uint64_t queue_bytes = 0;
+    bool reader_done = false;
+    std::atomic<bool> stop_processing(false);
+
+    auto log_progress = [&](uint64_t chunk_bytes, uint64_t cumulative_bytes,
+                            uint64_t chunk_index) {
+      if (chunk_bytes == 0) {
+        return;
+      }
+      if (file_size > 0) {
+        double pct = 100.0 * static_cast<long double>(cumulative_bytes) /
+                     static_cast<long double>(file_size);
+        fprintf(stdout,
+                "twittertrace: loaded chunk %" PRIu64
+                " (%.3f GiB text, %.2f%% of file)\n",
+                chunk_index,
+                static_cast<double>(chunk_bytes) / (1024.0 * 1024.0 * 1024.0),
+                pct);
+      } else {
+        fprintf(
+            stdout,
+            "twittertrace: loaded chunk %" PRIu64
+            " (%.3f GiB text, cumulative %.3f GiB)\n",
+            chunk_index,
+            static_cast<double>(chunk_bytes) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(cumulative_bytes) / (1024.0 * 1024.0 * 1024.0));
+      }
+      fflush(stdout);
+    };
+
+    std::thread reader([&]() {
+      std::string line;
+      uint64_t text_bytes_in_chunk = 0;
+      uint64_t total_text_bytes = 0;
+      uint64_t chunk_index = 0;
+
+      while (std::getline(in, line)) {
+        if (stop_processing.load(std::memory_order_acquire)) {
+          break;
+        }
+
+        uint64_t line_bytes = static_cast<uint64_t>(line.size()) + 1;
+        total_text_bytes += line_bytes;
+        text_bytes_in_chunk += line_bytes;
+
+        TwitterTraceRecord rec;
+        if (!ParseTwitterTraceLine(line, &rec)) {
+          continue;
+        }
+
+        std::unique_lock<std::mutex> lock(queue_mu);
+        queue_cv_not_full.wait(lock, [&]() {
+          return reader_done || queue_limit == 0 ||
+                 (queue_bytes + line_bytes <= queue_limit) ||
+                 (queue_bytes == 0 && line_bytes > queue_limit);
+        });
+        if (reader_done) {
+          break;
+        }
+        queue.push(TwitterTraceItem{std::move(rec), line_bytes});
+        queue_bytes += line_bytes;
+        lock.unlock();
+        queue_cv_not_empty.notify_one();
+
+        if (text_bytes_in_chunk >= report_interval) {
+          chunk_index++;
+          log_progress(text_bytes_in_chunk, total_text_bytes, chunk_index);
+          text_bytes_in_chunk = 0;
+        }
+      }
+
+      if (text_bytes_in_chunk > 0 || total_text_bytes == 0) {
+        chunk_index++;
+        log_progress(text_bytes_in_chunk, total_text_bytes, chunk_index);
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(queue_mu);
+        reader_done = true;
+      }
+      queue_cv_not_empty.notify_all();
+    });
+
+    uint64_t chunk_index = 0;
+    uint64_t chunk_lines = 0;
+    uint64_t chunk_gets = 0;
+    uint64_t chunk_puts = 0;
+    uint64_t chunk_found = 0;
+    uint64_t chunk_bytes = 0;
+
+    while (true) {
+      if (put_limit > 0 && total_puts >= put_limit) {
+        stop_processing.store(true, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(queue_mu);
+          reader_done = true;
+        }
+        queue_cv_not_empty.notify_all();
+        queue_cv_not_full.notify_all();
+        break;
+      }
+
+      TwitterTraceItem item;
+      {
+        std::unique_lock<std::mutex> lock(queue_mu);
+        queue_cv_not_empty.wait(
+            lock, [&]() { return reader_done || !queue.empty(); });
+        if (queue.empty()) {
+          break;
+        }
+        item = std::move(queue.front());
+        queue.pop();
+        queue_bytes -= item.text_bytes;
+      }
+      queue_cv_not_full.notify_one();
+
+      const auto& rec = item.rec;
+      Status s;
+      Slice key(rec.key);
+
+      if (rec.op == "get" || rec.op == "gets") {
+        if (FLAGS_twittertrace_skip_reads) {
+          continue;
+        }
+        chunk_gets++;
+        std::string val;
+        s = db->Get(read_opts, key, &val);
+        if (s.ok()) {
+          chunk_found++;
+          chunk_bytes += key.size() + val.size();
+        } else if (!s.IsNotFound()) {
+          fprintf(stderr, "twittertrace: Get error: %s\n",
+                  s.ToString().c_str());
+          ErrorExit();
+        }
+        thread->stats.FinishedOps(&db_, db, 1, kRead);
+      } else if (rec.op == "set" || rec.op == "add" || rec.op == "replace" ||
+                 rec.op == "append" || rec.op == "prepend") {
+        chunk_puts++;
+        total_puts++;
+
+        if (value_buf.size() < rec.value_size) {
+          value_buf.assign(rec.value_size, 'x');
+        }
+        Slice val(value_buf.data(), rec.value_size);
+
+        s = db->Put(write_opts, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "twittertrace: Put error: %s\n",
+                  s.ToString().c_str());
+          ErrorExit();
+        }
+        chunk_bytes += key.size() + rec.value_size;
+        thread->stats.FinishedOps(&db_, db, 1, kWrite);
+      } else {
+        continue;
+      }
+
+      chunk_lines++;
+      if (chunk_lines >= 1000000) {
+        chunk_index++;
+        fprintf(stdout,
+                "twittertrace: replayed chunk %" PRIu64 " (lines:%" PRIu64
+                ", gets:%" PRIu64 ", puts:%" PRIu64 ")\n",
+                chunk_index, chunk_lines, chunk_gets, chunk_puts);
+        fflush(stdout);
+
+        total_lines += chunk_lines;
+        total_gets += chunk_gets;
+        total_found += chunk_found;
+        total_bytes += chunk_bytes;
+
+        chunk_lines = 0;
+        chunk_gets = 0;
+        chunk_puts = 0;
+        chunk_found = 0;
+        chunk_bytes = 0;
+      }
+    }
+
+    if (chunk_lines > 0) {
+      chunk_index++;
+      fprintf(stdout,
+              "twittertrace: replayed chunk %" PRIu64 " (lines:%" PRIu64
+              ", gets:%" PRIu64 ", puts:%" PRIu64 ")\n",
+              chunk_index, chunk_lines, chunk_gets, chunk_puts);
+      fflush(stdout);
+
+      total_lines += chunk_lines;
+      total_gets += chunk_gets;
+      total_found += chunk_found;
+      total_bytes += chunk_bytes;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(queue_mu);
+      reader_done = true;
+    }
+    queue_cv_not_full.notify_all();
+    if (reader.joinable()) {
+      reader.join();
+    }
+
+    thread->stats.AddBytes(total_bytes);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "(twittertrace total_lines:%" PRIu64 " gets:%" PRIu64
+             " (found:%" PRIu64 ") puts:%" PRIu64 ")",
+             total_lines, total_gets, total_found, total_puts);
+    thread->stats.AddMessage(msg);
+  }
+
+  void Zipf(ThreadState* /*thread*/) {
+    fprintf(stdout, "ZIPF distribution test\n");
+    constexpr long kZipfSampleSize = 1000;
+    init_zipf_generator(0, kZipfSampleSize - 1, FLAGS_zipf_const);
+    std::vector<uint64_t> counts(kZipfSampleSize, 0);
+
+    for (int i = 0; i <= 10000; i++) {
+      long value = nextValue();
+      if (value >= 0 && value < kZipfSampleSize) {
+        counts[static_cast<size_t>(value)]++;
+      }
+    }
+
+    for (uint64_t count : counts) {
+      fprintf(stdout, "%" PRIu64 "\n", count);
+    }
+  }
+
+  void FillZipf(ThreadState* thread) {
+    RandomGenerator gen;
+    const int64_t key_range =
+        FLAGS_zipf_key_range > 0 ? FLAGS_zipf_key_range : num_;
+    if (key_range <= 0) {
+      fprintf(stderr, "fillzipf requires a positive key range\n");
+      ErrorExit();
+    }
+
+    init_zipf_generator(0, key_range - 1, FLAGS_zipf_const);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    int64_t bytes = 0;
+    auto duration = thread->shared->MakeDuration(FLAGS_duration, num_);
+
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      const int64_t key_id = nextValue() % key_range;
+      GenerateKeyFromInt(key_id, key_range, &key);
+      Slice value = gen.Generate(value_size);
+      Status s = db->Put(write_options_, key, value);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        ErrorExit();
+      }
+      bytes += key.size() + value.size();
+      thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+    }
+
+    thread->stats.AddBytes(bytes);
   }
 
   void Backup(ThreadState* thread) {

@@ -33,6 +33,7 @@ class VersionSet;
 class BlobFileAddition;
 class BlobFileGarbage;
 class SnapshotChecker;
+struct CompactionIterationStats;
 class TableCache;
 class TableBuilder;
 class WritableFileWriter;
@@ -82,6 +83,7 @@ Status BuildTable(
     uint64_t* memtable_garbage_bytes = nullptr,
     InternalStats::CompactionStats* flush_stats = nullptr,
     std::vector<BlobFileGarbage>* blob_file_garbages = nullptr,
-    bool fast_sst_open = false);
+    bool fast_sst_open = false,
+    CompactionIterationStats* compaction_iteration_stats = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE
