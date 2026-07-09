@@ -1790,6 +1790,17 @@ DEFINE_int64(mix_put_limit, 0,
              "For mixgraph, stop after this many Put operations. 0 means no "
              "Put-specific limit.");
 
+DEFINE_uint64(target_db_size_bytes, 0,
+              "If non-zero, supported write benchmarks stop after the live DB "
+              "directory size reaches this many bytes. The benchmark prints "
+              "the number of successful Put operations completed before "
+              "stopping.");
+
+DEFINE_uint64(db_size_check_interval, 100000,
+              "When --target_db_size_bytes is non-zero, check the DB "
+              "directory size every this many successful Put operations. 0 "
+              "means check after every Put.");
+
 DEFINE_uint64(
     benchmark_read_rate_limit, 0,
     "If non-zero, db_bench will rate-limit the reads from RocksDB. This "
@@ -3054,6 +3065,7 @@ struct SharedState {
   // control points (Duration::Done) without adding per-key hot-path cost. The
   // first error's status/message is recorded under `mu`.
   Atomic<bool> fatal{false};
+  Atomic<bool> target_db_size_reached{false};
   Status fatal_status;
   std::string fatal_msg;
 
@@ -6335,6 +6347,119 @@ class Benchmark {
     }
   }
 
+  Status GetDbDirectorySize(uint64_t* total_size) {
+    *total_size = 0;
+
+    std::vector<Env::FileAttributes> files;
+    Status s = FLAGS_env->GetChildrenFileAttributes(FLAGS_db, &files);
+    if (!s.ok()) {
+      return s;
+    }
+
+    for (const auto& file : files) {
+      *total_size += file.size_bytes;
+    }
+    return Status::OK();
+  }
+
+  uint64_t DbSizeCheckInterval() const {
+    return FLAGS_db_size_check_interval == 0 ? 1
+                                             : FLAGS_db_size_check_interval;
+  }
+
+  bool ShouldStopForTargetDbSize(ThreadState* thread, const char* benchmark,
+                                 uint64_t successful_puts) {
+    if (FLAGS_target_db_size_bytes == 0) {
+      return false;
+    }
+    if (thread->shared->target_db_size_reached.Load()) {
+      return true;
+    }
+    if (successful_puts == 0 ||
+        successful_puts % DbSizeCheckInterval() != 0) {
+      return false;
+    }
+
+    uint64_t db_size = 0;
+    Status s = GetDbDirectorySize(&db_size);
+    if (!s.ok()) {
+      std::string msg =
+          "target_db_size_bytes: failed to measure DB directory size for " +
+          FLAGS_db + ": " + s.ToString();
+      thread->shared->SetFatal(s, msg);
+      return true;
+    }
+
+    if (db_size < FLAGS_target_db_size_bytes) {
+      return false;
+    }
+
+    bool expected = false;
+    if (thread->shared->target_db_size_reached.CasStrong(expected, true)) {
+      fprintf(stdout,
+              "target_db_size_bytes reached: benchmark=%s "
+              "successful_puts=%" PRIu64 " db_size_bytes=%" PRIu64
+              " target_db_size_bytes=%" PRIu64 "\n",
+              benchmark, successful_puts, db_size,
+              FLAGS_target_db_size_bytes);
+      fflush(stdout);
+
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+               "(target_db_size_bytes reached puts:%" PRIu64
+               " db_size_bytes:%" PRIu64 ")",
+               successful_puts, db_size);
+      thread->stats.AddMessage(msg);
+    }
+    return true;
+  }
+
+  void ReportTargetDbSizeFinal(ThreadState* thread, const char* benchmark,
+                               uint64_t successful_puts) {
+    if (FLAGS_target_db_size_bytes == 0) {
+      return;
+    }
+
+    uint64_t db_size = 0;
+    Status s = GetDbDirectorySize(&db_size);
+    if (!s.ok()) {
+      fprintf(stderr,
+              "target_db_size_bytes final: failed to measure DB directory "
+              "size for %s: %s\n",
+              FLAGS_db.c_str(), s.ToString().c_str());
+      return;
+    }
+
+    const bool reached = db_size >= FLAGS_target_db_size_bytes ||
+                         thread->shared->target_db_size_reached.Load();
+    fprintf(stdout,
+            "target_db_size_bytes final: benchmark=%s target_reached=%s "
+            "successful_puts=%" PRIu64 " db_size_bytes=%" PRIu64
+            " target_db_size_bytes=%" PRIu64 "\n",
+            benchmark, reached ? "true" : "false", successful_puts, db_size,
+            FLAGS_target_db_size_bytes);
+    fflush(stdout);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "(target_db_size_bytes final reached:%s puts:%" PRIu64
+             " db_size_bytes:%" PRIu64 ")",
+             reached ? "true" : "false", successful_puts, db_size);
+    thread->stats.AddMessage(msg);
+  }
+
+  const char* WriteModeName(WriteMode write_mode) const {
+    switch (write_mode) {
+      case RANDOM:
+        return "write_random";
+      case SEQUENTIAL:
+        return "write_sequential";
+      case UNIQUE_RANDOM:
+        return "write_unique_random";
+    }
+    return "write";
+  }
+
   double SineRate(double x) {
     return FLAGS_sine_a * sin((FLAGS_sine_b * x) + FLAGS_sine_c) + FLAGS_sine_d;
   }
@@ -6475,8 +6600,13 @@ class Benchmark {
     int64_t next_seq_db_at = num_ops;
     size_t id = 0;
     int64_t num_range_deletions = 0;
+    const char* target_db_size_benchmark = WriteModeName(write_mode);
 
     while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_)) {
+      if (FLAGS_target_db_size_bytes > 0 &&
+          thread->shared->target_db_size_reached.Load()) {
+        break;
+      }
       if (duration.GetStage() != stage) {
         stage = duration.GetStage();
         if (db_.db != nullptr) {
@@ -6759,6 +6889,11 @@ class Benchmark {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
+
+      if (ShouldStopForTargetDbSize(thread, target_db_size_benchmark,
+                                    num_written)) {
+        break;
+      }
     }
     if ((write_mode == UNIQUE_RANDOM) && (p > 0.0)) {
       fprintf(stdout,
@@ -6775,6 +6910,7 @@ class Benchmark {
       std::cout << "Number of range deletions: " << num_range_deletions
                 << std::endl;
     }
+    ReportTargetDbSizeFinal(thread, target_db_size_benchmark, num_written);
     thread->stats.AddBytes(bytes);
   }
 
@@ -8105,6 +8241,10 @@ class Benchmark {
 
     auto duration = thread->shared->MakeDuration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
+      if (FLAGS_target_db_size_bytes > 0 &&
+          thread->shared->target_db_size_reached.Load()) {
+        break;
+      }
       if (FLAGS_mix_put_limit > 0 && puts >= FLAGS_mix_put_limit) {
         break;
       }
@@ -8212,6 +8352,9 @@ class Benchmark {
                                                       nullptr /*stats*/);
         }
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kWrite);
+        if (ShouldStopForTargetDbSize(thread, "mixgraph", puts)) {
+          break;
+        }
       } else if (query_type == 2) {
         // Seek query
         if (db_with_cfh->db != nullptr) {
@@ -8254,6 +8397,7 @@ class Benchmark {
 
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
+    ReportTargetDbSizeFinal(thread, "mixgraph", puts);
   }
 
   void IteratorCreation(ThreadState* thread) {
@@ -10302,6 +10446,16 @@ class Benchmark {
     bool reader_done = false;
     std::atomic<bool> stop_processing(false);
 
+    auto request_stop_processing = [&]() {
+      stop_processing.store(true, std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(queue_mu);
+        reader_done = true;
+      }
+      queue_cv_not_empty.notify_all();
+      queue_cv_not_full.notify_all();
+    };
+
     auto log_progress = [&](uint64_t chunk_bytes, uint64_t cumulative_bytes,
                             uint64_t chunk_index) {
       if (chunk_bytes == 0) {
@@ -10390,13 +10544,13 @@ class Benchmark {
 
     while (true) {
       if (put_limit > 0 && total_puts >= put_limit) {
-        stop_processing.store(true, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lock(queue_mu);
-          reader_done = true;
-        }
-        queue_cv_not_empty.notify_all();
-        queue_cv_not_full.notify_all();
+        request_stop_processing();
+        break;
+      }
+
+      if (FLAGS_target_db_size_bytes > 0 &&
+          thread->shared->target_db_size_reached.Load()) {
+        request_stop_processing();
         break;
       }
 
@@ -10417,6 +10571,7 @@ class Benchmark {
       const auto& rec = item.rec;
       Status s;
       Slice key(rec.key);
+      bool stop_for_target_db_size = false;
 
       if (rec.op == "get" || rec.op == "gets") {
         if (FLAGS_twittertrace_skip_reads) {
@@ -10452,6 +10607,8 @@ class Benchmark {
         }
         chunk_bytes += key.size() + rec.value_size;
         thread->stats.FinishedOps(&db_, db, 1, kWrite);
+        stop_for_target_db_size =
+            ShouldStopForTargetDbSize(thread, "twittertrace", total_puts);
       } else {
         continue;
       }
@@ -10475,6 +10632,11 @@ class Benchmark {
         chunk_puts = 0;
         chunk_found = 0;
         chunk_bytes = 0;
+      }
+
+      if (stop_for_target_db_size) {
+        request_stop_processing();
+        break;
       }
     }
 
@@ -10509,6 +10671,7 @@ class Benchmark {
              " (found:%" PRIu64 ") puts:%" PRIu64 ")",
              total_lines, total_gets, total_found, total_puts);
     thread->stats.AddMessage(msg);
+    ReportTargetDbSizeFinal(thread, "twittertrace", total_puts);
   }
 
   void Zipf(ThreadState* /*thread*/) {
@@ -10543,9 +10706,14 @@ class Benchmark {
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
     int64_t bytes = 0;
+    uint64_t successful_puts = 0;
     auto duration = thread->shared->MakeDuration(FLAGS_duration, num_);
 
     while (!duration.Done(1)) {
+      if (FLAGS_target_db_size_bytes > 0 &&
+          thread->shared->target_db_size_reached.Load()) {
+        break;
+      }
       DB* db = SelectDB(thread);
       const int64_t key_id = nextValue() % key_range;
       GenerateKeyFromInt(key_id, key_range, &key);
@@ -10556,9 +10724,14 @@ class Benchmark {
         ErrorExit();
       }
       bytes += key.size() + value.size();
+      ++successful_puts;
       thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      if (ShouldStopForTargetDbSize(thread, "fillzipf", successful_puts)) {
+        break;
+      }
     }
 
+    ReportTargetDbSizeFinal(thread, "fillzipf", successful_puts);
     thread->stats.AddBytes(bytes);
   }
 
