@@ -2091,6 +2091,31 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::PutDataBlockToCache(
   rep_->create_context.Create(&block_holder,
                               std::move(uncompressed_block_contents));
 
+  if (rep_->table_options.log_data_block_key_range &&
+      TBlocklike::kBlockType == BlockType::kData && block_holder != nullptr &&
+      ioptions.logger != nullptr) {
+    Block* b = reinterpret_cast<Block*>(block_holder.get());
+    DataBlockIter iter;
+    b->NewDataIterator(rep_->internal_comparator.user_comparator(),
+                       rep_->global_seqno, &iter);
+    iter.SeekToFirst();
+    std::string start_key_str =
+        iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
+                     : "<empty>";
+    iter.SeekToLast();
+    std::string end_key_str =
+        iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
+                     : "<empty>";
+
+    ROCKS_LOG_INFO(
+        ioptions.logger,
+        "[BLOCK_CACHE_DATA_LOAD] Level: %d, StartKey: %s, EndKey: %s",
+        rep_->level, start_key_str.c_str(), end_key_str.c_str());
+
+    b->SetEvictionLogging(ioptions.logger, rep_->level, start_key_str,
+                          end_key_str);
+  }
+
   // insert into uncompressed block cache
   if (block_cache && block_holder->own_bytes()) {
     size_t charge = block_holder->ApproximateMemoryUsage();

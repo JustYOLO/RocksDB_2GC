@@ -93,12 +93,59 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
         // TODO: update per-level perfcontext user_key_return_count for kMerge
         break;
       case GetContext::kFound:
-        if (hit_file_level == 0) {
-          RecordTick(db_statistics_, GET_HIT_L0);
-        } else if (hit_file_level == 1) {
-          RecordTick(db_statistics_, GET_HIT_L1);
-        } else if (hit_file_level >= 2) {
-          RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+        if (get_context.get_start_nanos() > 0 && clock_) {
+          uint64_t elapsed = clock_->NowNanos() - get_context.get_start_nanos();
+          if (get_context.get_context_stats_.num_cache_data_hit > 0) {
+            RecordTick(db_statistics_, BLOCK_CACHE_KEY_HIT);
+            RecordTick(db_statistics_, BLOCK_CACHE_HIT_TIME_NANOS, elapsed);
+          } else {
+            RecordTick(db_statistics_, DISK_HIT_TIME_NANOS, elapsed);
+            if (hit_file_level == 0) {
+              RecordTick(db_statistics_, GET_HIT_L0);
+            } else if (hit_file_level == 1) {
+              RecordTick(db_statistics_, GET_HIT_L1);
+            } else if (hit_file_level == 2) {
+              RecordTick(db_statistics_, GET_HIT_L2);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 3) {
+              RecordTick(db_statistics_, GET_HIT_L3);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 4) {
+              RecordTick(db_statistics_, GET_HIT_L4);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 5) {
+              RecordTick(db_statistics_, GET_HIT_L5);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level >= 6) {
+              RecordTick(db_statistics_, GET_HIT_L6_AND_UP);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            }
+          }
+        } else {
+          if (get_context.get_context_stats_.num_cache_data_hit > 0) {
+            RecordTick(db_statistics_, BLOCK_CACHE_KEY_HIT);
+          } else {
+            if (hit_file_level == 0) {
+              RecordTick(db_statistics_, GET_HIT_L0);
+            } else if (hit_file_level == 1) {
+              RecordTick(db_statistics_, GET_HIT_L1);
+            } else if (hit_file_level == 2) {
+              RecordTick(db_statistics_, GET_HIT_L2);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 3) {
+              RecordTick(db_statistics_, GET_HIT_L3);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 4) {
+              RecordTick(db_statistics_, GET_HIT_L4);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level == 5) {
+              RecordTick(db_statistics_, GET_HIT_L5);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (hit_file_level >= 6) {
+              RecordTick(db_statistics_, GET_HIT_L6_AND_UP);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            }
+          }
         }
 
         PERF_COUNTER_BY_LEVEL_ADD(user_key_return_count, 1, hit_file_level);

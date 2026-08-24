@@ -3202,6 +3202,9 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
   PERF_CPU_TIMER_GUARD(get_cpu_nanos, immutable_db_options_.clock);
   StopWatch sw(immutable_db_options_.clock, stats_, DB_GET);
+  if (read_options.log_read_time_breakdown && immutable_db_options_.clock) {
+    read_options.get_start_nanos = immutable_db_options_.clock->NowNanos();
+  }
   PERF_TIMER_GUARD(get_snapshot_time);
 
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
@@ -3394,6 +3397,10 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
       }
+    }
+    if (done && read_options.get_start_nanos > 0 && immutable_db_options_.clock) {
+      uint64_t elapsed = immutable_db_options_.clock->NowNanos() - read_options.get_start_nanos;
+      RecordTick(stats_, MEMTABLE_HIT_TIME_NANOS, elapsed);
     }
     if (!s.ok() && !s.IsMergeInProgress() && !s.IsNotFound()) {
       assert(done);

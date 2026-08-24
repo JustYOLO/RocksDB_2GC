@@ -202,6 +202,9 @@ class GetContext {
 
   uint64_t get_tracing_get_id() const { return tracing_get_id_; }
 
+  void set_start_nanos(uint64_t start_nanos) { start_nanos_ = start_nanos; }
+  uint64_t get_start_nanos() const { return start_nanos_; }
+
   void push_operand(const Slice& value, Cleanable* value_pinner);
 
  private:
@@ -267,6 +270,7 @@ class GetContext {
   // Get or a MultiGet.
   const uint64_t tracing_get_id_;
   BlobFetcher* blob_fetcher_;
+  uint64_t start_nanos_{0};
 };
 
 // Call this to replay a log and bring the get_context up to date. The replay

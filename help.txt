@@ -39,6 +39,8 @@ USAGE:
 
 
   Flags from tools/db_bench_tool.cc:
+    -YCSB_uniform_distribution (Uniform key distribution for YCSB) type: bool
+      default: false
     -adaptive_readahead (carry forward internal auto readahead size from one
       file to next file at each level during iteration) type: bool
       default: false
@@ -163,12 +165,13 @@ USAGE:
       --backup_rate_limit
       	restore -- Restore the DB from the latest backup available, rate limit
       can be specified through --restore_rate_limit
+      	fillzipf -- write N values using a Zipfian key distribution
       	testzipf -- Print a sample Zipf distribution using --zipf_const
       	twittertrace -- Replay Twitter cache trace CSV from --twitter_trace_file
       	approximatememtablestats -- Tests accuracy of
       GetApproximateMemTableStats, ideally
       after fillrandom, where actual answer is batch_size) type: string
-      default: "fillseq,fillseqdeterministic,fillsync,fillrandom,filluniquerandomdeterministic,overwrite,readrandom,newiterator,newiteratorwhilewriting,seekrandom,seekrandomwhilewriting,seekrandomwhilemerging,readseq,readreverse,compact,compactall,flush,compact0,compact1,waitforcompaction,multireadrandom,multiscan,multiscanrandom,mixgraph,readseq,readtorowcache,readtocache,readreverse,readwhilewriting,readwhilemerging,readwhilescanning,readrandomwriterandom,updaterandom,xorupdaterandom,approximatesizerandom,randomwithverify,fill100K,crc32c,xxhash,xxhash64,xxh3,compress,uncompress,acquireload,fillseekseq,randomtransaction,randomreplacekeys,timeseries,getmergeoperands,readrandomoperands,backup,restore,testzipf,openandcompact,approximatememtablestats"
+      default: "fillseq,fillseqdeterministic,fillsync,fillrandom,filluniquerandomdeterministic,overwrite,readrandom,newiterator,newiteratorwhilewriting,seekrandom,seekrandomwhilewriting,seekrandomwhilemerging,readseq,readreverse,compact,compactall,flush,compact0,compact1,waitforcompaction,multireadrandom,multiscan,multiscanrandom,mixgraph,readseq,readtorowcache,readtocache,readreverse,readwhilewriting,readwhilemerging,readwhilescanning,readrandomwriterandom,updaterandom,xorupdaterandom,approximatesizerandom,randomwithverify,fill100K,crc32c,xxhash,xxhash64,xxh3,compress,uncompress,acquireload,fillseekseq,randomtransaction,randomreplacekeys,timeseries,getmergeoperands,readrandomoperands,backup,restore,fillzipf,testzipf,openandcompact,approximatememtablestats"
     -bgwriter_num (If > 0, the background-writer thread used by
       readwhilewriting / readwhilemerging / multireadwhilewriting writes random
       keys over [0, bgwriter_num) instead of [0, num). Lets the reader thread
@@ -330,6 +333,9 @@ USAGE:
       table. This is only valid if use_data_block_hash_index is set to true)
       type: double default: 0.75
     -db (Use the db with the following name.) type: string default: ""
+    -db_size_check_interval (When --target_db_size_bytes is non-zero, check the
+      DB directory size every this many successful Put operations. 0 means
+      check after every Put.) type: uint64 default: 100000
     -db_write_buffer_size (Number of bytes to buffer in all memtables before
       compacting) type: int64 default: 0
     -decouple_partitioned_filters (Decouple filter partitioning from index
@@ -505,6 +511,7 @@ USAGE:
       type: double default: 0
     -key_id_range (Range of possible value of key id (used in TimeSeries
       only).) type: int32 default: 100000
+    -key_range (zipf key range) type: int64 default: 10000000
     -key_size (size of each key) type: int32 default: 16
     -keyrange_dist_a (The parameter 'a' of prefix average access distribution
       f(x)=a*exp(b*x)+c*exp(d*x)) type: double default: 0
@@ -530,6 +537,10 @@ USAGE:
       put stop.) type: int32 default: 36
     -level_compaction_dynamic_level_bytes (Whether level size base is dynamic)
       type: bool default: false
+    -log_data_block_key_range (Log start and end keys when a data block is
+      loaded into block cache.) type: bool default: false
+    -log_read_time_breakdown (Track fine-grained latency breakdown for Memtable
+      vs Block Cache vs Disk hits.) type: bool default: false
     -log_readahead_size (WAL and manifest readahead size) type: int32
       default: 0
     -manual_wal_flush (If true, buffer WAL until buffer is full or a manual
@@ -633,10 +644,15 @@ USAGE:
       default: 10000
     -mix_max_value_size (The max value size of this workload) type: int64
       default: 1024
+    -mix_put_limit (For mixgraph, stop after this many Put operations. 0 means
+      no Put-specific limit.) type: int64 default: 0
     -mix_put_ratio (The ratio of Put queries of mix_graph workload)
       type: double default: 0
     -mix_seek_ratio (The ratio of Seek queries of mix_graph workload)
       type: double default: 0
+    -mix_skip_reads (For mixgraph, skip Get and Seek operations and execute
+      only Put operations selected by the mix distribution.) type: bool
+      default: false
     -mmap_read (Allow reads to occur via mmap-ing files) type: bool
       default: false
     -mmap_write (Allow writes to occur via mmap-ing files) type: bool
@@ -834,6 +850,8 @@ USAGE:
       default: "report.csv"
     -report_file_operations (if report number of file operations) type: bool
       default: false
+    -report_flush_dropped_garbage (Print per-flush and total records dropped by
+      flush-time deduplication/filtering.) type: bool default: false
     -report_interval_seconds (If greater than zero, it will write simple stats
       in CSV format to --report_file every N seconds) type: int64 default: 0
     -report_open_timing (if report open timing) type: bool default: false
@@ -934,6 +952,10 @@ USAGE:
       super block alignment) type: uint64 default: 128
     -sync (Sync all writes to disk) type: bool default: false
     -table_cache_numshardbits () type: int32 default: 4
+    -target_db_size_bytes (If non-zero, supported write benchmarks stop after
+      the live DB directory size reaches this many bytes. The benchmark prints
+      the number of successful Put operations completed before stopping.)
+      type: uint64 default: 0
     -target_file_size_base (Target file size at level-1) type: int64
       default: 67108864
     -target_file_size_multiplier (A multiplier to compute target level-N file
@@ -1131,5 +1153,14 @@ USAGE:
       regularly.) type: int64 default: 0
     -writes_per_range_tombstone (Number of writes between range tombstones)
       type: int64 default: 0
+    -ycsb_hot_key_ratio (Fraction of total key space (0.0 to 1.0) defining the
+      hot key range size for YCSB write shift calculations) type: double
+      default: 0.20000000000000001
+    -ycsb_rw_key_overlap_mode (Hot key range overlap mode between reads and
+      writes in YCSB: "100" or "full" (100% overlap, default YCSB behavior),
+      "50" or "half" (50% overlap), "0" or "disjoint" (0% overlap / disjoint
+      hot ranges)) type: string default: "100"
     -zipf_const (Zipfian constant for Zipf distribution) type: double
       default: 0.98999999999999999
+    -zipf_key_range (Key range for fillzipf. 0 means use --num as the key
+      range.) type: int64 default: 0

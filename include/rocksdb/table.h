@@ -237,6 +237,10 @@ struct BlockBasedTableOptions {
   // block cache regardless of this option.
   bool cache_index_and_filter_blocks = false;
 
+  // If true, log the start and end user key range when a data block is loaded
+  // into the block cache.
+  bool log_data_block_key_range = false;
+
   // If cache_index_and_filter_blocks is enabled, cache index and filter
   // blocks with high priority. If set to true, depending on implementation of
   // block cache, index, filter, and other metadata blocks may be less likely

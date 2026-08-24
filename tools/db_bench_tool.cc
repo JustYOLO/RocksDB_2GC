@@ -95,6 +95,7 @@
 #include "util/string_util.h"
 #include "util/xxhash.h"
 #include "util/zipf.h"
+#include "util/latest-generator.h"
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/counted_fs.h"
 #include "utilities/merge_operators.h"
@@ -374,6 +375,29 @@ DEFINE_bool(use_uint64_comparator, false, "use Uint64 user comparator");
 
 DEFINE_int64(batch_size, 1, "Batch size");
 
+DEFINE_double(zipf_const, 0.99, "Zipfian constant for Zipf distribution");
+DEFINE_int64(key_range, 10000000, "zipf key range");
+DEFINE_bool(YCSB_uniform_distribution, false,
+            "Uniform key distribution for YCSB");
+
+DEFINE_string(ycsb_rw_key_overlap_mode, "100",
+              "Hot key range overlap mode between reads and writes in YCSB: "
+              "\"100\" or \"full\" (100% overlap, default YCSB behavior), "
+              "\"50\" or \"half\" (50% overlap), "
+              "\"0\" or \"disjoint\" (0% overlap / disjoint hot ranges)");
+
+DEFINE_double(ycsb_hot_key_ratio, 0.20,
+              "Fraction of total key space (0.0 to 1.0) defining the hot key "
+              "range size for YCSB write shift calculations");
+
+struct BenchmarkParams {
+  double zipf_const;
+  int64_t key_range;
+  bool memDist;
+};
+
+static BenchmarkParams bench_params;
+
 DEFINE_int64(multiscan_size, 10,
              "MultiScan size - number of multiscans of size `batch_size`");
 
@@ -401,8 +425,6 @@ DEFINE_int32(user_timestamp_size, 0,
 
 DEFINE_int32(num_multi_db, 0,
              "Number of DBs used in the benchmark. 0 means single DB.");
-
-DEFINE_double(zipf_const, 0.99, "Zipfian constant for Zipf distribution");
 
 DEFINE_int64(zipf_key_range, 0,
              "Key range for fillzipf. 0 means use --num as the key range.");
@@ -687,6 +709,12 @@ DEFINE_int64(simcache_size, -1,
 
 DEFINE_bool(cache_index_and_filter_blocks, false,
             "Cache index/filter blocks in block cache.");
+
+DEFINE_bool(log_data_block_key_range, false,
+            "Log start and end keys when a data block is loaded into block cache.");
+
+DEFINE_bool(log_read_time_breakdown, false,
+            "Track fine-grained latency breakdown for Memtable vs Block Cache vs Disk hits.");
 
 DEFINE_bool(use_cache_jemalloc_no_dump_allocator, false,
             "Use JemallocNodumpAllocator for block/blob cache.");
@@ -4131,6 +4159,7 @@ class Benchmark {
       read_options_.auto_readahead_size = FLAGS_auto_readahead_size;
       read_options_.auto_refresh_iterator_with_snapshot =
           FLAGS_auto_refresh_iterator_with_snapshot;
+      read_options_.log_read_time_breakdown = FLAGS_log_read_time_breakdown;
       if (FLAGS_use_trie_index && udi_factory_) {
         read_options_.table_index_factory = udi_factory_.get();
       }
@@ -4255,6 +4284,22 @@ class Benchmark {
                 entries_per_batch_);
         method = &Benchmark::MultiReadRandom;
       } else if (name == "multiscan") {
+        method = &Benchmark::MultiScan;
+      } else if (name == "ycsbwklda") {
+        method = &Benchmark::YCSBWorkloadA;
+      } else if (name == "ycsbwkldb") {
+        method = &Benchmark::YCSBWorkloadB;
+      } else if (name == "ycsbwkldc") {
+        method = &Benchmark::YCSBWorkloadC;
+      } else if (name == "ycsbwkldd") {
+        method = &Benchmark::YCSBWorkloadD;
+      } else if (name == "ycsbwklde") {
+        method = &Benchmark::YCSBWorkloadE;
+      } else if (name == "ycsbwkldf") {
+        method = &Benchmark::YCSBWorkloadF;
+      } else if (name == "fillzip") {
+        method = &Benchmark::YCSBWorkloadW;
+      } else if (name == "multiscan_stride") {
         fprintf(stderr, "multiscan_stride = %" PRIi64 "\n",
                 FLAGS_multiscan_stride);
         fprintf(stderr, "multiscan_size = %" PRIi64 "\n", FLAGS_multiscan_size);
@@ -4410,6 +4455,7 @@ class Benchmark {
         CacheReportProblems();
       } else if (name == "stats") {
         PrintStats("rocksdb.stats");
+        PrintHitCountSummary();
       } else if (name == "resetstats") {
         ResetStats();
       } else if (name == "verify") {
@@ -4624,6 +4670,7 @@ class Benchmark {
 
     if (FLAGS_statistics) {
       fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
+      PrintHitCountSummary();
     }
     if (FLAGS_simcache_size >= 0) {
       fprintf(
@@ -5349,6 +5396,8 @@ class Benchmark {
       }
       block_based_options.cache_index_and_filter_blocks =
           FLAGS_cache_index_and_filter_blocks;
+      block_based_options.log_data_block_key_range =
+          FLAGS_log_data_block_key_range;
       block_based_options.pin_l0_filter_and_index_blocks_in_cache =
           FLAGS_pin_l0_filter_and_index_blocks_in_cache;
       block_based_options.pin_top_level_index_and_filter =
@@ -7439,6 +7488,412 @@ class Benchmark {
       key_rand = static_cast<int64_t>((rand_num * kBigPrime) % FLAGS_num);
     }
     return key_rand;
+  }
+
+  int64_t GetYCSBWriteKey(int64_t k, int64_t num_keys) {
+    if (FLAGS_ycsb_rw_key_overlap_mode == "100" ||
+        FLAGS_ycsb_rw_key_overlap_mode == "full") {
+      return k;
+    }
+    int64_t hot_size =
+        static_cast<int64_t>(FLAGS_ycsb_hot_key_ratio * static_cast<double>(num_keys));
+    if (hot_size <= 0) {
+      hot_size = 1;
+    }
+    int64_t shift = 0;
+    if (FLAGS_ycsb_rw_key_overlap_mode == "50" ||
+        FLAGS_ycsb_rw_key_overlap_mode == "half") {
+      shift = hot_size / 2;
+    } else if (FLAGS_ycsb_rw_key_overlap_mode == "0" ||
+               FLAGS_ycsb_rw_key_overlap_mode == "none" ||
+               FLAGS_ycsb_rw_key_overlap_mode == "disjoint") {
+      shift = hot_size;
+    }
+    return (k + shift) % num_keys;
+  }
+
+  // Workload A: Update heavy workload (50/50 read/write)
+  void YCSBWorkloadA(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    if (FLAGS_benchmark_write_rate_limit > 0) {
+      thread->shared->write_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50) {
+        Status s = db->Get(options, key, &value);
+        if (s.ok()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+      } else {
+        std::unique_ptr<const char[]> write_key_guard;
+        Slice write_key = AllocateKey(&write_key_guard);
+        long write_k = GetYCSBWriteKey(k, FLAGS_num);
+        GenerateKeyFromInt(write_k, FLAGS_num, &write_key);
+
+        if (FLAGS_benchmark_write_rate_limit > 0) {
+          thread->shared->write_rate_limiter->Request(
+              value_size + FLAGS_key_size, Env::IO_HIGH, nullptr /* stats */,
+              RateLimiter::OpType::kWrite);
+          thread->stats.ResetLastOpTime();
+        }
+        Status s = db->Put(write_options_, write_key, gen.Generate(value_size));
+        if (s.ok()) {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 " done:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload B: Read mostly workload (95/5 read/write)
+  void YCSBWorkloadB(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        Status s = db->Get(options, key, &value);
+        if (s.ok()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+      } else {
+        std::unique_ptr<const char[]> write_key_guard;
+        Slice write_key = AllocateKey(&write_key_guard);
+        long write_k = GetYCSBWriteKey(k, FLAGS_num);
+        GenerateKeyFromInt(write_k, FLAGS_num, &write_key);
+
+        Status s = db->Put(write_options_, write_key, gen.Generate(value_size));
+        if (s.ok()) {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 " done:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload C: Read only workload (100% read)
+  void YCSBWorkloadC(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      Status s = db->Get(options, key, &value);
+      if (s.ok()) {
+        found++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      }
+      reads_done++;
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " total:%" PRIu64 " found:%" PRIu64
+             " done:%" PRIu64 ")",
+             reads_done, readwrites_, found, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload D: Read latest workload (95% read / 5% insert)
+  void YCSBWorkloadD(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = next_value_latestgen() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        Status s = db->Get(options, key, &value);
+        if (s.ok()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+      } else {
+        std::unique_ptr<const char[]> write_key_guard;
+        Slice write_key = AllocateKey(&write_key_guard);
+        long write_k = GetYCSBWriteKey(k, FLAGS_num);
+        GenerateKeyFromInt(write_k, FLAGS_num, &write_key);
+
+        Status s = db->Put(write_options_, write_key, gen.Generate(value_size));
+        if (s.ok()) {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 " done:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload E: Short range scan (95% scan / 5% insert)
+  void YCSBWorkloadE(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        Iterator* iter = db->NewIterator(options);
+        int64_t i = 0;
+        for (iter->Seek(key); i < 100 && iter->Valid(); iter->Next()) {
+          ++i;
+        }
+        delete iter;
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else {
+        std::unique_ptr<const char[]> write_key_guard;
+        Slice write_key = AllocateKey(&write_key_guard);
+        long write_k = GetYCSBWriteKey(k, FLAGS_num);
+        GenerateKeyFromInt(write_k, FLAGS_num, &write_key);
+
+        Status s = db->Put(write_options_, write_key, gen.Generate(value_size));
+        if (s.ok()) {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( scans:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " done:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload F: Read-modify-write (50/50 read/read-modify-write)
+  void YCSBWorkloadF(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_latestgen(FLAGS_num);
+    init_zipf_generator(0, FLAGS_num, bench_params.zipf_const);
+
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50) {
+        Status s = db->Get(options, key, &value);
+        if (s.ok()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        reads_done++;
+      } else {
+        Status s = db->Get(options, key, &value);
+
+        std::unique_ptr<const char[]> write_key_guard;
+        Slice write_key = AllocateKey(&write_key_guard);
+        long write_k = GetYCSBWriteKey(k, FLAGS_num);
+        GenerateKeyFromInt(write_k, FLAGS_num, &write_key);
+
+        s = db->Put(write_options_, write_key, gen.Generate(value_size));
+        if (s.ok()) {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 " done:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found, nums);
+    thread->stats.AddMessage(msg);
+  }
+
+  // Workload W (fillzip): Zipfian write workload
+  void YCSBWorkloadW(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    init_zipf_generator(0, FLAGS_key_range, bench_params.zipf_const);
+
+    std::string value;
+    int64_t writes_done = 0;
+    int64_t nums = FLAGS_num;
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    while (nums > 0) {
+      nums--;
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_YCSB_uniform_distribution) {
+        k = thread->rand.Next() % FLAGS_num;
+      } else {
+        k = nextValue() % FLAGS_key_range;
+      }
+      long write_k = GetYCSBWriteKey(k, FLAGS_key_range);
+      GenerateKeyFromInt(write_k, FLAGS_key_range, &key);
+
+      if (FLAGS_benchmark_write_rate_limit > 0) {
+        thread->shared->write_rate_limiter->Request(
+            value_size + FLAGS_key_size, Env::IO_HIGH, nullptr /* stats */,
+            RateLimiter::OpType::kWrite);
+        thread->stats.ResetLastOpTime();
+      }
+      Status s = db->Put(write_options_, key, gen.Generate(value_size));
+      if (s.ok()) {
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( writes:%" PRIu64 " total:%" PRIu64 ")",
+             writes_done, readwrites_);
+    thread->stats.AddMessage(msg);
   }
 
   void ReadRandom(ThreadState* thread) {
@@ -10297,6 +10752,106 @@ class Benchmark {
     cache_->ReportProblems(debug_logger);
   }
 
+  void PrintHitCountSummary() {
+    if (!dbstats) return;
+    uint64_t memtable_hit = dbstats->getTickerCount(Tickers::MEMTABLE_HIT);
+    uint64_t block_cache_hit =
+        dbstats->getTickerCount(Tickers::BLOCK_CACHE_KEY_HIT);
+    uint64_t l0_hit = dbstats->getTickerCount(Tickers::GET_HIT_L0);
+    uint64_t l1_hit = dbstats->getTickerCount(Tickers::GET_HIT_L1);
+    uint64_t l2_hit = dbstats->getTickerCount(Tickers::GET_HIT_L2);
+    uint64_t l3_hit = dbstats->getTickerCount(Tickers::GET_HIT_L3);
+    uint64_t l4_hit = dbstats->getTickerCount(Tickers::GET_HIT_L4);
+    uint64_t l5_hit = dbstats->getTickerCount(Tickers::GET_HIT_L5);
+    uint64_t l6_and_up_hit =
+        dbstats->getTickerCount(Tickers::GET_HIT_L6_AND_UP);
+
+    fprintf(stdout,
+            "READ HIT BREAKDOWN: memtable hit: %" PRIu64
+            ", blockcache hit: %" PRIu64 ", L0 hit: %" PRIu64
+            ", L1 hit: %" PRIu64 ", L2 hit: %" PRIu64 ", L3 hit: %" PRIu64
+            ", L4 hit: %" PRIu64 ", L5 hit: %" PRIu64 ", L6+ hit: %" PRIu64
+            "\n",
+            memtable_hit, block_cache_hit, l0_hit, l1_hit, l2_hit, l3_hit,
+            l4_hit, l5_hit, l6_and_up_hit);
+
+    uint64_t mem_time_ns =
+        dbstats->getTickerCount(Tickers::MEMTABLE_HIT_TIME_NANOS);
+    uint64_t bc_time_ns =
+        dbstats->getTickerCount(Tickers::BLOCK_CACHE_HIT_TIME_NANOS);
+    uint64_t disk_time_ns =
+        dbstats->getTickerCount(Tickers::DISK_HIT_TIME_NANOS);
+
+    if (mem_time_ns > 0 || bc_time_ns > 0 || disk_time_ns > 0) {
+      double mem_ms = mem_time_ns / 1e6;
+      double bc_ms = bc_time_ns / 1e6;
+      double disk_ms = disk_time_ns / 1e6;
+
+      double mem_avg_us =
+          memtable_hit > 0 ? (mem_time_ns / 1e3) / memtable_hit : 0.0;
+      double bc_avg_us =
+          block_cache_hit > 0 ? (bc_time_ns / 1e3) / block_cache_hit : 0.0;
+      uint64_t total_disk_hits = l0_hit + l1_hit + l2_hit + l3_hit + l4_hit +
+                                 l5_hit + l6_and_up_hit;
+      double disk_avg_us =
+          total_disk_hits > 0 ? (disk_time_ns / 1e3) / total_disk_hits : 0.0;
+
+      fprintf(stdout,
+              "READ TIME BREAKDOWN: memtable time: %.2f ms (avg: %.2f us/op)"
+              ", blockcache time: %.2f ms (avg: %.2f us/op)"
+              ", disk time: %.2f ms (avg: %.2f us/op)\n",
+              mem_ms, mem_avg_us, bc_ms, bc_avg_us, disk_ms, disk_avg_us);
+    }
+
+    uint64_t flush_drop_new =
+        dbstats->getTickerCount(Tickers::FLUSH_KEY_DROP_NEWER_ENTRY);
+    uint64_t flush_drop_obs =
+        dbstats->getTickerCount(Tickers::FLUSH_KEY_DROP_OBSOLETE);
+    uint64_t flush_invalid = flush_drop_new + flush_drop_obs;
+
+    uint64_t compact_drop_new =
+        dbstats->getTickerCount(Tickers::COMPACTION_KEY_DROP_NEWER_ENTRY);
+    uint64_t compact_drop_obs =
+        dbstats->getTickerCount(Tickers::COMPACTION_KEY_DROP_OBSOLETE);
+    uint64_t compact_drop_rdel =
+        dbstats->getTickerCount(Tickers::COMPACTION_KEY_DROP_RANGE_DEL);
+    uint64_t compaction_invalid =
+        compact_drop_new + compact_drop_obs + compact_drop_rdel;
+
+    uint64_t keys_written =
+        dbstats->getTickerCount(Tickers::NUMBER_KEYS_WRITTEN);
+    uint64_t valid_keys = keys_written > (flush_invalid + compaction_invalid)
+                              ? keys_written - (flush_invalid + compaction_invalid)
+                              : 0;
+
+    fprintf(stdout,
+            "KV LIFETIME BREAKDOWN: total writes: %" PRIu64
+            ", valid: %" PRIu64 ", invalidated in flush: %" PRIu64
+            ", invalidated by compaction: %" PRIu64 "\n",
+            keys_written, valid_keys, flush_invalid, compaction_invalid);
+
+    uint64_t compact_write_bytes =
+        dbstats->getTickerCount(Tickers::COMPACT_WRITE_BYTES);
+    double compact_write_mb = compact_write_bytes / (1024.0 * 1024.0);
+
+    std::string sst_size_str;
+    uint64_t total_sst_bytes = 0;
+    if (db_.db != nullptr &&
+        db_.db->GetProperty("rocksdb.total-sst-files-size", &sst_size_str)) {
+      try {
+        total_sst_bytes = std::stoull(sst_size_str);
+      } catch (...) {
+        total_sst_bytes = 0;
+      }
+    }
+    double sst_db_size_mb = total_sst_bytes / (1024.0 * 1024.0);
+
+    fprintf(stdout,
+            "COMPACTION & SPACE AMP SUMMARY: compact write bytes: %.2f MB"
+            ", total db sst size: %.2f MB\n",
+            compact_write_mb, sst_db_size_mb);
+  }
+
   void PrintStats(const char* key) {
     if (db_.db != nullptr) {
       PrintStats(db_.db, key, false);
@@ -10849,6 +11404,8 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   }
   RegisterDbBenchBdwFlagValidators();
   ParseCommandLineFlags(&argc, &argv, true);
+  bench_params.zipf_const = FLAGS_zipf_const;
+  bench_params.key_range = FLAGS_key_range;
   FLAGS_compaction_style_e =
       (ROCKSDB_NAMESPACE::CompactionStyle)FLAGS_compaction_style;
   if (FLAGS_statistics && !FLAGS_statistics_string.empty()) {

@@ -141,10 +141,35 @@ enum Tickers : uint32_t {
   // # of memtable misses.
   MEMTABLE_MISS,
 
+  // # of keys dropped during memtable flush by GC / newer entry
+  FLUSH_KEY_DROP_NEWER_ENTRY,
+  FLUSH_KEY_DROP_OBSOLETE,
+
+  // # of memtable flush jobs completed
+  MEMTABLE_FLUSH_COUNT,
+
+  // Cumulative nanoseconds spent on Get() operations by hit type
+  MEMTABLE_HIT_TIME_NANOS,
+  BLOCK_CACHE_HIT_TIME_NANOS,
+  DISK_HIT_TIME_NANOS,
+
+  // # of Get() queries where key was found in a data block served from block cache
+  BLOCK_CACHE_KEY_HIT,
+
   // # of Get() queries served by L0
   GET_HIT_L0,
   // # of Get() queries served by L1
   GET_HIT_L1,
+  // # of Get() queries served by L2
+  GET_HIT_L2,
+  // # of Get() queries served by L3
+  GET_HIT_L3,
+  // # of Get() queries served by L4
+  GET_HIT_L4,
+  // # of Get() queries served by L5
+  GET_HIT_L5,
+  // # of Get() queries served by L6 and up
+  GET_HIT_L6_AND_UP,
   // # of Get() queries served by L2 and up
   GET_HIT_L2_AND_UP,
 

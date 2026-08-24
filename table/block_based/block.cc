@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
@@ -1279,6 +1280,13 @@ BlockBasedTableOptions::DataBlockIndexType Block::IndexType() const {
 }
 
 Block::~Block() {
+  if (eviction_logger_) {
+    ROCKS_LOG_INFO(
+        eviction_logger_,
+        "[BLOCK_CACHE_DATA_EVICT] Level: %d, StartKey: %s, EndKey: %s",
+        eviction_level_, eviction_start_key_.c_str(),
+        eviction_end_key_.c_str());
+  }
   // This sync point can be re-enabled if RocksDB can control the
   // initialization order of any/all static options created by the user.
   // TEST_SYNC_POINT("Block::~Block");

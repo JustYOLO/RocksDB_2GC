@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "cache/cache_reservation_manager.h"
@@ -2424,6 +2425,62 @@ INSTANTIATE_TEST_CASE_P(
             .WithCompressionDictByteCounts({0})
             .WithFillCacheFlags({false})
             .build()));
+
+class KeyRangeTestLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char* format, va_list ap) override {
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    ss_ << buffer << "\n";
+  }
+  std::string AsString() const { return ss_.str(); }
+
+ private:
+  std::stringstream ss_;
+};
+
+TEST(BlockBasedTableReaderTest, LogDataBlockKeyRangeEviction) {
+  std::string dbname = test::PerThreadDBPath("log_data_block_key_range_test");
+  ASSERT_OK(DestroyDB(dbname, Options()));
+
+  Options options;
+  options.create_if_missing = true;
+
+  std::shared_ptr<KeyRangeTestLogger> logger =
+      std::make_shared<KeyRangeTestLogger>();
+  options.info_log = logger;
+
+  BlockBasedTableOptions table_options;
+  table_options.log_data_block_key_range = true;
+  table_options.block_cache = NewLRUCache(1024 * 1024);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  DB* db = nullptr;
+  ASSERT_OK(DB::Open(options, dbname, &db));
+
+  for (int i = 0; i < 100; ++i) {
+    std::string key = "key" + std::to_string(i);
+    std::string val = "val" + std::to_string(i);
+    ASSERT_OK(db->Put(WriteOptions(), key, val));
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  std::string value;
+  ASSERT_OK(db->Get(ReadOptions(), "key0", &value));
+
+  std::string log_str = logger->AsString();
+  ASSERT_NE(log_str.find("[BLOCK_CACHE_DATA_LOAD]"), std::string::npos);
+
+  table_options.block_cache->EraseUnRefEntries();
+  delete db;
+  db = nullptr;
+
+  log_str = logger->AsString();
+  ASSERT_NE(log_str.find("[BLOCK_CACHE_DATA_EVICT]"), std::string::npos);
+
+  ASSERT_OK(DestroyDB(dbname, Options()));
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

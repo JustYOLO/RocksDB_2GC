@@ -168,6 +168,16 @@ void FlushJob::ReportFlushInputSize(const autovector<ReadOnlyMemTable*>& mems) {
 
 void FlushJob::RecordFlushIOStats() {
   RecordTick(stats_, FLUSH_WRITE_BYTES, IOSTATS(bytes_written));
+  if (flush_iteration_stats_.num_record_drop_hidden > 0) {
+    RecordTick(stats_, FLUSH_KEY_DROP_NEWER_ENTRY,
+               flush_iteration_stats_.num_record_drop_hidden);
+    flush_iteration_stats_.num_record_drop_hidden = 0;
+  }
+  if (flush_iteration_stats_.num_record_drop_obsolete > 0) {
+    RecordTick(stats_, FLUSH_KEY_DROP_OBSOLETE,
+               flush_iteration_stats_.num_record_drop_obsolete);
+    flush_iteration_stats_.num_record_drop_obsolete = 0;
+  }
   ThreadStatusUtil::IncreaseThreadOperationProperty(
       ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
@@ -1192,6 +1202,7 @@ Status FlushJob::WriteLevel0Table() {
 
   flush_stats.num_output_files_blob = static_cast<int>(blobs.size());
 
+  RecordTick(stats_, MEMTABLE_FLUSH_COUNT);
   RecordTimeToHistogram(stats_, FLUSH_TIME, flush_stats.micros);
   cfd_->internal_stats()->AddCompactionStats(0 /* level */, thread_pri_,
                                              flush_stats);

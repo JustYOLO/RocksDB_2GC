@@ -2164,6 +2164,10 @@ struct ReadOptions {
   // found at the specified cache, then Status::Incomplete is returned.
   ReadTier read_tier = kReadAllTier;
 
+  // Track fine-grained latency breakdown for Memtable vs Block Cache vs Disk hits
+  bool log_read_time_breakdown = false;
+  mutable uint64_t get_start_nanos = 0;
+
   // For file reads associated with this option, charge the internal rate
   // limiter (see `DBOptions::rate_limiter`) at the specified priority. The
   // special value `Env::IO_TOTAL` disables charging the rate limiter.

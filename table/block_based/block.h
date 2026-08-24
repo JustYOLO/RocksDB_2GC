@@ -39,6 +39,7 @@ class DataBlockIter;
 class IndexBlockIter;
 class MetaBlockIter;
 class BlockPrefixIndex;
+class Logger;
 
 // BlockReadAmpBitmap is a bitmap that map the ROCKSDB_NAMESPACE::Block data
 // bytes to a bitmap with ratio bytes_per_bit. Whenever we access a range of
@@ -205,6 +206,14 @@ class Block {
                                  bool block_contents_pinned = false,
                                  bool user_defined_timestamps_persisted = true);
 
+  void SetEvictionLogging(Logger* logger, int level, std::string start_key,
+                          std::string end_key) {
+    eviction_logger_ = logger;
+    eviction_level_ = level;
+    eviction_start_key_ = std::move(start_key);
+    eviction_end_key_ = std::move(end_key);
+  }
+
   // Returns an MetaBlockIter for iterating over blocks containing metadata
   // (like Properties blocks).  Unlike data blocks, the keys for these blocks
   // do not contain sequence numbers, do not use a user-define comparator, and
@@ -309,6 +318,12 @@ class Block {
 
   // Pointer to values section, nullptr if not using separated KV
   const char* values_section_{nullptr};
+
+  // Eviction logging context
+  Logger* eviction_logger_{nullptr};
+  int eviction_level_{-1};
+  std::string eviction_start_key_;
+  std::string eviction_end_key_;
 };
 
 // A `BlockIter` iterates over the entries in a `Block`'s data buffer. The

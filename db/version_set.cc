@@ -2964,6 +2964,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       max_covering_tombstone_seq, clock_, seq,
       merge_operator_ ? pinned_iters_mgr : nullptr, callback, is_blob_to_use,
       tracing_get_id, &blob_fetcher);
+  get_context.set_start_nanos(read_options.get_start_nanos);
 
   // Pin blocks that we read to hold merge operands
   if (merge_operator_) {
@@ -3029,12 +3030,59 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         }
         break;
       case GetContext::kFound:
-        if (fp.GetHitFileLevel() == 0) {
-          RecordTick(db_statistics_, GET_HIT_L0);
-        } else if (fp.GetHitFileLevel() == 1) {
-          RecordTick(db_statistics_, GET_HIT_L1);
-        } else if (fp.GetHitFileLevel() >= 2) {
-          RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+        if (get_context.get_start_nanos() > 0 && clock_) {
+          uint64_t elapsed = clock_->NowNanos() - get_context.get_start_nanos();
+          if (get_context.get_context_stats_.num_cache_data_hit > 0) {
+            RecordTick(db_statistics_, BLOCK_CACHE_KEY_HIT);
+            RecordTick(db_statistics_, BLOCK_CACHE_HIT_TIME_NANOS, elapsed);
+          } else {
+            RecordTick(db_statistics_, DISK_HIT_TIME_NANOS, elapsed);
+            if (fp.GetHitFileLevel() == 0) {
+              RecordTick(db_statistics_, GET_HIT_L0);
+            } else if (fp.GetHitFileLevel() == 1) {
+              RecordTick(db_statistics_, GET_HIT_L1);
+            } else if (fp.GetHitFileLevel() == 2) {
+              RecordTick(db_statistics_, GET_HIT_L2);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 3) {
+              RecordTick(db_statistics_, GET_HIT_L3);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 4) {
+              RecordTick(db_statistics_, GET_HIT_L4);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 5) {
+              RecordTick(db_statistics_, GET_HIT_L5);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() >= 6) {
+              RecordTick(db_statistics_, GET_HIT_L6_AND_UP);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            }
+          }
+        } else {
+          if (get_context.get_context_stats_.num_cache_data_hit > 0) {
+            RecordTick(db_statistics_, BLOCK_CACHE_KEY_HIT);
+          } else {
+            if (fp.GetHitFileLevel() == 0) {
+              RecordTick(db_statistics_, GET_HIT_L0);
+            } else if (fp.GetHitFileLevel() == 1) {
+              RecordTick(db_statistics_, GET_HIT_L1);
+            } else if (fp.GetHitFileLevel() == 2) {
+              RecordTick(db_statistics_, GET_HIT_L2);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 3) {
+              RecordTick(db_statistics_, GET_HIT_L3);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 4) {
+              RecordTick(db_statistics_, GET_HIT_L4);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() == 5) {
+              RecordTick(db_statistics_, GET_HIT_L5);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            } else if (fp.GetHitFileLevel() >= 6) {
+              RecordTick(db_statistics_, GET_HIT_L6_AND_UP);
+              RecordTick(db_statistics_, GET_HIT_L2_AND_UP);
+            }
+          }
         }
 
         PERF_COUNTER_BY_LEVEL_ADD(user_key_return_count, 1,
