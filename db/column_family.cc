@@ -28,6 +28,9 @@
 #include "db/internal_stats.h"
 #include "db/job_context.h"
 #include "db/range_del_aggregator.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
+#include "db/space_saving_topk.h"
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
 #include "db/write_controller.h"
@@ -556,6 +559,8 @@ void SuperVersion::Init(
   mem = new_mem;
   imm = new_imm;
   current = new_current;
+  hot_mem = cfd->hot_mem_shared();
+  hot_router = cfd->hot_router_shared();
   full_history_ts_low = cfd->GetFullHistoryTsLow();
   seqno_to_time_mapping = std::move(new_seqno_to_time_mapping);
   cfd->Ref();
@@ -738,6 +743,93 @@ ColumnFamilyData::ColumnFamilyData(
               bbto->block_cache)));
     }
   }
+
+  if (ioptions_.enable_hot_table) {
+    base_write_buffer_size_ = mutable_cf_options_.write_buffer_size;
+    hot_mem_ = std::make_shared<HotMemTable>(
+        internal_comparator_, ioptions_.hot_table_write_buffer_size,
+        ioptions_.hot_table_max_value_size);
+    size_t initial_cap = ioptions_.hot_table_write_buffer_size /
+                         (32 + ioptions_.hot_table_max_value_size);
+    if (initial_cap == 0) initial_cap = 1024;
+    hot_router_ = std::make_shared<HotTableRouter>(initial_cap);
+    // Initially start disabled to avoid bloom filter overhead during uniform/cold start
+    hot_router_->Disable();
+    // Dynamically expand cold memtable buffer to absorb unused HotTable memory
+    size_t expanded_size = base_write_buffer_size_ + ioptions_.hot_table_write_buffer_size;
+    mutable_cf_options_.write_buffer_size = expanded_size;
+    if (mem_) {
+      mem_->UpdateWriteBufferSize(expanded_size);
+    }
+    space_saving_topk_ = std::make_shared<SpaceSavingTopK>(
+        initial_cap * 2, ioptions_.hot_table_decay_factor,
+        ioptions_.hot_table_zero_hit_penalty);
+  }
+}
+
+void ColumnFamilyData::ExecuteVirtualFlush() {
+  if (!ioptions_.enable_hot_table || !hot_mem_ || !space_saving_topk_) {
+    return;
+  }
+  std::unordered_map<std::string, uint32_t> hit_map;
+  hot_mem_->SweepHits(&hit_map);
+  space_saving_topk_->ApplyDecayAndPenalties(hit_map);
+  RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
+}
+
+void ColumnFamilyData::RebuildHotTable() {
+  if (!ioptions_.enable_hot_table) {
+    return;
+  }
+  size_t capacity = ioptions_.hot_table_write_buffer_size /
+                    (32 + ioptions_.hot_table_max_value_size);
+  if (capacity == 0) capacity = 1024;
+
+  bool currently_active = (hot_router_ && hot_router_->IsActive());
+  bool is_skewed = true;
+  if (space_saving_topk_) {
+    is_skewed = space_saving_topk_->IsWorkloadSkewed(
+        currently_active,
+        ioptions_.hot_table_min_duplicate_ratio,
+        ioptions_.hot_table_min_absorption_ratio,
+        ioptions_.hot_table_consecutive_threshold_windows);
+  }
+
+  if (!is_skewed) {
+    if (hot_router_) {
+      hot_router_->Disable();
+    }
+    if (space_saving_topk_) {
+      space_saving_topk_->Clear();
+    }
+    // Expand cold memtable write buffer size to absorb unused hot table memory
+    size_t expanded_size = base_write_buffer_size_ + ioptions_.hot_table_write_buffer_size;
+    mutable_cf_options_.write_buffer_size = expanded_size;
+    if (mem_) {
+      mem_->UpdateWriteBufferSize(expanded_size);
+    }
+    return;
+  }
+
+  // Workload is skewed -> enable HotTable and revert cold memtable to base buffer size
+  mutable_cf_options_.write_buffer_size = base_write_buffer_size_;
+  if (mem_) {
+    mem_->UpdateWriteBufferSize(base_write_buffer_size_);
+  }
+
+  hot_mem_ = std::make_shared<HotMemTable>(
+      internal_comparator_, ioptions_.hot_table_write_buffer_size,
+      ioptions_.hot_table_max_value_size);
+  auto new_router = std::make_shared<HotTableRouter>(capacity);
+
+  if (space_saving_topk_) {
+    auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
+    for (const auto& entry : top_keys) {
+      new_router->Add(entry.key);
+    }
+  }
+  hot_router_ = std::move(new_router);
+  RecordTick(ioptions_.statistics.get(), HOT_TABLE_PHYSICAL_FLUSH_COUNT);
 }
 
 // DB mutex held

@@ -346,6 +346,16 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.atomic_flush.request.reason.memtable_max_range_deletions"},
     {ATOMIC_FLUSH_REQUEST_REASON_OTHER,
      "rocksdb.atomic_flush.request.reason.other"},
+    {HOT_TABLE_HIT_COUNT, "rocksdb.hot.table.hit.count"},
+    {HOT_TABLE_WRITE_HIT_COUNT, "rocksdb.hot.table.write.hit.count"},
+    {HOT_TABLE_WRITE_MISS_COUNT, "rocksdb.hot.table.write.miss.count"},
+    {HOT_TABLE_READ_HIT_COUNT, "rocksdb.hot.table.read.hit.count"},
+    {HOT_TABLE_READ_MISS_COUNT, "rocksdb.hot.table.read.miss.count"},
+    {HOT_TABLE_ROUTER_FILTERED, "rocksdb.hot.table.router.filtered"},
+    {HOT_TABLE_ROUTER_MATCH, "rocksdb.hot.table.router.match"},
+    {HOT_TABLE_ROUTER_FALSE_POSITIVES, "rocksdb.hot.table.router.false.positives"},
+    {HOT_TABLE_VIRTUAL_FLUSH_COUNT, "rocksdb.hot.table.virtual.flush.count"},
+    {HOT_TABLE_PHYSICAL_FLUSH_COUNT, "rocksdb.hot.table.physical.flush.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

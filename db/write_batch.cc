@@ -52,6 +52,9 @@
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/flush_scheduler.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
+#include "db/space_saving_topk.h"
 #include "db/kv_checksum.h"
 #include "db/memtable.h"
 #include "db/merge_context.h"
@@ -2304,6 +2307,26 @@ class MemTableInserter : public WriteBatch::Handler {
 
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
+
+    ColumnFamilyData* cfd = cf_mems_->current();
+    if (cfd && cfd->ioptions().enable_hot_table && cfd->hot_router() &&
+        cfd->hot_router()->IsActive() && cfd->hot_mem()) {
+      if (cfd->hot_router()->MayContain(key)) {
+        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
+        if (cfd->hot_mem()->UpdateInPlace(key, value, value_type, sequence_) ||
+            cfd->hot_mem()->Add(key, value, value_type, sequence_)) {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_HIT_COUNT);
+          MaybeAdvanceSeq(false /* batch_boundary */);
+          return Status::OK();
+        } else {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FALSE_POSITIVES);
+        }
+      } else {
+        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FILTERED);
+      }
+      RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_MISS_COUNT);
+    }
     // inplace_update_support is inconsistent with snapshots, and therefore with
     // any kind of transactions including the ones that use seq_per_batch
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
@@ -2523,6 +2546,26 @@ class MemTableInserter : public WriteBatch::Handler {
                     const ProtectionInfoKVOS64* kv_prot_info) {
     Status ret_status;
     MemTable* mem = cf_mems_->GetMemTable();
+
+    ColumnFamilyData* cfd = cf_mems_->current();
+    if (cfd && cfd->ioptions().enable_hot_table && cfd->hot_router() &&
+        cfd->hot_router()->IsActive() && cfd->hot_mem()) {
+      if (cfd->hot_router()->MayContain(key)) {
+        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
+        if (cfd->hot_mem()->UpdateInPlace(key, Slice(), delete_type, sequence_) ||
+            cfd->hot_mem()->Add(key, Slice(), delete_type, sequence_)) {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_HIT_COUNT);
+          MaybeAdvanceSeq();
+          return Status::OK();
+        } else {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FALSE_POSITIVES);
+        }
+      } else {
+        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FILTERED);
+      }
+      RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_MISS_COUNT);
+    }
     if (delete_type == kTypeRangeDeletion &&
         concurrent_memtable_writes_ == false) {
       // Need to force range deletions to undergo concurrent writes since reads

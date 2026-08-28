@@ -17,6 +17,9 @@
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/event_helpers.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
+#include "db/space_saving_topk.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
@@ -244,6 +247,12 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
       mutable_cf_options_.experimental_mempurge_threshold;
 
   AutoThreadOperationStageUpdater stage_run(ThreadStatus::STAGE_FLUSH_RUN);
+  if (cfd_->ioptions().enable_hot_table) {
+    cfd_->IncrementColdFlushCounter();
+    if (cfd_->cold_flush_counter() % cfd_->ioptions().virtual_flush_interval_flushes == 0) {
+      cfd_->ExecuteVirtualFlush();
+    }
+  }
   if (mems_.empty()) {
     ROCKS_LOG_BUFFER(log_buffer_, "[%s] No memtable to flush",
                      cfd_->GetName().c_str());
@@ -892,6 +901,7 @@ Status FlushJob::WriteLevel0Table() {
   const uint64_t start_micros = clock_->NowMicros();
   const uint64_t start_cpu_micros = clock_->CPUMicros();
   Status s;
+  bool flush_hot_table = false;
 
   meta_.temperature = mutable_cf_options_.default_write_temperature;
   file_options_.temperature = meta_.temperature;
@@ -971,6 +981,63 @@ Status FlushJob::WriteLevel0Table() {
       total_data_size += m->GetDataSize();
       total_memory_usage += m->ApproximateMemoryUsage();
       total_num_range_deletes += m->NumRangeDeletion();
+    }
+
+    // Identify and record keys in the flushed cold memtable(s) that appeared >= 2 times
+    if (cfd_->ioptions().enable_hot_table && cfd_->space_saving_topk()) {
+      uint64_t total_duplicate_entries = 0;
+      for (ReadOnlyMemTable* m : mems_) {
+        InternalIterator* scan_it = m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+                                                   /*prefix_extractor=*/nullptr, /*for_flush=*/true);
+        std::string prev_user_key;
+        uint64_t dup_count = 0;
+
+        for (scan_it->SeekToFirst(); scan_it->Valid(); scan_it->Next()) {
+          ParsedInternalKey pikey;
+          if (ParseInternalKey(scan_it->key(), &pikey, false /* log_err_key */).ok()) {
+            if (dup_count > 0 && pikey.user_key == prev_user_key) {
+              dup_count++;
+            } else {
+              if (dup_count >= 2) {
+                cfd_->space_saving_topk()->Update(prev_user_key, dup_count);
+                total_duplicate_entries += dup_count;
+              }
+              prev_user_key = pikey.user_key.ToString();
+              dup_count = 1;
+            }
+          }
+        }
+        if (dup_count >= 2) {
+          cfd_->space_saving_topk()->Update(prev_user_key, dup_count);
+          total_duplicate_entries += dup_count;
+        }
+      }
+      uint64_t cur_hits = 0;
+      uint64_t cur_misses = 0;
+      if (stats_) {
+        cur_hits = stats_->getTickerCount(HOT_TABLE_WRITE_HIT_COUNT);
+        cur_misses = stats_->getTickerCount(HOT_TABLE_WRITE_MISS_COUNT);
+      }
+      uint64_t delta_hits = (cur_hits >= cfd_->last_hot_write_hits()) ? (cur_hits - cfd_->last_hot_write_hits()) : cur_hits;
+      uint64_t delta_misses = (cur_misses >= cfd_->last_hot_write_misses()) ? (cur_misses - cfd_->last_hot_write_misses()) : cur_misses;
+      cfd_->set_last_hot_write_stats(cur_hits, cur_misses);
+
+      cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries, total_duplicate_entries,
+                                                  delta_hits, delta_misses);
+    }
+
+    flush_hot_table = false;
+    if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem()) {
+      if (cfd_->hot_mem()->IsFull() || flush_reason_ == FlushReason::kWalFull ||
+          flush_reason_ == FlushReason::kShutDown || flush_reason_ == FlushReason::kManualFlush) {
+        flush_hot_table = true;
+      }
+    }
+    if (flush_hot_table) {
+      memtables.push_back(cfd_->hot_mem()->NewIterator(&arena));
+      total_num_input_entries += cfd_->hot_mem()->KeyCount();
+      total_data_size += cfd_->hot_mem()->ApproximateMemoryUsage();
+      total_memory_usage += cfd_->hot_mem()->ApproximateMemoryUsage();
     }
 
     RecordInHistogram(stats_, FLUSH_MEMTABLE_MEMORY_BYTES, total_memory_usage);
@@ -1210,6 +1277,12 @@ Status FlushJob::WriteLevel0Table() {
       InternalStats::BYTES_FLUSHED,
       flush_stats.bytes_written + flush_stats.bytes_written_blob);
   RecordFlushIOStats();
+
+  if (s.ok()) {
+    if (flush_hot_table || (cfd_->ioptions().enable_hot_table && cfd_->hot_router())) {
+      cfd_->RebuildHotTable();
+    }
+  }
 
   return s;
 }

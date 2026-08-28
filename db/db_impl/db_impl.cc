@@ -45,6 +45,8 @@
 #include "db/external_sst_file_ingestion_job.h"
 #include "db/flush_job.h"
 #include "db/forward_iterator.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
 #include "db/import_column_family_job.h"
 #include "db/job_context.h"
 #include "db/log_reader.h"
@@ -3351,8 +3353,43 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     }
   };
   if (!skip_memtable) {
+    if (sv->hot_router && sv->hot_router->IsActive() && sv->hot_mem) {
+      if (sv->hot_router->MayContain(lkey.user_key())) {
+        RecordTick(stats_, HOT_TABLE_ROUTER_MATCH);
+        std::string hot_val;
+        Status hot_s = Status::OK();
+        SequenceNumber hot_seq = 0;
+        if (sv->hot_mem->Get(lkey.user_key(), &hot_val, &hot_s, &hot_seq)) {
+          if (hot_s.ok()) {
+            done = true;
+            s = Status::OK();
+            if (get_impl_options.value != nullptr) {
+              *get_impl_options.value->GetSelf() = std::move(hot_val);
+              get_impl_options.value->PinSelf();
+            }
+            if (get_impl_options.value_found != nullptr) {
+              *get_impl_options.value_found = true;
+            }
+            RecordTick(stats_, HOT_TABLE_READ_HIT_COUNT);
+            RecordTick(stats_, MEMTABLE_HIT);
+          } else if (hot_s.IsNotFound()) {
+            done = true;
+            s = Status::NotFound();
+            if (get_impl_options.value_found != nullptr) {
+              *get_impl_options.value_found = false;
+            }
+          }
+        } else {
+          RecordTick(stats_, HOT_TABLE_ROUTER_FALSE_POSITIVES);
+          RecordTick(stats_, HOT_TABLE_READ_MISS_COUNT);
+        }
+      } else {
+        RecordTick(stats_, HOT_TABLE_ROUTER_FILTERED);
+        RecordTick(stats_, HOT_TABLE_READ_MISS_COUNT);
+      }
+    }
     // Get value associated with key
-    if (get_impl_options.get_value) {
+    if (!done && get_impl_options.get_value) {
       if (sv->mem->Get(lkey,
                        get_impl_options.value
                            ? get_impl_options.value->GetSelf()

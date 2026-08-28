@@ -1704,6 +1704,25 @@ DEFINE_uint64(inplace_update_num_locks,
               ROCKSDB_NAMESPACE::Options().inplace_update_num_locks,
               "Number of RW locks to protect in-place memtable updates");
 
+DEFINE_bool(enable_hot_table, false,
+            "Enable Adaptive In-Place Hot Table architecture");
+DEFINE_uint64(hot_table_write_buffer_size, 64 * 1024 * 1024,
+              "Size of Hot Table in bytes");
+DEFINE_uint32(hot_table_max_value_size, 1024,
+              "Max value padding for in-place Hot Table nodes in bytes");
+DEFINE_uint32(virtual_flush_interval_flushes, 1,
+              "Cold flushes per Virtual Flush sweep");
+DEFINE_double(hot_table_decay_factor, 0.5,
+              "Aging decay factor for History Tracker");
+DEFINE_double(hot_table_zero_hit_penalty, 0.25,
+              "0-hit penalty factor for History Tracker");
+DEFINE_double(hot_table_min_duplicate_ratio, 0.20,
+              "Minimum duplicate ratio in cold memtable to consider workload skewed");
+DEFINE_double(hot_table_min_absorption_ratio, 0.20,
+              "Minimum write absorption ratio in HotTable to consider workload skewed");
+DEFINE_uint32(hot_table_consecutive_threshold_windows, 2,
+              "Number of consecutive flush windows required to switch HotTable state");
+
 DEFINE_bool(enable_write_thread_adaptive_yield, true,
             "Use a yielding spin loop for brief writer thread waits.");
 
@@ -5655,6 +5674,16 @@ class Benchmark {
         FLAGS_experimental_mempurge_threshold;
     options.inplace_update_support = FLAGS_inplace_update_support;
     options.inplace_update_num_locks = FLAGS_inplace_update_num_locks;
+    options.enable_hot_table = FLAGS_enable_hot_table;
+    options.hot_table_write_buffer_size = FLAGS_hot_table_write_buffer_size;
+    options.hot_table_max_value_size = FLAGS_hot_table_max_value_size;
+    options.virtual_flush_interval_flushes = FLAGS_virtual_flush_interval_flushes;
+    options.hot_table_decay_factor = FLAGS_hot_table_decay_factor;
+    options.hot_table_zero_hit_penalty = FLAGS_hot_table_zero_hit_penalty;
+    options.hot_table_min_duplicate_ratio = FLAGS_hot_table_min_duplicate_ratio;
+    options.hot_table_min_absorption_ratio = FLAGS_hot_table_min_absorption_ratio;
+    options.hot_table_consecutive_threshold_windows =
+        FLAGS_hot_table_consecutive_threshold_windows;
     options.enable_write_thread_adaptive_yield =
         FLAGS_enable_write_thread_adaptive_yield;
     options.enable_pipelined_write = FLAGS_enable_pipelined_write;
@@ -10850,6 +10879,36 @@ class Benchmark {
             "COMPACTION & SPACE AMP SUMMARY: compact write bytes: %.2f MB"
             ", total db sst size: %.2f MB\n",
             compact_write_mb, sst_db_size_mb);
+
+    uint64_t hot_write_hit = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT);
+    uint64_t hot_write_miss = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_MISS_COUNT);
+    uint64_t hot_read_hit = dbstats->getTickerCount(Tickers::HOT_TABLE_READ_HIT_COUNT);
+    uint64_t hot_read_miss = dbstats->getTickerCount(Tickers::HOT_TABLE_READ_MISS_COUNT);
+    uint64_t hot_filtered = dbstats->getTickerCount(Tickers::HOT_TABLE_ROUTER_FILTERED);
+    uint64_t hot_matches = dbstats->getTickerCount(Tickers::HOT_TABLE_ROUTER_MATCH);
+    uint64_t hot_fp = dbstats->getTickerCount(Tickers::HOT_TABLE_ROUTER_FALSE_POSITIVES);
+    uint64_t vflush_cnt = dbstats->getTickerCount(Tickers::HOT_TABLE_VIRTUAL_FLUSH_COUNT);
+    uint64_t pflush_cnt = dbstats->getTickerCount(Tickers::HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+
+    if (FLAGS_enable_hot_table || hot_write_hit > 0 || hot_write_miss > 0 || hot_read_hit > 0 || vflush_cnt > 0) {
+      uint64_t total_writes = hot_write_hit + hot_write_miss;
+      double write_ratio = total_writes > 0 ? (100.0 * hot_write_hit / total_writes) : 0.0;
+      uint64_t total_reads = hot_read_hit + hot_read_miss;
+      double read_ratio = total_reads > 0 ? (100.0 * hot_read_hit / total_reads) : 0.0;
+      double fp_rate = hot_matches > 0 ? (100.0 * hot_fp / hot_matches) : 0.0;
+
+      fprintf(stdout, "------------------------------------------------\n");
+      fprintf(stdout, "HOT TABLE SUMMARY:\n");
+      fprintf(stdout, "  Writes : %" PRIu64 " in-place hits, %" PRIu64 " misses (Absorption Ratio: %.2f%%)\n",
+              hot_write_hit, hot_write_miss, write_ratio);
+      fprintf(stdout, "  Reads  : %" PRIu64 " in-place hits, %" PRIu64 " misses (Read Hit Ratio: %.2f%%)\n",
+              hot_read_hit, hot_read_miss, read_ratio);
+      fprintf(stdout, "  Router : %" PRIu64 " fast-rejected, %" PRIu64 " matches, %" PRIu64 " false positives (FP Rate: %.2f%%)\n",
+              hot_filtered, hot_matches, hot_fp, fp_rate);
+      fprintf(stdout, "  Flushes: %" PRIu64 " virtual flushes (aging sweeps), %" PRIu64 " physical flushes (L0 merges)\n",
+              vflush_cnt, pflush_cnt);
+      fprintf(stdout, "------------------------------------------------\n");
+    }
   }
 
   void PrintStats(const char* key) {

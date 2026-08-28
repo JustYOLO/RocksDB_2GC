@@ -1117,7 +1117,16 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
           cf_options.persist_user_defined_timestamps),
       cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind),
       memtable_batch_lookup_optimization(
-          cf_options.memtable_batch_lookup_optimization) {}
+          cf_options.memtable_batch_lookup_optimization),
+      enable_hot_table(cf_options.enable_hot_table),
+      hot_table_write_buffer_size(cf_options.hot_table_write_buffer_size),
+      hot_table_max_value_size(cf_options.hot_table_max_value_size),
+      virtual_flush_interval_flushes(cf_options.virtual_flush_interval_flushes),
+      hot_table_decay_factor(cf_options.hot_table_decay_factor),
+      hot_table_zero_hit_penalty(cf_options.hot_table_zero_hit_penalty),
+      hot_table_min_duplicate_ratio(cf_options.hot_table_min_duplicate_ratio),
+      hot_table_min_absorption_ratio(cf_options.hot_table_min_absorption_ratio),
+      hot_table_consecutive_threshold_windows(cf_options.hot_table_consecutive_threshold_windows) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

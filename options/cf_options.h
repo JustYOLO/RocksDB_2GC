@@ -99,6 +99,16 @@ struct ImmutableCFOptions {
   bool cf_allow_ingest_behind;
 
   bool memtable_batch_lookup_optimization;
+
+  bool enable_hot_table;
+  size_t hot_table_write_buffer_size;
+  uint32_t hot_table_max_value_size;
+  uint32_t virtual_flush_interval_flushes;
+  double hot_table_decay_factor;
+  double hot_table_zero_hit_penalty;
+  double hot_table_min_duplicate_ratio;
+  double hot_table_min_absorption_ratio;
+  uint32_t hot_table_consecutive_threshold_windows;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

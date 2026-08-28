@@ -71,9 +71,12 @@ LIB_SOURCES =                                                   \
   db/file_indexer.cc                                            \
   db/flush_job.cc                                               \
   db/flush_scheduler.cc                                         \
-  db/forward_iterator.cc                                        \
+   db/forward_iterator.cc                                        \
+  db/hot_memtable.cc                                            \
+  db/hot_table_router.cc                                        \
   db/import_column_family_job.cc                                \
   db/internal_stats.cc                                          \
+  db/space_saving_topk.cc                                       \
   db/logs_with_prep_tracker.cc                                  \
   db/log_reader.cc                                              \
   db/log_writer.cc                                              \

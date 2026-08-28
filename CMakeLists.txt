@@ -815,8 +815,11 @@ set(SOURCES
         db/flush_job.cc
         db/flush_scheduler.cc
         db/forward_iterator.cc
+        db/hot_memtable.cc
+        db/hot_table_router.cc
         db/import_column_family_job.cc
         db/internal_stats.cc
+        db/space_saving_topk.cc
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
         db/log_writer.cc
@@ -1498,6 +1501,7 @@ if(WITH_TESTS)
         db/db_kv_checksum_test.cc
         db/db_log_iter_test.cc
         db/db_memtable_test.cc
+        db/hot_memtable_test.cc
         db/db_merge_operator_test.cc
         db/db_merge_operand_test.cc
         db/db_open_with_config_test.cc
