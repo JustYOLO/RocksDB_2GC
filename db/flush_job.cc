@@ -1279,8 +1279,11 @@ Status FlushJob::WriteLevel0Table() {
   RecordFlushIOStats();
 
   if (s.ok()) {
-    if (flush_hot_table || (cfd_->ioptions().enable_hot_table && cfd_->hot_router())) {
-      cfd_->RebuildHotTable();
+    if (cfd_->ioptions().enable_hot_table && cfd_->hot_router()) {
+      cfd_->RebuildHotTable(flush_hot_table);
+    }
+    if (cfd_->ioptions().enable_level_up_compaction) {
+      cfd_->DecayAndEvaluateLevelUpSkew();
     }
   }
 

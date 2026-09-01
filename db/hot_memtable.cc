@@ -165,7 +165,8 @@ HotMemTable::~HotMemTable() {
 }
 
 bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
-                               ValueType type, SequenceNumber seq) {
+                               ValueType type, SequenceNumber seq,
+                               uint64_t log_num) {
   HotNode* node = nullptr;
   {
     std::lock_guard<std::mutex> lock(index_mutex_);
@@ -190,11 +191,18 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
 
   node->seq_version.store(v + 2, std::memory_order_release);
   node->hit_count.fetch_add(1, std::memory_order_relaxed);
+
+  if (log_num > 0) {
+    uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
+    while (log_num < cur_earliest_log &&
+           !earliest_log_num_.compare_exchange_weak(cur_earliest_log, log_num)) {}
+  }
+
   return true;
 }
 
 bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
-                      SequenceNumber seq) {
+                      SequenceNumber seq, uint64_t log_num) {
   std::lock_guard<std::mutex> lock(index_mutex_);
   std::string key_str = user_key.ToString();
   auto it = index_.find(key_str);
@@ -210,6 +218,11 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
       memcpy(node->ValBuf(), value.data(), clamped_val_size);
     }
     node->seq_version.store(v + 2, std::memory_order_release);
+    if (log_num > 0) {
+      uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
+      while (log_num < cur_earliest_log &&
+             !earliest_log_num_.compare_exchange_weak(cur_earliest_log, log_num)) {}
+    }
     return true;
   }
 
@@ -234,6 +247,12 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
 
   SequenceNumber cur_earliest = earliest_seq_.load(std::memory_order_relaxed);
   while (seq < cur_earliest && !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {}
+
+  if (log_num > 0) {
+    uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
+    while (log_num < cur_earliest_log &&
+           !earliest_log_num_.compare_exchange_weak(cur_earliest_log, log_num)) {}
+  }
 
   return true;
 }

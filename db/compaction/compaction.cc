@@ -14,6 +14,7 @@
 
 #include "db/column_family.h"
 #include "db/dbformat.h"
+#include "db/spatial_cms.h"
 #include "logging/logging.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/sst_partitioner.h"
@@ -415,9 +416,9 @@ void Compaction::PopulateProximalLevelOutputRange() {
     return;
   }
 
-  // exclude the last level, the range of all input levels is the safe range
-  // of keys that can be moved up.
-  int exclude_level = number_levels_ - 1;
+  // exclude the output level, the range of all non-output input levels is the safe range
+  // of keys that can be retained/moved up.
+  int exclude_level = output_level_;
   proximal_output_range_type_ = ProximalOutputRangeType::kNonLastRange;
 
   // For universal compaction, the proximal_output_range could be extended if
@@ -623,9 +624,45 @@ bool Compaction::IsTrivialMove() const {
     }
   }
 
-  // PerKeyPlacement compaction should never be trivial move.
+  // PerKeyPlacement compaction should never be trivial move, unless Level-Up
+  // compaction determines that no hot data needs to be retained in the proximal level.
   if (SupportsPerKeyPlacement()) {
-    return false;
+    if (immutable_options_.enable_level_up_compaction) {
+      uint64_t total_input_bytes = CalculateTotalInputSize();
+      uint64_t target_file_size = target_output_file_size();
+      uint64_t min_input_size_threshold =
+          std::max(static_cast<uint64_t>(1024 * 1024),
+                   std::min(target_file_size / 4, static_cast<uint64_t>(16 * 1024 * 1024)));
+      if (total_input_bytes < min_input_size_threshold) {
+        // Below minimum size threshold; allow trivial move if applicable.
+      } else {
+        bool is_skewed = (cfd_ != nullptr && cfd_->spatial_cms() != nullptr &&
+                          cfd_->spatial_cms()->IsWorkloadSkewed());
+        if (immutable_options_.level_up_min_skew_ratio > 0.0 && !is_skewed) {
+          // Workload is not evaluated as skewed; no keys will be retained in proximal level.
+          // Allow trivial move to proceed.
+        } else {
+          // Workload is skewed (or skew checking is bypassed with min_skew_ratio <= 0.0).
+          // Check if any candidate input file has hot keys requiring proximal level retention.
+          bool has_hot_data = false;
+          if (cfd_ != nullptr && cfd_->spatial_cms() != nullptr) {
+            for (const auto& file : inputs_.front().files) {
+              if (cfd_->spatial_cms()->HasHotKeyInRange(
+                      file->smallest.user_key(), file->largest.user_key(),
+                      immutable_options_.level_up_warmth_threshold)) {
+                has_hot_data = true;
+                break;
+              }
+            }
+          }
+          if (has_hot_data) {
+            return false;
+          }
+        }
+      }
+    } else {
+      return false;
+    }
   }
 
   return true;
@@ -1028,6 +1065,18 @@ int Compaction::EvaluateProximalLevel(
       immutable_options.compaction_style != kCompactionStyleUniversal) {
     return kInvalidLevel;
   }
+
+  if (immutable_options.enable_level_up_compaction) {
+    if (output_level <= 0 || output_level >= immutable_options.num_levels) {
+      return kInvalidLevel;
+    }
+    int proximal_level = output_level - 1;
+    if (proximal_level <= 0) {
+      return kInvalidLevel;
+    }
+    return proximal_level;
+  }
+
   if (output_level != immutable_options.num_levels - 1) {
     return kInvalidLevel;
   }

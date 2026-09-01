@@ -31,6 +31,7 @@
 #include "db/log_writer.h"
 #include "db/merge_helper.h"
 #include "db/range_del_aggregator.h"
+#include "db/spatial_cms.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "file/file_util.h"
@@ -720,6 +721,35 @@ void CompactionJob::InitializeCompactionRun() {
   TEST_SYNC_POINT("CompactionJob::Run():Start");
   log_buffer_->FlushBufferToLog();
   LogCompaction();
+
+  // Zero-overhead live-lock detection guard
+  if (compact_ != nullptr && compact_->compaction != nullptr) {
+    auto* cfd = compact_->compaction->column_family_data();
+    if (cfd != nullptr) {
+      const Slice smallest = compact_->compaction->GetSmallestUserKey();
+      const Slice largest = compact_->compaction->GetLargestUserKey();
+      int start_lvl = compact_->compaction->start_level();
+
+      if (cfd->CheckAndTrackCompactionLiveLock(start_lvl, smallest, largest, /*threshold=*/10)) {
+        ROCKS_LOG_FATAL(
+            db_options_.info_log,
+            "[LIVE_LOCK_GUARD] Live-lock detected! %u consecutive identical compactions on level %d [%s .. %s]. Shutting down to prevent hang.",
+            cfd->consecutive_identical_compaction_count(), start_lvl,
+            smallest.ToString(/*hex=*/true).c_str(),
+            largest.ToString(/*hex=*/true).c_str());
+        fprintf(stderr,
+                "\n====================================================================\n"
+                "FATAL: Live-lock detected! %u consecutive compactions on identical key\n"
+                "range [%s .. %s] at level %d without progress. Shutting down.\n"
+                "====================================================================\n",
+                cfd->consecutive_identical_compaction_count(),
+                smallest.ToString(/*hex=*/true).c_str(),
+                largest.ToString(/*hex=*/true).c_str(), start_lvl);
+        fflush(stderr);
+        std::abort();
+      }
+    }
+  }
 }
 
 void CompactionJob::RunSubcompactions() {
@@ -1677,6 +1707,33 @@ Status CompactionJob::ProcessKeyValue(
   IterKey prev_iter_output_key;
   ParsedInternalKey prev_iter_output_internal_key;
 
+  uint64_t level_up_retained_bytes = 0;
+  uint64_t level_up_max_budget_bytes = 0;
+  const uint64_t total_input_bytes =
+      sub_compact->compaction->CalculateTotalInputSize();
+  const uint64_t target_file_size =
+      sub_compact->compaction->target_output_file_size();
+  // Prevent micro-compaction ping-pong loop: require minimum input size (1/4 of target file size or 16MB)
+  const uint64_t min_input_size_threshold =
+      std::max(static_cast<uint64_t>(1024 * 1024),
+               std::min(target_file_size / 4, static_cast<uint64_t>(16 * 1024 * 1024)));
+
+  const bool is_level_up_active =
+      cfd->ioptions().enable_level_up_compaction &&
+      sub_compact->compaction->SupportsPerKeyPlacement() &&
+      cfd->spatial_cms() != nullptr &&
+      (cfd->ioptions().level_up_min_skew_ratio <= 0.0 ||
+       cfd->spatial_cms()->IsWorkloadSkewed()) &&
+      (total_input_bytes >= min_input_size_threshold);
+
+  if (is_level_up_active) {
+    level_up_max_budget_bytes = static_cast<uint64_t>(
+        total_input_bytes * cfd->ioptions().level_up_budget_ratio);
+    if (level_up_max_budget_bytes == 0) {
+      level_up_max_budget_bytes = 64 * 1024 * 1024;
+    }
+  }
+
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::ProcessKeyValueCompaction()::Processing",
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
@@ -1703,6 +1760,27 @@ Status CompactionJob::ProcessKeyValue(
 
     const auto& ikey = c_iter->ikey();
     bool use_proximal_output = ikey.sequence > proximal_after_seqno_;
+
+    if (is_level_up_active) {
+      RecordTick(cfd->ioptions().statistics.get(), LEVEL_UP_KEY_CHECKED);
+      uint16_t heat = cfd->spatial_cms()->Estimate(c_iter->user_key());
+      if (heat >= cfd->ioptions().level_up_warmth_threshold) {
+        if (sub_compact->compaction->OverlapProximalLevelOutputRange(
+                c_iter->user_key(), c_iter->user_key())) {
+          uint64_t entry_bytes = c_iter->key().size() + c_iter->value().size();
+          if (level_up_retained_bytes + entry_bytes <= level_up_max_budget_bytes) {
+            use_proximal_output = true;
+            level_up_retained_bytes += entry_bytes;
+            cfd->spatial_cms()->CoolPrefix(c_iter->user_key(), 1);
+            RecordTick(cfd->ioptions().statistics.get(), LEVEL_UP_KEY_RETAINED);
+          } else {
+            RecordTick(cfd->ioptions().statistics.get(), LEVEL_UP_BUDGET_EXCEEDED);
+          }
+        } else {
+          RecordTick(cfd->ioptions().statistics.get(), LEVEL_UP_BOUNDARY_CLIPPED);
+        }
+      }
+    }
 
 #ifndef NDEBUG
     if (sub_compact->compaction->SupportsPerKeyPlacement()) {

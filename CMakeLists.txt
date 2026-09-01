@@ -820,6 +820,7 @@ set(SOURCES
         db/import_column_family_job.cc
         db/internal_stats.cc
         db/space_saving_topk.cc
+        db/spatial_cms.cc
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
         db/log_writer.cc
@@ -1502,6 +1503,7 @@ if(WITH_TESTS)
         db/db_log_iter_test.cc
         db/db_memtable_test.cc
         db/hot_memtable_test.cc
+        db/spatial_cms_test.cc
         db/db_merge_operator_test.cc
         db/db_merge_operand_test.cc
         db/db_open_with_config_test.cc

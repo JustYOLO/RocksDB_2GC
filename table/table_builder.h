@@ -32,6 +32,7 @@ namespace ROCKSDB_NAMESPACE {
 class Slice;
 class Status;
 class BlobSource;
+class SpatialCountMinSketch;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
@@ -119,6 +120,7 @@ struct TableReaderOptions {
   // (SstFileReader, sst_dump, repair, external-file ingestion prevalidation,
   // etc.), in which case embedded reads fall back to a direct (uncached) read.
   BlobSource* blob_source = nullptr;
+  SpatialCountMinSketch* spatial_cms = nullptr;
 };
 
 struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {

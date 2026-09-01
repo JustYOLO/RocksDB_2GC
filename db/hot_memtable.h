@@ -49,11 +49,11 @@ class HotMemTable {
   // In-place update for an existing hot key.
   // Returns true if key was present and updated in-place; false if key was not found.
   bool UpdateInPlace(const Slice& user_key, const Slice& value, ValueType type,
-                     SequenceNumber seq);
+                     SequenceNumber seq, uint64_t log_num = 0);
 
   // Add a new hot key node with over-provisioned value padding.
   bool Add(const Slice& user_key, const Slice& value, ValueType type,
-           SequenceNumber seq);
+           SequenceNumber seq, uint64_t log_num = 0);
 
   // Lock-free untorn read for a hot key.
   // Returns true if key was found in HotTable.
@@ -79,6 +79,18 @@ class HotMemTable {
     return earliest_seq_.load(std::memory_order_relaxed);
   }
 
+  uint64_t GetEarliestLogNumber() const {
+    return earliest_log_num_.load(std::memory_order_relaxed);
+  }
+
+  void SetEarliestLogNumber(uint64_t log_num) {
+    earliest_log_num_.store(log_num, std::memory_order_relaxed);
+  }
+
+  void ResetEarliestLogNumber(uint64_t log_num) {
+    earliest_log_num_.store(log_num, std::memory_order_relaxed);
+  }
+
  private:
   friend class HotMemTableIterator;
 
@@ -95,6 +107,7 @@ class HotMemTable {
 
   std::atomic<size_t> allocated_bytes_{0};
   std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
+  std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
 
   mutable std::mutex index_mutex_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;

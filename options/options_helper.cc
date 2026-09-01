@@ -371,6 +371,23 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->cf_allow_ingest_behind = ioptions.cf_allow_ingest_behind;
   cf_opts->memtable_batch_lookup_optimization =
       ioptions.memtable_batch_lookup_optimization;
+  cf_opts->enable_hot_table = ioptions.enable_hot_table;
+  cf_opts->hot_table_write_buffer_size = ioptions.hot_table_write_buffer_size;
+  cf_opts->hot_table_max_value_size = ioptions.hot_table_max_value_size;
+  cf_opts->virtual_flush_interval_flushes = ioptions.virtual_flush_interval_flushes;
+  cf_opts->hot_table_decay_factor = ioptions.hot_table_decay_factor;
+  cf_opts->hot_table_zero_hit_penalty = ioptions.hot_table_zero_hit_penalty;
+  cf_opts->hot_table_min_duplicate_ratio = ioptions.hot_table_min_duplicate_ratio;
+  cf_opts->hot_table_min_absorption_ratio = ioptions.hot_table_min_absorption_ratio;
+  cf_opts->hot_table_consecutive_threshold_windows =
+      ioptions.hot_table_consecutive_threshold_windows;
+
+  cf_opts->enable_level_up_compaction = ioptions.enable_level_up_compaction;
+  cf_opts->level_up_warmth_threshold = ioptions.level_up_warmth_threshold;
+  cf_opts->level_up_min_skew_ratio = ioptions.level_up_min_skew_ratio;
+  cf_opts->level_up_budget_ratio = ioptions.level_up_budget_ratio;
+  cf_opts->level_up_prefix_len = ioptions.level_up_prefix_len;
+  cf_opts->level_up_decay_interval_flushes = ioptions.level_up_decay_interval_flushes;
 
   // TODO(yhchiang): find some way to handle the following derived options
   // * max_file_size

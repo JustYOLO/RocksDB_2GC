@@ -15,6 +15,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class SpatialCountMinSketch;
+
 // ImmutableCFOptions is a data struct used by RocksDB internal. It contains a
 // subset of Options that should not be changed during the entire lifetime
 // of DB. Raw pointers defined in this struct do not have ownership to the data
@@ -109,6 +111,13 @@ struct ImmutableCFOptions {
   double hot_table_min_duplicate_ratio;
   double hot_table_min_absorption_ratio;
   uint32_t hot_table_consecutive_threshold_windows;
+
+  bool enable_level_up_compaction;
+  uint32_t level_up_warmth_threshold;
+  double level_up_min_skew_ratio;
+  double level_up_budget_ratio;
+  size_t level_up_prefix_len;
+  uint32_t level_up_decay_interval_flushes;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

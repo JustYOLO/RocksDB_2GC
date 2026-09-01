@@ -35,6 +35,7 @@ struct FileDescriptor;
 class GetContext;
 class HistogramImpl;
 class BlobSource;
+class SpatialCountMinSketch;
 
 struct TableCacheOpenOptions {
   // Open a new TableReader owned by the returned iterator instead of reusing
@@ -78,6 +79,7 @@ class TableCache {
   // (nullptr) in non-DB contexts (e.g. repair), where embedded reads fall back
   // to a direct (uncached) read.
   void SetBlobSource(BlobSource* blob_source) { blob_source_ = blob_source; }
+  void SetSpatialCMS(SpatialCountMinSketch* spatial_cms) { spatial_cms_ = spatial_cms; }
 
   // Cache interface for table cache
   using CacheInterface =
@@ -366,6 +368,7 @@ class TableCache {
   // Owned by the same ColumnFamilyData; see SetBlobSource(). nullptr in non-DB
   // contexts (e.g. repair).
   BlobSource* blob_source_ = nullptr;
+  SpatialCountMinSketch* spatial_cms_ = nullptr;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

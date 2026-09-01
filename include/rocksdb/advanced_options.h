@@ -455,6 +455,14 @@ struct AdvancedColumnFamilyOptions {
   double hot_table_min_absorption_ratio = 0.20;
   uint32_t hot_table_consecutive_threshold_windows = 2;
 
+  // Level Up Compaction options
+  bool enable_level_up_compaction = false;
+  uint32_t level_up_warmth_threshold = 5;
+  double level_up_min_skew_ratio = 2.0;
+  double level_up_budget_ratio = 0.3;
+  size_t level_up_prefix_len = 8;
+  uint32_t level_up_decay_interval_flushes = 1;
+
   // Page size for huge page for the arena used by the memtable. If <=0, it
   // won't allocate from huge page but from malloc.
   // Users are responsible to reserve huge pages for it to be allocated. For

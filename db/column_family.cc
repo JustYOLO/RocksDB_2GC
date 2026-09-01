@@ -31,6 +31,7 @@
 #include "db/hot_memtable.h"
 #include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
+#include "db/spatial_cms.h"
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
 #include "db/write_controller.h"
@@ -746,6 +747,7 @@ ColumnFamilyData::ColumnFamilyData(
 
   if (ioptions_.enable_hot_table) {
     base_write_buffer_size_ = mutable_cf_options_.write_buffer_size;
+    base_max_write_buffer_number_ = mutable_cf_options_.max_write_buffer_number;
     hot_mem_ = std::make_shared<HotMemTable>(
         internal_comparator_, ioptions_.hot_table_write_buffer_size,
         ioptions_.hot_table_max_value_size);
@@ -755,15 +757,23 @@ ColumnFamilyData::ColumnFamilyData(
     hot_router_ = std::make_shared<HotTableRouter>(initial_cap);
     // Initially start disabled to avoid bloom filter overhead during uniform/cold start
     hot_router_->Disable();
-    // Dynamically expand cold memtable buffer to absorb unused HotTable memory
-    size_t expanded_size = base_write_buffer_size_ + ioptions_.hot_table_write_buffer_size;
-    mutable_cf_options_.write_buffer_size = expanded_size;
-    if (mem_) {
-      mem_->UpdateWriteBufferSize(expanded_size);
-    }
+    // Dynamically grant extra memtable count to absorb unused HotTable memory
+    int extra_memtables = static_cast<int>(
+        ioptions_.hot_table_write_buffer_size / base_write_buffer_size_);
+    if (extra_memtables < 1) extra_memtables = 1;
+    mutable_cf_options_.max_write_buffer_number =
+        base_max_write_buffer_number_ + extra_memtables;
     space_saving_topk_ = std::make_shared<SpaceSavingTopK>(
         initial_cap * 2, ioptions_.hot_table_decay_factor,
         ioptions_.hot_table_zero_hit_penalty);
+  }
+
+  if (ioptions_.enable_level_up_compaction) {
+    spatial_cms_ = std::make_shared<SpatialCountMinSketch>(
+        ioptions_.level_up_prefix_len);
+    if (table_cache_) {
+      table_cache_->SetSpatialCMS(spatial_cms_.get());
+    }
   }
 }
 
@@ -777,7 +787,7 @@ void ColumnFamilyData::ExecuteVirtualFlush() {
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 }
 
-void ColumnFamilyData::RebuildHotTable() {
+void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
@@ -802,24 +812,28 @@ void ColumnFamilyData::RebuildHotTable() {
     if (space_saving_topk_) {
       space_saving_topk_->Clear();
     }
-    // Expand cold memtable write buffer size to absorb unused hot table memory
-    size_t expanded_size = base_write_buffer_size_ + ioptions_.hot_table_write_buffer_size;
-    mutable_cf_options_.write_buffer_size = expanded_size;
-    if (mem_) {
-      mem_->UpdateWriteBufferSize(expanded_size);
-    }
+    // Grant extra memtable count to absorb unused HotTable memory
+    int extra_memtables = static_cast<int>(
+        ioptions_.hot_table_write_buffer_size / base_write_buffer_size_);
+    if (extra_memtables < 1) extra_memtables = 1;
+    mutable_cf_options_.max_write_buffer_number =
+        base_max_write_buffer_number_ + extra_memtables;
     return;
   }
 
-  // Workload is skewed -> enable HotTable and revert cold memtable to base buffer size
-  mutable_cf_options_.write_buffer_size = base_write_buffer_size_;
-  if (mem_) {
-    mem_->UpdateWriteBufferSize(base_write_buffer_size_);
+  // Workload is skewed -> enable HotTable and revert max write buffer number to base
+  mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
+
+  if (was_physically_flushed || !hot_mem_) {
+    hot_mem_ = std::make_shared<HotMemTable>(
+        internal_comparator_, ioptions_.hot_table_write_buffer_size,
+        ioptions_.hot_table_max_value_size);
+    hot_mem_->SetEarliestLogNumber(GetLogNumber());
+    if (was_physically_flushed) {
+      RecordTick(ioptions_.statistics.get(), HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+    }
   }
 
-  hot_mem_ = std::make_shared<HotMemTable>(
-      internal_comparator_, ioptions_.hot_table_write_buffer_size,
-      ioptions_.hot_table_max_value_size);
   auto new_router = std::make_shared<HotTableRouter>(capacity);
 
   if (space_saving_topk_) {
@@ -829,7 +843,18 @@ void ColumnFamilyData::RebuildHotTable() {
     }
   }
   hot_router_ = std::move(new_router);
-  RecordTick(ioptions_.statistics.get(), HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+}
+
+void ColumnFamilyData::DecayAndEvaluateLevelUpSkew() {
+  if (!ioptions_.enable_level_up_compaction || !spatial_cms_) {
+    return;
+  }
+  level_up_flush_counter_++;
+  if (ioptions_.level_up_decay_interval_flushes > 0 &&
+      level_up_flush_counter_ % ioptions_.level_up_decay_interval_flushes == 0) {
+    spatial_cms_->DecayAndEvaluateSkew(ioptions_.level_up_min_skew_ratio);
+    RecordTick(ioptions_.statistics.get(), LEVEL_UP_SKEW_EVALUATION_COUNT);
+  }
 }
 
 // DB mutex held

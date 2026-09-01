@@ -356,6 +356,11 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {HOT_TABLE_ROUTER_FALSE_POSITIVES, "rocksdb.hot.table.router.false.positives"},
     {HOT_TABLE_VIRTUAL_FLUSH_COUNT, "rocksdb.hot.table.virtual.flush.count"},
     {HOT_TABLE_PHYSICAL_FLUSH_COUNT, "rocksdb.hot.table.physical.flush.count"},
+    {LEVEL_UP_KEY_CHECKED, "rocksdb.level.up.key.checked"},
+    {LEVEL_UP_KEY_RETAINED, "rocksdb.level.up.key.retained"},
+    {LEVEL_UP_BOUNDARY_CLIPPED, "rocksdb.level.up.boundary.clipped"},
+    {LEVEL_UP_BUDGET_EXCEEDED, "rocksdb.level.up.budget.exceeded"},
+    {LEVEL_UP_SKEW_EVALUATION_COUNT, "rocksdb.level.up.skew.evaluation.count"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

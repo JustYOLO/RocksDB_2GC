@@ -15,6 +15,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
+#include "db/hot_memtable.h"
 #include "db/wide/wide_columns_helper.h"
 #include "file/filename.h"
 #include "logging/logging.h"
@@ -2115,12 +2116,22 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
                wals_total_size_.LoadRelaxed() > GetMaxTotalWalSize())) {
     assert(versions_);
     InstrumentedMutexLock l(&mutex_);
-    const ColumnFamilySet* const column_families =
+    ColumnFamilySet* const column_families =
         versions_->GetColumnFamilySet();
     assert(column_families);
     size_t num_cfs = column_families->NumberOfColumnFamilies();
     assert(num_cfs >= 1);
-    if (num_cfs > 1) {
+    bool should_switch_wal = (num_cfs > 1);
+    if (!should_switch_wal) {
+      for (auto cfd : *column_families) {
+        if (cfd->ioptions().enable_hot_table && cfd->hot_mem() &&
+            cfd->hot_mem()->KeyCount() > 0) {
+          should_switch_wal = true;
+          break;
+        }
+      }
+    }
+    if (should_switch_wal) {
       WaitForPendingWrites();
       status = SwitchWAL(write_context);
     }

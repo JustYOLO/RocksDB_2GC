@@ -885,7 +885,8 @@ Status BlockBasedTable::Open(
     size_t max_file_size_for_l0_meta_pin, const std::string& cur_db_session_id,
     uint64_t cur_file_num, UniqueId64x2 expected_unique_id,
     const bool user_defined_timestamps_persisted,
-    const bool avoid_shared_metadata_cache, BlobSource* blob_source) {
+    const bool avoid_shared_metadata_cache, BlobSource* blob_source,
+    SpatialCountMinSketch* spatial_cms) {
   table_reader->reset();
 
   Status s;
@@ -962,6 +963,7 @@ Status BlockBasedTable::Open(
   rep->file = std::move(file);
   rep->footer = footer;
   rep->blob_source_ = blob_source;
+  rep->spatial_cms_ = spatial_cms;
 
   // For fully portable/stable cache keys, we need to read the properties
   // block before setting up cache keys. TODO: consider setting up a bootstrap
@@ -2091,29 +2093,39 @@ WithBlocklikeCheck<Status, TBlocklike> BlockBasedTable::PutDataBlockToCache(
   rep_->create_context.Create(&block_holder,
                               std::move(uncompressed_block_contents));
 
-  if (rep_->table_options.log_data_block_key_range &&
-      TBlocklike::kBlockType == BlockType::kData && block_holder != nullptr &&
-      ioptions.logger != nullptr) {
+  if (TBlocklike::kBlockType == BlockType::kData && block_holder != nullptr &&
+      (rep_->spatial_cms_ != nullptr ||
+       (rep_->table_options.log_data_block_key_range && ioptions.logger != nullptr))) {
     Block* b = reinterpret_cast<Block*>(block_holder.get());
     DataBlockIter iter;
     b->NewDataIterator(rep_->internal_comparator.user_comparator(),
                        rep_->global_seqno, &iter);
     iter.SeekToFirst();
-    std::string start_key_str =
-        iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
-                     : "<empty>";
-    iter.SeekToLast();
-    std::string end_key_str =
-        iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
-                     : "<empty>";
+    std::string raw_start_key =
+        iter.Valid() ? ExtractUserKey(iter.key()).ToString() : "";
+    std::string start_key_str = "<empty>";
+    std::string end_key_str = "<empty>";
 
-    ROCKS_LOG_INFO(
-        ioptions.logger,
-        "[BLOCK_CACHE_DATA_LOAD] Level: %d, StartKey: %s, EndKey: %s",
-        rep_->level, start_key_str.c_str(), end_key_str.c_str());
+    if (rep_->table_options.log_data_block_key_range && ioptions.logger != nullptr) {
+      start_key_str =
+          iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
+                       : "<empty>";
+      iter.SeekToLast();
+      end_key_str =
+          iter.Valid() ? ExtractUserKey(iter.key()).ToString(/*hex=*/true)
+                       : "<empty>";
+      ROCKS_LOG_INFO(
+          ioptions.logger,
+          "[BLOCK_CACHE_DATA_LOAD] Level: %d, StartKey: %s, EndKey: %s",
+          rep_->level, start_key_str.c_str(), end_key_str.c_str());
+    }
 
-    b->SetEvictionLogging(ioptions.logger, rep_->level, start_key_str,
-                          end_key_str);
+    Logger* eviction_logger = rep_->table_options.log_data_block_key_range
+                                  ? ioptions.logger
+                                  : nullptr;
+    b->SetEvictionLogging(eviction_logger, rep_->level, start_key_str,
+                          end_key_str, rep_->spatial_cms_,
+                          raw_start_key);
   }
 
   // insert into uncompressed block cache

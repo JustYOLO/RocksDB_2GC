@@ -1723,6 +1723,19 @@ DEFINE_double(hot_table_min_absorption_ratio, 0.20,
 DEFINE_uint32(hot_table_consecutive_threshold_windows, 2,
               "Number of consecutive flush windows required to switch HotTable state");
 
+DEFINE_bool(enable_level_up_compaction, false,
+            "Enable Level Up Compaction for read-hot ranges");
+DEFINE_uint32(level_up_warmth_threshold, 5,
+              "Minimum Count-Min Sketch frequency to retain hot keys in Ln");
+DEFINE_double(level_up_min_skew_ratio, 2.0,
+              "Minimum skew ratio (max/avg counter) to enable Level-Up placement");
+DEFINE_double(level_up_budget_ratio, 0.3,
+              "Max fraction of compaction input size allowed to be retained in Ln");
+DEFINE_uint64(level_up_prefix_len, 8,
+              "Spatial prefix length in bytes for Spatial CMS tracking");
+DEFINE_uint32(level_up_decay_interval_flushes, 1,
+              "Flushes per halving decay sweep of Spatial CMS");
+
 DEFINE_bool(enable_write_thread_adaptive_yield, true,
             "Use a yielding spin loop for brief writer thread waits.");
 
@@ -5684,6 +5697,12 @@ class Benchmark {
     options.hot_table_min_absorption_ratio = FLAGS_hot_table_min_absorption_ratio;
     options.hot_table_consecutive_threshold_windows =
         FLAGS_hot_table_consecutive_threshold_windows;
+    options.enable_level_up_compaction = FLAGS_enable_level_up_compaction;
+    options.level_up_warmth_threshold = FLAGS_level_up_warmth_threshold;
+    options.level_up_min_skew_ratio = FLAGS_level_up_min_skew_ratio;
+    options.level_up_budget_ratio = FLAGS_level_up_budget_ratio;
+    options.level_up_prefix_len = FLAGS_level_up_prefix_len;
+    options.level_up_decay_interval_flushes = FLAGS_level_up_decay_interval_flushes;
     options.enable_write_thread_adaptive_yield =
         FLAGS_enable_write_thread_adaptive_yield;
     options.enable_pipelined_write = FLAGS_enable_pipelined_write;
@@ -10907,6 +10926,25 @@ class Benchmark {
               hot_filtered, hot_matches, hot_fp, fp_rate);
       fprintf(stdout, "  Flushes: %" PRIu64 " virtual flushes (aging sweeps), %" PRIu64 " physical flushes (L0 merges)\n",
               vflush_cnt, pflush_cnt);
+      fprintf(stdout, "------------------------------------------------\n");
+    }
+
+    uint64_t level_up_checked = dbstats->getTickerCount(Tickers::LEVEL_UP_KEY_CHECKED);
+    uint64_t level_up_retained = dbstats->getTickerCount(Tickers::LEVEL_UP_KEY_RETAINED);
+    uint64_t level_up_clipped = dbstats->getTickerCount(Tickers::LEVEL_UP_BOUNDARY_CLIPPED);
+    uint64_t level_up_budget = dbstats->getTickerCount(Tickers::LEVEL_UP_BUDGET_EXCEEDED);
+    uint64_t level_up_skews = dbstats->getTickerCount(Tickers::LEVEL_UP_SKEW_EVALUATION_COUNT);
+
+    if (FLAGS_enable_level_up_compaction || level_up_checked > 0 || level_up_retained > 0) {
+      double retain_ratio = level_up_checked > 0 ? (100.0 * level_up_retained / level_up_checked) : 0.0;
+      fprintf(stdout, "------------------------------------------------\n");
+      fprintf(stdout, "LEVEL UP COMPACTION SUMMARY:\n");
+      fprintf(stdout, "  Evaluated Keys   : %" PRIu64 "\n", level_up_checked);
+      fprintf(stdout, "  Retained in Ln   : %" PRIu64 " (Retain Ratio: %.2f%%)\n",
+              level_up_retained, retain_ratio);
+      fprintf(stdout, "  Boundary Clipped : %" PRIu64 "\n", level_up_clipped);
+      fprintf(stdout, "  Budget Exceeded  : %" PRIu64 "\n", level_up_budget);
+      fprintf(stdout, "  Skew Sweeps      : %" PRIu64 "\n", level_up_skews);
       fprintf(stdout, "------------------------------------------------\n");
     }
   }

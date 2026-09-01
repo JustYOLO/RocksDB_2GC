@@ -77,6 +77,7 @@ LIB_SOURCES =                                                   \
   db/import_column_family_job.cc                                \
   db/internal_stats.cc                                          \
   db/space_saving_topk.cc                                       \
+  db/spatial_cms.cc                                             \
   db/logs_with_prep_tracker.cc                                  \
   db/log_reader.cc                                              \
   db/log_writer.cc                                              \
