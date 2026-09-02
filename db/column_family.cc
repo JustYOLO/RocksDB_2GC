@@ -771,9 +771,6 @@ ColumnFamilyData::ColumnFamilyData(
   if (ioptions_.enable_level_up_compaction) {
     spatial_cms_ = std::make_shared<SpatialCountMinSketch>(
         ioptions_.level_up_prefix_len);
-    if (table_cache_) {
-      table_cache_->SetSpatialCMS(spatial_cms_.get());
-    }
   }
 }
 

@@ -40,7 +40,6 @@ class IndexBlockIter;
 class MetaBlockIter;
 class BlockPrefixIndex;
 class Logger;
-class SpatialCountMinSketch;
 
 // BlockReadAmpBitmap is a bitmap that map the ROCKSDB_NAMESPACE::Block data
 // bytes to a bitmap with ratio bytes_per_bit. Whenever we access a range of
@@ -208,15 +207,11 @@ class Block {
                                  bool user_defined_timestamps_persisted = true);
 
   void SetEvictionLogging(Logger* logger, int level, std::string start_key,
-                          std::string end_key,
-                          SpatialCountMinSketch* spatial_cms = nullptr,
-                          std::string raw_start_user_key = "") {
+                          std::string end_key) {
     eviction_logger_ = logger;
     eviction_level_ = level;
     eviction_start_key_ = std::move(start_key);
     eviction_end_key_ = std::move(end_key);
-    spatial_cms_ = spatial_cms;
-    raw_start_user_key_ = std::move(raw_start_user_key);
   }
 
   // Returns an MetaBlockIter for iterating over blocks containing metadata
@@ -329,8 +324,6 @@ class Block {
   int eviction_level_{-1};
   std::string eviction_start_key_;
   std::string eviction_end_key_;
-  SpatialCountMinSketch* spatial_cms_{nullptr};
-  std::string raw_start_user_key_;
 };
 
 // A `BlockIter` iterates over the entries in a `Block`'s data buffer. The

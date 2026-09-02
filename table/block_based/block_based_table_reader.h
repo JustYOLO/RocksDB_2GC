@@ -55,7 +55,6 @@ class TableReader;
 class WritableFile;
 class BlobIndex;
 class BlobSource;
-class SpatialCountMinSketch;
 struct BlockBasedTableOptions;
 struct EnvOptions;
 struct ReadOptions;
@@ -175,8 +174,7 @@ class BlockBasedTable : public TableReader {
       UniqueId64x2 expected_unique_id = {},
       const bool user_defined_timestamps_persisted = true,
       bool avoid_shared_metadata_cache = false,
-      BlobSource* blob_source = nullptr,
-      SpatialCountMinSketch* spatial_cms = nullptr);
+      BlobSource* blob_source = nullptr);
 
   bool PrefixRangeMayMatch(const Slice& internal_key,
                            const ReadOptions& read_options,
@@ -849,7 +847,6 @@ struct BlockBasedTable::Rep {
   // repair, external-file ingestion prevalidation, etc.); in that case
   // embedded reads fall back to a direct (uncached) read.
   BlobSource* blob_source_ = nullptr;
-  SpatialCountMinSketch* spatial_cms_ = nullptr;
 
   // Whether block checksums in metadata blocks were verified on open.
   // This is only to mostly maintain current dubious behavior of VerifyChecksum

@@ -39,6 +39,7 @@
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
 #include "db/pinned_iterators_manager.h"
+#include "db/spatial_cms.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
@@ -1168,7 +1169,8 @@ class LevelIterator final : public InternalIterator {
           nullptr,
       SequenceNumber read_seq = kMaxSequenceNumber,
       Statistics* db_statistics = nullptr, SystemClock* clock = nullptr,
-      bool open_ephemeral_table_reader = false)
+      bool open_ephemeral_table_reader = false,
+      SpatialCountMinSketch* spatial_cms = nullptr)
       : table_cache_(table_cache),
         read_options_(read_options),
         file_options_(file_options),
@@ -1198,7 +1200,8 @@ class LevelIterator final : public InternalIterator {
         db_statistics_(db_statistics),
         clock_(clock),
         table_cache_open_options_(
-            GetCompactionTableCacheOpenOptions(open_ephemeral_table_reader)) {
+            GetCompactionTableCacheOpenOptions(open_ephemeral_table_reader)),
+        spatial_cms_(spatial_cms) {
     // Empty level is not supported.
     assert(flevel_ != nullptr && flevel_->num_files > 0);
     if (range_tombstone_iter_ptr_) {
@@ -1419,6 +1422,9 @@ class LevelIterator final : public InternalIterator {
     }
     const FileMetaData* meta = flevel_->files[file_index_].file_metadata;
     sample_file_read_inc(meta);
+    if (spatial_cms_ != nullptr) {
+      spatial_cms_->AddPrefix(ExtractUserKey(file_iter_.key()));
+    }
     ValueType type = ExtractValueType(file_iter_.key());
     if (type == kTypeDeletion || type == kTypeSingleDeletion ||
         type == kTypeDeletionWithTimestamp || type == kTypeMerge) {
@@ -1536,6 +1542,7 @@ class LevelIterator final : public InternalIterator {
   Statistics* db_statistics_ = nullptr;
   SystemClock* clock_ = nullptr;
   TableCacheOpenOptions table_cache_open_options_;
+  SpatialCountMinSketch* spatial_cms_ = nullptr;
 
   // Our stored scan_opts for each prefix
   std::unique_ptr<ScanOptionsMap> file_to_scan_opts_ = nullptr;
@@ -2561,7 +2568,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
         /*range_del_agg=*/nullptr,
         /*compaction_boundaries=*/nullptr, allow_unprepared_value,
         read_options.ignore_range_deletions ? nullptr : &tombstone_iter_ptr,
-        read_seq, db_statistics_, clock_);
+        read_seq, db_statistics_, clock_, /*open_ephemeral_table_reader=*/false,
+        cfd_->spatial_cms());
 #ifndef NDEBUG
     std::pair<bool, bool> iterator_type(
         false /* is_block_based_table_iterator */,
@@ -2609,7 +2617,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
         /*range_del_agg=*/nullptr,
         /*compaction_boundaries=*/nullptr, allow_unprepared_value,
         read_options.ignore_range_deletions ? nullptr : &tombstone_iter_ptr,
-        read_seq, db_statistics_, clock_);
+        read_seq, db_statistics_, clock_, /*open_ephemeral_table_reader=*/false,
+        cfd_->spatial_cms());
     if (read_options.ignore_range_deletions) {
       merge_iter_builder->AddIterator(level_iter);
     } else {
@@ -2985,6 +2994,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     }
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
+      if (cfd_ != nullptr && cfd_->spatial_cms() != nullptr) {
+        cfd_->spatial_cms()->AddPrefix(user_key);
+      }
     }
 
     bool timer_enabled =

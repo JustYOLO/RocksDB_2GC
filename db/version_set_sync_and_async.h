@@ -4,6 +4,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include "db/spatial_cms.h"
 #include "util/coro_utils.h"
 
 #if defined(WITHOUT_COROUTINES) || \
@@ -58,6 +59,10 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
 
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
+      if (cfd_ != nullptr && cfd_->spatial_cms() != nullptr) {
+        cfd_->spatial_cms()->AddPrefix(iter->lkey ? iter->lkey->user_key()
+                                                  : *iter->key);
+      }
       if (get_context.State() == GetContext::kNotFound ||
           get_context.State() == GetContext::kMerge ||
           get_context.State() == GetContext::kDeleted) {
