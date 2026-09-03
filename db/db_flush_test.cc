@@ -473,6 +473,73 @@ TEST_F(DBFlushTest, StatisticsGarbageBasic) {
   Close();
 }
 
+TEST_F(DBFlushTest, MemtableGarbageCollectionOnFlushDisabled) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.inplace_update_support = false;
+  options.memtable_garbage_collection_on_flush = false;
+
+  ASSERT_OK(TryReopen(options));
+
+  // Insert 3 versions for key1 and 3 versions for key2
+  ASSERT_OK(Put("key1", "val1_v1"));
+  ASSERT_OK(Put("key1", "val1_v2"));
+  ASSERT_OK(Put("key1", "val1_v3"));
+  ASSERT_OK(Put("key2", "val2_v1"));
+  ASSERT_OK(Put("key2", "val2_v2"));
+  ASSERT_OK(Put("key2", "val2_v3"));
+
+  ASSERT_OK(Flush());
+
+  // Since GC on flush is disabled, all 6 entries should be written to SST,
+  // and garbage discarded at flush should be 0.
+  uint64_t garbage_bytes =
+      TestGetTickerCount(options, MEMTABLE_GARBAGE_BYTES_AT_FLUSH);
+  EXPECT_EQ(garbage_bytes, 0);
+
+  TablePropertiesCollection props;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  ASSERT_EQ(props.size(), 1);
+  EXPECT_EQ(props.begin()->second->num_entries, 6);
+
+  // Reads must still return the latest version
+  std::string val;
+  ASSERT_OK(db_->Get(ReadOptions(), "key1", &val));
+  EXPECT_EQ(val, "val1_v3");
+  ASSERT_OK(db_->Get(ReadOptions(), "key2", &val));
+  EXPECT_EQ(val, "val2_v3");
+
+  Close();
+
+  // Now test with GC on flush enabled (default)
+  options.memtable_garbage_collection_on_flush = true;
+  ASSERT_OK(TryReopen(options));
+
+  ASSERT_OK(Put("key1", "val1_v4"));
+  ASSERT_OK(Put("key1", "val1_v5"));
+  ASSERT_OK(Put("key1", "val1_v6"));
+
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&props));
+  // The newly flushed file should only have 1 entry for key1
+  uint64_t latest_sst_entries = 0;
+  for (const auto& p : props) {
+    if (p.second->num_entries < 6) {
+      latest_sst_entries = p.second->num_entries;
+    }
+  }
+  EXPECT_EQ(latest_sst_entries, 1);
+
+  ASSERT_OK(db_->Get(ReadOptions(), "key1", &val));
+  EXPECT_EQ(val, "val1_v6");
+
+  Close();
+}
+
 TEST_F(DBFlushTest, FlushReasonStatsWriteBufferFull) {
   Options options = CurrentOptions();
   options.statistics = CreateDBStatistics();

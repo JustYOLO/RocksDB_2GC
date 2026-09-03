@@ -139,7 +139,8 @@ CompactionIterator::CompactionIterator(
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
     std::optional<SequenceNumber> preserve_seqno_min,
-    const Version* input_version, Env::IOActivity blob_read_io_activity)
+    const Version* input_version, Env::IOActivity blob_read_io_activity,
+    bool allow_garbage_collection)
     : CompactionIterator(
           input, cmp, merge_helper, last_sequence, snapshots, earliest_snapshot,
           earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
@@ -149,7 +150,7 @@ CompactionIterator::CompactionIterator(
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
           must_count_input_entries, compaction_filter, shutting_down, info_log,
           full_history_ts_low, preserve_seqno_min, input_version,
-          blob_read_io_activity) {}
+          blob_read_io_activity, allow_garbage_collection) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -168,7 +169,8 @@ CompactionIterator::CompactionIterator(
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
     std::optional<SequenceNumber> preserve_seqno_min,
-    const Version* input_version, Env::IOActivity blob_read_io_activity)
+    const Version* input_version, Env::IOActivity blob_read_io_activity,
+    bool allow_garbage_collection)
     : input_(input, cmp, must_count_input_entries),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -210,7 +212,8 @@ CompactionIterator::CompactionIterator(
       current_key_committed_(false),
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
-      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
+      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)),
+      allow_garbage_collection_(allow_garbage_collection) {
   assert(snapshots_ != nullptr);
   assert(preserve_seqno_after_ <= earliest_snapshot_);
 
@@ -1027,12 +1030,13 @@ void CompactionIterator::NextFromInput() {
             // timestamp of this key is greater than or equal to
             // *full_history_ts_low_. We will output the SingleDelete.
             validity_info_.SetValid(ValidContext::kKeepTsHistory);
-          } else if (has_outputted_key_ ||
-                     DefinitelyInSnapshot(ikey_.sequence,
-                                          earliest_write_conflict_snapshot_) ||
-                     (earliest_snapshot_ < earliest_write_conflict_snapshot_ &&
+          } else if (allow_garbage_collection_ &&
+                     (has_outputted_key_ ||
                       DefinitelyInSnapshot(ikey_.sequence,
-                                           earliest_snapshot_))) {
+                                           earliest_write_conflict_snapshot_) ||
+                      (earliest_snapshot_ < earliest_write_conflict_snapshot_ &&
+                       DefinitelyInSnapshot(ikey_.sequence,
+                                            earliest_snapshot_)))) {
             // Found a matching value, we can drop the single delete and the
             // value.  It is safe to drop both records since we've already
             // outputted a key in this snapshot, or there is no earlier
@@ -1120,35 +1124,40 @@ void CompactionIterator::NextFromInput() {
     } else if (last_sequence != kMaxSequenceNumber &&
                (last_snapshot == current_user_key_snapshot_ ||
                 last_snapshot < current_user_key_snapshot_)) {
-      // rule (A):
-      // If the earliest snapshot is which this key is visible in
-      // is the same as the visibility of a previous instance of the
-      // same key, then this kv is not visible in any snapshot.
-      // Hidden by an newer entry for same user key
-      //
-      // Note: Dropping this key will not affect TransactionDB write-conflict
-      // checking since there has already been a record returned for this key
-      // in this snapshot.
-      // When ingest_behind is enabled, it's ok that we drop an overwritten
-      // Delete here. The overwritting key still covers whatever that will be
-      // ingested. Note that we will not drop SingleDelete here as SingleDelte
-      // is handled entirely in its own if clause. This is important, see
-      // example: from new to old: SingleDelete_1, PUT_1, SingleDelete_2, PUT_2,
-      // where all operations are on the same key and PUT_2 is ingested with
-      // ingest_behind=true. If SingleDelete_2 is dropped due to being compacted
-      // together with PUT_1, and then PUT_1 is compacted away together with
-      // SingleDelete_1, PUT_2 can incorrectly becomes visible.
-      if (last_sequence < current_user_key_sequence_) {
-        ROCKS_LOG_FATAL(info_log_,
-                        "key %s, last_sequence (%" PRIu64
-                        ") < current_user_key_sequence_ (%" PRIu64 ")",
-                        ikey_.DebugString(allow_data_in_errors_, true).c_str(),
-                        last_sequence, current_user_key_sequence_);
-        assert(false);
-      }
+      if (allow_garbage_collection_) {
+        // rule (A):
+        // If the earliest snapshot is which this key is visible in
+        // is the same as the visibility of a previous instance of the
+        // same key, then this kv is not visible in any snapshot.
+        // Hidden by an newer entry for same user key
+        //
+        // Note: Dropping this key will not affect TransactionDB write-conflict
+        // checking since there has already been a record returned for this key
+        // in this snapshot.
+        // When ingest_behind is enabled, it's ok that we drop an overwritten
+        // Delete here. The overwritting key still covers whatever that will be
+        // ingested. Note that we will not drop SingleDelete here as SingleDelte
+        // is handled entirely in its own if clause. This is important, see
+        // example: from new to old: SingleDelete_1, PUT_1, SingleDelete_2,
+        // PUT_2, where all operations are on the same key and PUT_2 is ingested
+        // with ingest_behind=true. If SingleDelete_2 is dropped due to being
+        // compacted together with PUT_1, and then PUT_1 is compacted away
+        // together with SingleDelete_1, PUT_2 can incorrectly becomes visible.
+        if (last_sequence < current_user_key_sequence_) {
+          ROCKS_LOG_FATAL(
+              info_log_,
+              "key %s, last_sequence (%" PRIu64
+              ") < current_user_key_sequence_ (%" PRIu64 ")",
+              ikey_.DebugString(allow_data_in_errors_, true).c_str(),
+              last_sequence, current_user_key_sequence_);
+          assert(false);
+        }
 
-      ++iter_stats_.num_record_drop_hidden;
-      AdvanceInputIter();
+        ++iter_stats_.num_record_drop_hidden;
+        AdvanceInputIter();
+      } else {
+        validity_info_.SetValid(ValidContext::kNewUserKey);
+      }
     } else if (compaction_ != nullptr &&
                (ikey_.type == kTypeDeletion ||
                 (ikey_.type == kTypeDeletionWithTimestamp &&
@@ -1262,7 +1271,8 @@ void CompactionIterator::NextFromInput() {
       auto [unpacked_value, preferred_seqno] =
           ParsePackedValueWithSeqno(value_);
       assert(preferred_seqno < ikey_.sequence || ikey_.sequence == 0);
-      if (range_del_agg_->ShouldDelete(
+      if (allow_garbage_collection_ &&
+          range_del_agg_->ShouldDelete(
               key_, RangeDelPositioningMode::kForwardTraversal)) {
         ++iter_stats_.num_record_drop_hidden;
         ++iter_stats_.num_record_drop_range_del;
@@ -1356,7 +1366,8 @@ void CompactionIterator::NextFromInput() {
       // covered by a range tombstone that is at or below history_ts_low_ and
       // trim_ts.
       bool should_delete = false;
-      if (!timestamp_size_ || cmp_with_history_ts_low_ < 0) {
+      if (allow_garbage_collection_ &&
+          (!timestamp_size_ || cmp_with_history_ts_low_ < 0)) {
         should_delete = range_del_agg_->ShouldDelete(
             key_, RangeDelPositioningMode::kForwardTraversal);
       }

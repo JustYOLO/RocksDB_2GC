@@ -244,7 +244,10 @@ Status BuildTable(
         true /* must_count_input_entries */,
         /*compaction=*/nullptr, compaction_filter.get(),
         /*shutting_down=*/nullptr, db_options.info_log, full_history_ts_low,
-        std::nullopt, version, tboptions.read_options.io_activity);
+        std::nullopt, version, tboptions.read_options.io_activity,
+        tboptions.reason == TableFileCreationReason::kFlush
+            ? ioptions.memtable_garbage_collection_on_flush
+            : true);
 
     if (version != nullptr) {
       ColumnFamilyData* const cfd = version->cfd();

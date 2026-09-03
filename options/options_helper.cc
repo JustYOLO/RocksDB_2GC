@@ -388,6 +388,8 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->level_up_budget_ratio = ioptions.level_up_budget_ratio;
   cf_opts->level_up_prefix_len = ioptions.level_up_prefix_len;
   cf_opts->level_up_decay_interval_flushes = ioptions.level_up_decay_interval_flushes;
+  cf_opts->memtable_garbage_collection_on_flush =
+      ioptions.memtable_garbage_collection_on_flush;
 
   // TODO(yhchiang): find some way to handle the following derived options
   // * max_file_size

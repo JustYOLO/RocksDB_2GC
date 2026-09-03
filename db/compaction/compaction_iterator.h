@@ -274,7 +274,8 @@ class CompactionIterator {
       const std::string* full_history_ts_low = nullptr,
       std::optional<SequenceNumber> preserve_seqno_min = {},
       const Version* input_version = nullptr,
-      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction);
+      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction,
+      bool allow_garbage_collection = true);
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(
@@ -296,7 +297,8 @@ class CompactionIterator {
       const std::string* full_history_ts_low = nullptr,
       std::optional<SequenceNumber> preserve_seqno_min = {},
       const Version* input_version = nullptr,
-      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction);
+      Env::IOActivity blob_read_io_activity = Env::IOActivity::kCompaction,
+      bool allow_garbage_collection = true);
 
   ~CompactionIterator();
 
@@ -638,6 +640,8 @@ class CompactionIterator {
 
   // Max seqno that can be zeroed out at last level (various reasons)
   const SequenceNumber preserve_seqno_after_ = kMaxSequenceNumber;
+
+  const bool allow_garbage_collection_{true};
 
   void AdvanceInputIter() { input_.Next(); }
 

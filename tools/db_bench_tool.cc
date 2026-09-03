@@ -948,6 +948,11 @@ DEFINE_string(statistics_string, "", "Serialized statistics string");
 DEFINE_bool(report_flush_dropped_garbage, false,
             "Print per-flush and total records dropped by flush-time "
             "deduplication/filtering.");
+DEFINE_bool(memtable_garbage_collection_on_flush, true,
+            "Enable garbage collection during memtable flush (drops "
+            "obsolete/hidden memtable entries during flush).");
+DEFINE_bool(memtable_gc_on_flush, true,
+            "Alias for --memtable_garbage_collection_on_flush.");
 static class std::shared_ptr<ROCKSDB_NAMESPACE::Statistics> dbstats;
 
 DEFINE_int64(writes, -1,
@@ -5255,6 +5260,9 @@ class Benchmark {
         FLAGS_use_direct_io_for_compaction_reads;
     options.use_direct_io_for_flush_and_compaction =
         FLAGS_use_direct_io_for_flush_and_compaction;
+    options.memtable_garbage_collection_on_flush =
+        FLAGS_memtable_garbage_collection_on_flush &&
+        FLAGS_memtable_gc_on_flush;
     options.manual_wal_flush = FLAGS_manual_wal_flush;
     options.wal_compression = FLAGS_wal_compression_e;
     options.ttl = FLAGS_fifo_compaction_ttl;

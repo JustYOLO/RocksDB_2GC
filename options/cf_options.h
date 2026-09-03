@@ -118,6 +118,7 @@ struct ImmutableCFOptions {
   double level_up_budget_ratio;
   size_t level_up_prefix_len;
   uint32_t level_up_decay_interval_flushes;
+  bool memtable_garbage_collection_on_flush;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

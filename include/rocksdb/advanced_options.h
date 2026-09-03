@@ -373,6 +373,12 @@ struct AdvancedColumnFamilyOptions {
   // [experimental]
   double experimental_mempurge_threshold = 0.0;
 
+  // If true (the default), obsolete and duplicate versions of user keys in the
+  // memtable are dropped during flush (inline garbage collection). If false,
+  // all records in the memtable are written directly to the L0 SST file as-is,
+  // deferring garbage collection to background compaction.
+  bool memtable_garbage_collection_on_flush = true;
+
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist
   // existing_value_size - pointer to size of existing_value).

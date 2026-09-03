@@ -971,6 +971,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    memtable_batch_lookup_optimization),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"memtable_garbage_collection_on_flush",
+         {offsetof(struct ImmutableCFOptions,
+                   memtable_garbage_collection_on_flush),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"enable_level_up_compaction",
          {offsetof(struct ImmutableCFOptions, enable_level_up_compaction),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -1150,14 +1155,17 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       hot_table_zero_hit_penalty(cf_options.hot_table_zero_hit_penalty),
       hot_table_min_duplicate_ratio(cf_options.hot_table_min_duplicate_ratio),
       hot_table_min_absorption_ratio(cf_options.hot_table_min_absorption_ratio),
-      hot_table_consecutive_threshold_windows(cf_options.hot_table_consecutive_threshold_windows),
+      hot_table_consecutive_threshold_windows(
+          cf_options.hot_table_consecutive_threshold_windows),
       enable_level_up_compaction(cf_options.enable_level_up_compaction),
       level_up_warmth_threshold(cf_options.level_up_warmth_threshold),
       level_up_min_skew_ratio(cf_options.level_up_min_skew_ratio),
       level_up_budget_ratio(cf_options.level_up_budget_ratio),
       level_up_prefix_len(cf_options.level_up_prefix_len),
       level_up_decay_interval_flushes(
-          cf_options.level_up_decay_interval_flushes) {}
+          cf_options.level_up_decay_interval_flushes),
+      memtable_garbage_collection_on_flush(
+          cf_options.memtable_garbage_collection_on_flush) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 
