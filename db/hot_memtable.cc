@@ -17,7 +17,6 @@ class HotMemTableIterator : public InternalIterator {
       : table_(table),
         user_cmp_(table->internal_comparator_.user_comparator()),
         status_(Status::OK()) {
-    std::lock_guard<std::mutex> lock(table_->index_mutex_);
     entries_.reserve(table_->index_.size());
     for (const auto& kv : table_->index_) {
       entries_.push_back(kv.second);
@@ -158,7 +157,7 @@ HotMemTable::HotMemTable(const InternalKeyComparator& cmp, size_t write_buffer_s
       index_(KeyComparatorWrapper{cmp.user_comparator()}) {}
 
 HotMemTable::~HotMemTable() {
-  std::lock_guard<std::mutex> lock(index_mutex_);
+  std::unique_lock<std::shared_mutex> lock(index_rwlock_);
   for (void* ptr : allocated_node_ptrs_) {
     free(ptr);
   }
@@ -169,7 +168,6 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
                                uint64_t log_num) {
   HotNode* node = nullptr;
   {
-    std::lock_guard<std::mutex> lock(index_mutex_);
     auto it = index_.find(user_key.ToString());
     if (it == index_.end()) {
       return false;
@@ -203,11 +201,15 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
 
 bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
                       SequenceNumber seq, uint64_t log_num) {
-  std::lock_guard<std::mutex> lock(index_mutex_);
+  std::unique_lock<std::shared_mutex> lock(index_rwlock_);
   std::string key_str = user_key.ToString();
   auto it = index_.find(key_str);
   if (it != index_.end()) {
     HotNode* node = it->second;
+    std::lock_guard<SpinMutex> node_lock(node->write_lock);
+    if (seq <= node->seq) {
+      return true;
+    }
     uint32_t clamped_val_size = static_cast<uint32_t>(std::min<size_t>(value.size(), max_val_size_));
     uint32_t v = node->seq_version.load(std::memory_order_relaxed);
     node->seq_version.store(v + 1, std::memory_order_release);
@@ -261,7 +263,7 @@ bool HotMemTable::Get(const Slice& user_key, std::string* value, Status* status,
                       SequenceNumber* seq_found) {
   HotNode* node = nullptr;
   {
-    std::lock_guard<std::mutex> lock(index_mutex_);
+    std::shared_lock<std::shared_mutex> lock(index_rwlock_);
     auto it = index_.find(user_key.ToString());
     if (it == index_.end()) {
       return false;
@@ -300,7 +302,7 @@ bool HotMemTable::Get(const Slice& user_key, std::string* value, Status* status,
 
 void HotMemTable::SweepHits(std::unordered_map<std::string, uint32_t>* hit_map) {
   if (!hit_map) return;
-  std::lock_guard<std::mutex> lock(index_mutex_);
+  std::shared_lock<std::shared_mutex> lock(index_rwlock_);
   hit_map->reserve(index_.size());
   for (const auto& kv : index_) {
     HotNode* node = kv.second;
@@ -319,7 +321,6 @@ InternalIterator* HotMemTable::NewIterator(Arena* arena) {
 }
 
 size_t HotMemTable::KeyCount() const {
-  std::lock_guard<std::mutex> lock(index_mutex_);
   return index_.size();
 }
 

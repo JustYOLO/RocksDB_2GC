@@ -251,6 +251,96 @@ TEST_F(HotMemTableTest, RouterDisableAndAdaptiveRebuild) {
   ASSERT_EQ(tracker.QualifiedHeavyHittersCount(2), 2);
 }
 
+TEST_F(HotMemTableTest, ConcurrentWritersHighestSeqWinsAndNoTornWrites) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 256);
+
+  std::string key = "contended_hot_key";
+  hot_table.Add(key, "init_val_0000000000", kTypeValue, 1);
+
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> global_seq{1};
+  std::atomic<uint64_t> total_writes{0};
+
+  const int num_writers = 12;
+  const int num_readers = 4;
+  std::vector<std::thread> writers;
+  std::vector<std::thread> readers;
+
+  // 12 Concurrent writers hammering the same key
+  for (int w = 0; w < num_writers; ++w) {
+    writers.emplace_back([&, w]() {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      char buf[64];
+      while (!stop.load(std::memory_order_relaxed)) {
+        uint64_t my_seq = global_seq.fetch_add(1, std::memory_order_relaxed);
+        // Payload consists of repeated formatted sequence number to detect torn writes
+        snprintf(buf, sizeof(buf), "%016" PRIu64 ":%016" PRIu64, my_seq, my_seq);
+        hot_table.UpdateInPlace(key, Slice(buf, 33), kTypeValue, my_seq);
+        total_writes.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  // 4 Concurrent readers checking for untorn values and valid sequence numbers
+  std::atomic<uint64_t> total_reads{0};
+  for (int r = 0; r < num_readers; ++r) {
+    readers.emplace_back([&, r]() {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      std::string val;
+      Status s;
+      SequenceNumber seq = 0;
+      uint64_t last_seq = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        if (hot_table.Get(key, &val, &s, &seq)) {
+          ASSERT_OK(s);
+          ASSERT_EQ(val.size(), 33);
+          uint64_t s1 = 0, s2 = 0;
+          ASSERT_EQ(sscanf(val.c_str(), "%016" PRIu64 ":%016" PRIu64, &s1, &s2), 2);
+          // Both parts must match (proves no torn write occurred)
+          ASSERT_EQ(s1, s2);
+          ASSERT_EQ(s1, seq);
+          ASSERT_GE(seq, last_seq);
+          last_seq = seq;
+          total_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+
+  // Start all threads simultaneously
+  start.store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  stop.store(true, std::memory_order_release);
+
+  for (auto& t : writers) {
+    t.join();
+  }
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  // Final validation: HotTable must hold the HIGHEST sequence number written
+  std::string final_val;
+  Status final_status;
+  SequenceNumber final_seq = 0;
+  ASSERT_TRUE(hot_table.Get(key, &final_val, &final_status, &final_seq));
+  ASSERT_OK(final_status);
+
+  uint64_t highest_assigned_seq = global_seq.load(std::memory_order_relaxed) - 1;
+  ASSERT_EQ(final_seq, highest_assigned_seq);
+
+  uint64_t val_s1 = 0, val_s2 = 0;
+  ASSERT_EQ(sscanf(final_val.c_str(), "%016" PRIu64 ":%016" PRIu64, &val_s1, &val_s2), 2);
+  ASSERT_EQ(val_s1, highest_assigned_seq);
+  ASSERT_EQ(val_s2, highest_assigned_seq);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

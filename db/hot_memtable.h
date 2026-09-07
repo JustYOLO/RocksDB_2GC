@@ -109,7 +109,6 @@ class HotMemTable {
   std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
   std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
 
-  mutable std::mutex index_mutex_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;
   std::vector<void*> allocated_node_ptrs_;
 };
