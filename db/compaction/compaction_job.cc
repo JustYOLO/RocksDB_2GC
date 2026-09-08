@@ -721,35 +721,6 @@ void CompactionJob::InitializeCompactionRun() {
   TEST_SYNC_POINT("CompactionJob::Run():Start");
   log_buffer_->FlushBufferToLog();
   LogCompaction();
-
-  // Zero-overhead live-lock detection guard
-  if (compact_ != nullptr && compact_->compaction != nullptr) {
-    auto* cfd = compact_->compaction->column_family_data();
-    if (cfd != nullptr) {
-      const Slice smallest = compact_->compaction->GetSmallestUserKey();
-      const Slice largest = compact_->compaction->GetLargestUserKey();
-      int start_lvl = compact_->compaction->start_level();
-
-      if (cfd->CheckAndTrackCompactionLiveLock(start_lvl, smallest, largest, /*threshold=*/10)) {
-        ROCKS_LOG_FATAL(
-            db_options_.info_log,
-            "[LIVE_LOCK_GUARD] Live-lock detected! %u consecutive identical compactions on level %d [%s .. %s]. Shutting down to prevent hang.",
-            cfd->consecutive_identical_compaction_count(), start_lvl,
-            smallest.ToString(/*hex=*/true).c_str(),
-            largest.ToString(/*hex=*/true).c_str());
-        fprintf(stderr,
-                "\n====================================================================\n"
-                "FATAL: Live-lock detected! %u consecutive compactions on identical key\n"
-                "range [%s .. %s] at level %d without progress. Shutting down.\n"
-                "====================================================================\n",
-                cfd->consecutive_identical_compaction_count(),
-                smallest.ToString(/*hex=*/true).c_str(),
-                largest.ToString(/*hex=*/true).c_str(), start_lvl);
-        fflush(stderr);
-        std::abort();
-      }
-    }
-  }
 }
 
 void CompactionJob::RunSubcompactions() {

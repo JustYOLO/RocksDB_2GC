@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -18,10 +19,12 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "table/internal_iterator.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 struct HotNode {
+  SpinMutex write_lock;
   std::atomic<uint32_t> hit_count{0};
   std::atomic<uint32_t> seq_version{0}; // Seqlock: Even = stable, Odd = writing
   uint32_t user_key_len{0};
@@ -109,6 +112,7 @@ class HotMemTable {
   std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
   std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
 
+  mutable std::shared_mutex index_rwlock_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;
   std::vector<void*> allocated_node_ptrs_;
 };

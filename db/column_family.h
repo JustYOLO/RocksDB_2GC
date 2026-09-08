@@ -456,27 +456,6 @@ class ColumnFamilyData {
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_shared() const { return spatial_cms_; }
   void DecayAndEvaluateLevelUpSkew();
 
-  // Track consecutive identical compactions for zero-overhead live-lock detection
-  bool CheckAndTrackCompactionLiveLock(int start_level, const Slice& smallest,
-                                      const Slice& largest, uint32_t threshold = 10) {
-    if (start_level == last_compacted_start_level_ &&
-        smallest.compare(last_compacted_smallest_user_key_) == 0 &&
-        largest.compare(last_compacted_largest_user_key_) == 0) {
-      consecutive_identical_compaction_count_++;
-      if (consecutive_identical_compaction_count_ >= threshold) {
-        return true;
-      }
-    } else {
-      last_compacted_start_level_ = start_level;
-      last_compacted_smallest_user_key_ = smallest.ToString();
-      last_compacted_largest_user_key_ = largest.ToString();
-      consecutive_identical_compaction_count_ = 0;
-    }
-    return false;
-  }
-  uint32_t consecutive_identical_compaction_count() const {
-    return consecutive_identical_compaction_count_;
-  }
 
   // See documentation in compaction_picker.h
   // REQUIRES: DB mutex held
@@ -736,10 +715,6 @@ class ColumnFamilyData {
   uint32_t cold_flush_counter_{0};
   uint64_t last_hot_write_hits_{0};
   uint64_t last_hot_write_misses_{0};
-  std::string last_compacted_smallest_user_key_;
-  std::string last_compacted_largest_user_key_;
-  int last_compacted_start_level_{-1};
-  uint32_t consecutive_identical_compaction_count_{0};
   SuperVersion* super_version_;
 
   // An ordinal representing the current SuperVersion. Updated by
