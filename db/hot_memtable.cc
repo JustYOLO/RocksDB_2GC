@@ -17,6 +17,7 @@ class HotMemTableIterator : public InternalIterator {
       : table_(table),
         user_cmp_(table->internal_comparator_.user_comparator()),
         status_(Status::OK()) {
+    std::shared_lock<std::shared_mutex> lock(table_->index_rwlock_);
     entries_.reserve(table_->index_.size());
     for (const auto& kv : table_->index_) {
       entries_.push_back(kv.second);
@@ -168,11 +169,17 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
                                uint64_t log_num) {
   HotNode* node = nullptr;
   {
+    std::shared_lock<std::shared_mutex> lock(index_rwlock_);
     auto it = index_.find(user_key.ToString());
     if (it == index_.end()) {
       return false;
     }
     node = it->second;
+  }
+
+  std::lock_guard<SpinMutex> node_lock(node->write_lock);
+  if (seq <= node->seq) {
+    return true;
   }
 
   uint32_t clamped_val_size = static_cast<uint32_t>(std::min<size_t>(value.size(), max_val_size_));
@@ -311,7 +318,11 @@ void HotMemTable::SweepHits(std::unordered_map<std::string, uint32_t>* hit_map) 
   }
 }
 
-InternalIterator* HotMemTable::NewIterator(Arena* arena) {
+InternalIterator* HotMemTable::NewIterator(Arena* arena, size_t* out_key_count) {
+  std::shared_lock<std::shared_mutex> lock(index_rwlock_);
+  if (out_key_count) {
+    *out_key_count = index_.size();
+  }
   if (arena) {
     void* mem = arena->AllocateAligned(sizeof(HotMemTableIterator));
     return new (mem) HotMemTableIterator(this);
@@ -321,6 +332,7 @@ InternalIterator* HotMemTable::NewIterator(Arena* arena) {
 }
 
 size_t HotMemTable::KeyCount() const {
+  std::shared_lock<std::shared_mutex> lock(index_rwlock_);
   return index_.size();
 }
 

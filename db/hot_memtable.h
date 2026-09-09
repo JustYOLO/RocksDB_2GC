@@ -67,7 +67,10 @@ class HotMemTable {
   void SweepHits(std::unordered_map<std::string, uint32_t>* hit_map);
 
   // Create an InternalIterator for reading/flushing all entries
-  InternalIterator* NewIterator(Arena* arena = nullptr);
+  InternalIterator* NewIterator(Arena* arena = nullptr,
+                                size_t* out_key_count = nullptr);
+
+  std::shared_mutex& index_rwlock() const { return index_rwlock_; }
 
   size_t ApproximateMemoryUsage() const {
     return allocated_bytes_.load(std::memory_order_relaxed);

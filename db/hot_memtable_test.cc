@@ -299,6 +299,10 @@ TEST_F(HotMemTableTest, ConcurrentWritersHighestSeqWinsAndNoTornWrites) {
       while (!stop.load(std::memory_order_relaxed)) {
         if (hot_table.Get(key, &val, &s, &seq)) {
           ASSERT_OK(s);
+          if (seq == 1) {
+            ASSERT_EQ(val, "init_val_0000000000");
+            continue;
+          }
           ASSERT_EQ(val.size(), 33);
           uint64_t s1 = 0, s2 = 0;
           ASSERT_EQ(sscanf(val.c_str(), "%016" PRIu64 ":%016" PRIu64, &s1, &s2), 2);

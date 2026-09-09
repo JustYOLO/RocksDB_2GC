@@ -20,6 +20,7 @@
 #include "db/hot_memtable.h"
 #include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
+#include "db/write_controller.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
@@ -108,7 +109,7 @@ FlushJob::FlushJob(
     std::shared_ptr<const SeqnoToTimeMapping> seqno_to_time_mapping,
     const std::string& db_id, const std::string& db_session_id,
     std::string full_history_ts_low, BlobFileCompletionCallback* blob_callback,
-    bool fast_sst_open)
+    bool fast_sst_open, InstrumentedCondVar* db_cv)
     : dbname_(dbname),
       db_id_(db_id),
       db_session_id_(db_session_id),
@@ -119,6 +120,7 @@ FlushJob::FlushJob(
       file_options_(file_options),
       versions_(versions),
       db_mutex_(db_mutex),
+      db_cv_(db_cv),
       shutting_down_(shutting_down),
       earliest_snapshot_(job_context->GetEarliestSnapshotSequence()),
       job_context_(job_context),
@@ -902,6 +904,28 @@ Status FlushJob::WriteLevel0Table() {
   const uint64_t start_cpu_micros = clock_->CPUMicros();
   Status s;
   bool flush_hot_table = false;
+  if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem()) {
+    if (cfd_->hot_mem()->IsFull() || flush_reason_ == FlushReason::kWalFull ||
+        flush_reason_ == FlushReason::kShutDown || flush_reason_ == FlushReason::kManualFlush) {
+      flush_hot_table = true;
+    }
+  }
+
+  std::unique_ptr<WriteControllerToken> hot_stall_token;
+  uint64_t hot_flush_stall_start_micros = 0;
+  if (flush_hot_table && versions_ && versions_->GetColumnFamilySet()) {
+    WriteController* write_controller =
+        versions_->GetColumnFamilySet()->write_controller();
+    if (write_controller) {
+      hot_stall_token = write_controller->GetStopToken();
+      hot_flush_stall_start_micros = clock_->NowMicros();
+      cfd_->internal_stats()->AddCFStats(InternalStats::MEMTABLE_LIMIT_STOPS, 1);
+      ROCKS_LOG_WARN(
+          db_options_.info_log,
+          "[%s] [JOB %d] Initiating Write Stall for HotTable physical flush",
+          cfd_->GetName().c_str(), job_context_->job_id);
+    }
+  }
 
   meta_.temperature = mutable_cf_options_.default_write_temperature;
   file_options_.temperature = meta_.temperature;
@@ -1026,16 +1050,10 @@ Status FlushJob::WriteLevel0Table() {
                                                   delta_hits, delta_misses);
     }
 
-    flush_hot_table = false;
-    if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem()) {
-      if (cfd_->hot_mem()->IsFull() || flush_reason_ == FlushReason::kWalFull ||
-          flush_reason_ == FlushReason::kShutDown || flush_reason_ == FlushReason::kManualFlush) {
-        flush_hot_table = true;
-      }
-    }
     if (flush_hot_table) {
-      memtables.push_back(cfd_->hot_mem()->NewIterator(&arena));
-      total_num_input_entries += cfd_->hot_mem()->KeyCount();
+      size_t hot_key_count = 0;
+      memtables.push_back(cfd_->hot_mem()->NewIterator(&arena, &hot_key_count));
+      total_num_input_entries += hot_key_count;
       total_data_size += cfd_->hot_mem()->ApproximateMemoryUsage();
       total_memory_usage += cfd_->hot_mem()->ApproximateMemoryUsage();
     }
@@ -1284,6 +1302,22 @@ Status FlushJob::WriteLevel0Table() {
     }
     if (cfd_->ioptions().enable_level_up_compaction) {
       cfd_->DecayAndEvaluateLevelUpSkew();
+    }
+  }
+
+  if (hot_stall_token) {
+    uint64_t stall_micros = clock_->NowMicros() - hot_flush_stall_start_micros;
+    hot_stall_token.reset();
+    RecordTick(stats_, STALL_MICROS, stall_micros);
+    RecordInHistogram(stats_, WRITE_STALL, stall_micros);
+    cfd_->internal_stats()->AddDBStats(
+        InternalStats::kIntStatsWriteStallMicros, stall_micros);
+    ROCKS_LOG_INFO(
+        db_options_.info_log,
+        "[%s] [JOB %d] HotTable physical flush completed; Write Stall ended (%" PRIu64 " micros)",
+        cfd_->GetName().c_str(), job_context_->job_id, stall_micros);
+    if (db_cv_) {
+      db_cv_->SignalAll();
     }
   }
 

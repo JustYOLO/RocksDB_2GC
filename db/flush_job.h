@@ -54,6 +54,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 class Arena;
+class InstrumentedCondVar;
 
 class FlushJob {
  public:
@@ -75,7 +76,8 @@ class FlushJob {
            const std::string& db_id = "", const std::string& db_session_id = "",
            std::string full_history_ts_low = "",
            BlobFileCompletionCallback* blob_callback = nullptr,
-           bool fast_sst_open = false);
+           bool fast_sst_open = false,
+           InstrumentedCondVar* db_cv = nullptr);
 
   ~FlushJob();
 
@@ -197,6 +199,7 @@ class FlushJob {
   FileOptions file_options_;
   VersionSet* versions_;
   InstrumentedMutex* db_mutex_;
+  InstrumentedCondVar* db_cv_;
   std::atomic<bool>* shutting_down_;
   SequenceNumber earliest_snapshot_;
   JobContext* job_context_;
