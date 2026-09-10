@@ -27,6 +27,7 @@
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
 #endif
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <random>
 #include <thread>
 #include <unordered_map>
 
@@ -432,6 +434,20 @@ DEFINE_int64(zipf_key_range, 0,
 DEFINE_double(compression_ratio, 0.5,
               "Arrange to generate values that shrink to this fraction of "
               "their original size after compression");
+
+DEFINE_string(path_real_data, "datasets/data",
+              "Directory containing binary dataset files");
+DEFINE_string(dataset, "",
+              "Name of real dataset to load (e.g. books, osm_cellids, wiki_ts, "
+              "fb, test_dist)");
+DEFINE_string(dataset_size, "",
+              "Size/key count of dataset (e.g. 200M, 400M, 800M, 100K, or raw number)");
+DEFINE_string(dataset_mapping, "shuffle",
+              "Dataset key mapping: 'shuffle' (Strategy A, deterministic shuffle) "
+              "or 'sorted' (Strategy B, sorted ascending)");
+DEFINE_bool(dataset_binary_keys, false,
+            "Store keys as raw 8-byte big-endian binary integers instead of "
+            "zero-padded decimal strings");
 
 DEFINE_double(
     overwrite_probability, 0.0,
@@ -3471,10 +3487,183 @@ class Benchmark {
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
+  static uint64_t ParseDatasetSizeCount(const std::string& size) {
+    if (size.empty()) return 0;
+    char suffix = size.back();
+    uint64_t multiplier = 1;
+    std::string number = size;
+    if (!std::isdigit(static_cast<unsigned char>(suffix))) {
+      number = size.substr(0, size.size() - 1);
+      suffix = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix)));
+      if (suffix == 'K') {
+        multiplier = 1000ULL;
+      } else if (suffix == 'M') {
+        multiplier = 1000000ULL;
+      } else if (suffix == 'G') {
+        multiplier = 1000000000ULL;
+      }
+    }
+    char* end = nullptr;
+    uint64_t value = strtoull(number.c_str(), &end, 10);
+    return value * multiplier;
+  }
+
+  static std::string NormalizeDatasetSizeSuffix(const std::string& size) {
+    if (size.empty()) return size;
+    if (!std::isdigit(static_cast<unsigned char>(size.back()))) {
+      std::string normalized = size;
+      normalized.back() = static_cast<char>(
+          std::toupper(static_cast<unsigned char>(normalized.back())));
+      return normalized;
+    }
+    uint64_t count = ParseDatasetSizeCount(size);
+    if (count > 0 && count % 1000000000ULL == 0) {
+      return std::to_string(count / 1000000000ULL) + "G";
+    }
+    if (count > 0 && count % 1000000ULL == 0) {
+      return std::to_string(count / 1000000ULL) + "M";
+    }
+    if (count > 0 && count % 1000ULL == 0) {
+      return std::to_string(count / 1000ULL) + "K";
+    }
+    return size;
+  }
+
+  static std::string DatasetPrefix(const std::string& dataset) {
+    if (dataset == "osm") return "osm_cellids";
+    if (dataset == "book") return "books";
+    if (dataset == "wiki") return "wiki_ts";
+    return dataset;
+  }
+
+  static std::string ResolveDatasetFilePath(const std::string& base_dir,
+                                           const std::string& dataset,
+                                           const std::string& size_str) {
+    std::string dir = base_dir;
+    if (!dir.empty() && dir.back() != '/') {
+      dir += "/";
+    }
+    if (!size_str.empty()) {
+      std::string candidate = dir + DatasetPrefix(dataset) + "_" +
+                              NormalizeDatasetSizeSuffix(size_str) + "_uint64";
+      std::ifstream test_f(candidate);
+      if (test_f.good()) return candidate;
+    }
+    std::string candidate2 = dir + dataset;
+    std::ifstream test_f2(candidate2);
+    if (test_f2.good()) return candidate2;
+
+    return dir + DatasetPrefix(dataset) + "_" +
+           (size_str.empty() ? "" : (NormalizeDatasetSizeSuffix(size_str) + "_")) +
+           "uint64";
+  }
+
+  void LoadRealDataset() {
+    std::string filename = ResolveDatasetFilePath(
+        FLAGS_path_real_data, FLAGS_dataset, FLAGS_dataset_size);
+    std::ifstream input(filename, std::ios::binary);
+    if (!input.is_open()) {
+      fprintf(stderr, "Error: Could not open dataset file: '%s'\n",
+              filename.c_str());
+      ErrorExit();
+    }
+
+    uint64_t declared_count = 0;
+    if (!input.read(reinterpret_cast<char*>(&declared_count),
+                    sizeof(uint64_t))) {
+      fprintf(stderr,
+              "Error: Dataset file '%s' is missing 8-byte uint64 count header\n",
+              filename.c_str());
+      ErrorExit();
+    }
+
+    std::vector<uint64_t> raw_keys;
+    raw_keys.reserve(declared_count);
+    uint64_t key_val = 0;
+    while (input.read(reinterpret_cast<char*>(&key_val), sizeof(uint64_t))) {
+      raw_keys.push_back(key_val);
+    }
+
+    if (raw_keys.empty()) {
+      fprintf(stderr, "Error: Dataset file '%s' contains no keys\n",
+              filename.c_str());
+      ErrorExit();
+    }
+
+    if (raw_keys.size() != declared_count) {
+      fprintf(stdout,
+              "[Dataset] Warning: file declares %llu keys, but read %zu keys\n",
+              (unsigned long long)declared_count, raw_keys.size());
+    }
+
+    if (FLAGS_dataset_mapping == "sorted") {
+      std::sort(raw_keys.begin(), raw_keys.end());
+      fprintf(stdout,
+              "[Dataset] Applied Strategy B (sorted ascending mapping)\n");
+    } else if (FLAGS_dataset_mapping == "shuffle") {
+      std::mt19937_64 gen(42);
+      std::shuffle(raw_keys.begin(), raw_keys.end(), gen);
+      fprintf(stdout,
+              "[Dataset] Applied Strategy A (deterministic shuffle mapping, "
+              "seed=42)\n");
+    } else {
+      fprintf(stderr,
+              "Error: Unknown --dataset_mapping='%s'. Expected 'shuffle' or "
+              "'sorted'.\n",
+              FLAGS_dataset_mapping.c_str());
+      ErrorExit();
+    }
+
+    if (FLAGS_num <= 0 || FLAGS_num > static_cast<int64_t>(raw_keys.size())) {
+      FLAGS_num = static_cast<int64_t>(raw_keys.size());
+    }
+
+    size_t keys_to_load =
+        std::min<size_t>(raw_keys.size(), static_cast<size_t>(FLAGS_num));
+    keys_.clear();
+    keys_.reserve(keys_to_load);
+
+    for (size_t i = 0; i < keys_to_load; ++i) {
+      uint64_t k = raw_keys[i];
+      if (FLAGS_dataset_binary_keys) {
+        std::string str(FLAGS_key_size, '0');
+        for (int b = 0; b < 8 && b < FLAGS_key_size; ++b) {
+          str[b] = static_cast<char>((k >> ((7 - b) * 8)) & 0xFF);
+        }
+        keys_.push_back(std::move(str));
+      } else {
+        std::string num_str = std::to_string(k);
+        std::string formatted;
+        if (num_str.size() >= static_cast<size_t>(FLAGS_key_size)) {
+          formatted = num_str.substr(0, FLAGS_key_size);
+        } else {
+          formatted =
+              std::string(FLAGS_key_size - num_str.size(), '0') + num_str;
+        }
+        keys_.push_back(std::move(formatted));
+      }
+    }
+
+    fprintf(stdout,
+            "[Dataset] Loaded %zu keys from '%s' into memory (key_size: %d, "
+            "format: %s)\n",
+            keys_.size(), filename.c_str(), FLAGS_key_size,
+            FLAGS_dataset_binary_keys ? "binary_big_endian"
+                                      : "decimal_zero_padded");
+  }
+
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
       fprintf(stderr, "compression_ratio should be between 0 and 1\n");
       return false;
+    }
+    if (!FLAGS_dataset.empty()) {
+      if (FLAGS_dataset_mapping != "shuffle" && FLAGS_dataset_mapping != "sorted") {
+        fprintf(stderr,
+                "Invalid --dataset_mapping='%s'. Must be 'shuffle' or 'sorted'\n",
+                FLAGS_dataset_mapping.c_str());
+        return false;
+      }
     }
     return true;
   }
@@ -4033,10 +4222,11 @@ class Benchmark {
   //     ----------------------------
   void GenerateKeyFromInt(uint64_t v, int64_t num_keys, Slice* key) {
     if (!keys_.empty()) {
-      assert(FLAGS_use_existing_keys);
-      assert(keys_.size() == static_cast<size_t>(num_keys));
-      assert(v < static_cast<uint64_t>(num_keys));
-      *key = keys_[v];
+      assert(FLAGS_use_existing_keys || !FLAGS_dataset.empty());
+      uint64_t idx = (keys_.size() == static_cast<size_t>(num_keys))
+                         ? v
+                         : (v % keys_.size());
+      *key = keys_[idx];
       return;
     }
     char* start = const_cast<char*>(key->data());
@@ -5984,6 +6174,8 @@ class Benchmark {
       }
       delete iter;
       FLAGS_num = keys_.size();
+    } else if (!FLAGS_dataset.empty() && keys_.empty()) {
+      LoadRealDataset();
     }
   }
 
@@ -9237,7 +9429,8 @@ class Benchmark {
       const int64_t bg_keyspace =
           FLAGS_bgwriter_num > 0 ? FLAGS_bgwriter_num : FLAGS_num;
       const int64_t num_keys =
-          FLAGS_use_existing_keys ? FLAGS_num : bg_keyspace;
+          (FLAGS_use_existing_keys || !FLAGS_dataset.empty()) ? FLAGS_num
+                                                              : bg_keyspace;
       GenerateKeyFromInt(thread->rand.Next() % bg_keyspace, num_keys, &key);
       Status s;
 
