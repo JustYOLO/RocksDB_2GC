@@ -2,6 +2,7 @@ make_config.mk
 rocksdb.pc
 .build_signature
 build_tools/__pycache__/
+datasets/data
 
 *.a
 *.arc
