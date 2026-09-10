@@ -1053,6 +1053,10 @@ DEFINE_int32(readwritepercent, 90,
              "90% operations out of all reads and writes operations are "
              "reads. In other words, 9 gets for every 1 put.");
 
+DEFINE_bool(use_zipf_for_readwrite, false,
+            "Use Zipfian key distribution for ReadRandomWriteRandom workload "
+            "using --zipf_const instead of uniform random");
+
 DEFINE_int32(mergereadpercent, 70,
              "Ratio of merges to merges&reads (expressed as percentage) for "
              "the ReadRandomMergeRandom workload. The default value 70 means "
@@ -9780,10 +9784,20 @@ class Benchmark {
       ts_guard.reset(new char[user_timestamp_size_]);
     }
 
+    if (FLAGS_use_zipf_for_readwrite) {
+      init_zipf_generator(0, FLAGS_num - 1, FLAGS_zipf_const);
+    }
+
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
       DB* db = SelectDB(thread);
-      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      int64_t key_id;
+      if (FLAGS_use_zipf_for_readwrite) {
+        key_id = nextValue() % FLAGS_num;
+      } else {
+        key_id = thread->rand.Next() % FLAGS_num;
+      }
+      GenerateKeyFromInt(key_id, FLAGS_num, &key);
       if (get_weight == 0 && put_weight == 0) {
         // one batch completed, reinitialize for next batch
         get_weight = FLAGS_readwritepercent;
