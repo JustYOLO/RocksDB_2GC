@@ -47,6 +47,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
+#include "logging/logging.h"
 #include "monitoring/histogram.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
@@ -988,6 +989,33 @@ static std::atomic<uint64_t> g_last_window_hits{0};
 static std::atomic<uint64_t> g_last_window_misses{0};
 static std::atomic<uint64_t> g_bench_start_micros{0};
 static std::mutex g_window_report_mutex;
+
+DEFINE_bool(varying_include_prefill, true,
+            "Include Phase 1 (pre-fill uniform write-only) in varying_workload");
+DEFINE_int64(varying_phase1_ops, 100000000,
+             "Number of operations for Phase 1 (Pre-fill uniform write-only)");
+DEFINE_int64(varying_phase2_ops, 50000000,
+             "Number of operations for Phase 2 (Mixed 50/50 Zipfian)");
+DEFINE_int64(varying_phase3_ops, 50000000,
+             "Number of operations for Phase 3 (Read-heavy 70/30 Zipfian)");
+DEFINE_int64(varying_phase4_ops, 10000000,
+             "Number of operations for Phase 4 (Write-heavy 10/90 Uniform)");
+DEFINE_int64(varying_phase5_ops, 50000000,
+             "Number of operations for Phase 5 (Write-only 0/100 Zipfian)");
+DEFINE_int64(varying_window_ops, 100000,
+             "Report interval stats every N operations in varying_workload (0 to disable)");
+DEFINE_int64(varying_window_seconds, 0,
+             "Report interval stats every N seconds in varying_workload (0 to disable)");
+
+static std::atomic<uint64_t> g_varying_total_ops{0};
+static std::atomic<uint64_t> g_varying_bench_start_micros{0};
+static std::atomic<uint64_t> g_varying_last_report_micros{0};
+static std::atomic<uint64_t> g_varying_last_report_op{0};
+static std::atomic<uint64_t> g_varying_last_read_hits{0};
+static std::atomic<uint64_t> g_varying_last_read_misses{0};
+static std::atomic<uint64_t> g_varying_last_write_hits{0};
+static std::atomic<uint64_t> g_varying_last_write_misses{0};
+static std::mutex g_varying_report_mutex;
 
 DEFINE_int64(writes, -1,
              "Number of write operations to do. If negative, do --num reads.");
@@ -4548,6 +4576,8 @@ class Benchmark {
         method = &Benchmark::YCSBWorkloadF;
       } else if (name == "fillzip") {
         method = &Benchmark::YCSBWorkloadW;
+      } else if (name == "varying_workload") {
+        method = &Benchmark::VaryingWorkload;
       } else if (name == "multiscan_stride") {
         fprintf(stderr, "multiscan_stride = %" PRIi64 "\n",
                 FLAGS_multiscan_stride);
@@ -8285,6 +8315,348 @@ class Benchmark {
     thread->stats.AddMessage(msg);
   }
 
+  // VaryingWorkload: Sequences 5 distinct phases continuously:
+  // Phase 1: Pre-fill (Uniform random, 100% write, 100M keys)
+  // Phase 2: Mixed (Zipfian, 50% read / 50% write, 50M ops)
+  // Phase 3: Read-heavy (Zipfian, 70% read / 30% write, 50M ops)
+  // Phase 4: Write-heavy uniform (Uniform, 10% read / 90% write, 10M ops)
+  // Phase 5: Write-only Zipfian (Zipfian, 0% read / 100% write, 50M ops)
+  void VaryingWorkload(ThreadState* thread) {
+    ReadOptions options = read_options_;
+    RandomGenerator gen;
+    std::string value;
+
+    int64_t key_range = FLAGS_key_range > 0 ? FLAGS_key_range : FLAGS_num;
+    if (key_range <= 0) {
+      key_range = 100000000;
+    }
+    init_zipf_generator(0, key_range, bench_params.zipf_const);
+
+    struct PhaseSpec {
+      int id;
+      const char* name;
+      int64_t target_ops;
+      bool is_zipfian;
+      int read_ratio;  // percentage (0 to 100)
+    };
+
+    std::vector<PhaseSpec> phases;
+    if (FLAGS_varying_include_prefill && FLAGS_varying_phase1_ops > 0) {
+      phases.push_back({1, "Pre-fill (100% Write, Uniform)",
+                        FLAGS_varying_phase1_ops, false, 0});
+    }
+    if (FLAGS_varying_phase2_ops > 0) {
+      phases.push_back({2, "Mixed (50R/50W, Zipfian)",
+                        FLAGS_varying_phase2_ops, true, 50});
+    }
+    if (FLAGS_varying_phase3_ops > 0) {
+      phases.push_back({3, "Read-Heavy (70R/30W, Zipfian)",
+                        FLAGS_varying_phase3_ops, true, 70});
+    }
+    if (FLAGS_varying_phase4_ops > 0) {
+      phases.push_back({4, "Write-Heavy Uniform (10R/90W, Uniform)",
+                        FLAGS_varying_phase4_ops, false, 10});
+    }
+    if (FLAGS_varying_phase5_ops > 0) {
+      phases.push_back({5, "Write-Only (0R/100W, Zipfian)",
+                        FLAGS_varying_phase5_ops, true, 0});
+    }
+
+    uint64_t now_init = FLAGS_env->NowMicros();
+    uint64_t expected_zero = 0;
+    if (g_varying_bench_start_micros.compare_exchange_strong(expected_zero,
+                                                             now_init)) {
+      g_varying_last_report_micros.store(now_init, std::memory_order_relaxed);
+      g_varying_last_report_op.store(0, std::memory_order_relaxed);
+      g_varying_total_ops.store(0, std::memory_order_relaxed);
+      if (dbstats) {
+        g_varying_last_read_hits.store(
+            dbstats->getTickerCount(Tickers::HOT_TABLE_READ_HIT_COUNT),
+            std::memory_order_relaxed);
+        g_varying_last_read_misses.store(
+            dbstats->getTickerCount(Tickers::HOT_TABLE_READ_MISS_COUNT),
+            std::memory_order_relaxed);
+        g_varying_last_write_hits.store(
+            dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT),
+            std::memory_order_relaxed);
+        g_varying_last_write_misses.store(
+            dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_MISS_COUNT),
+            std::memory_order_relaxed);
+      }
+    }
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    int64_t total_reads_done = 0;
+    int64_t total_writes_done = 0;
+    int64_t total_found = 0;
+
+    for (const auto& phase : phases) {
+      // Workload Shift Boundary
+      {
+        std::lock_guard<std::mutex> lk(g_varying_report_mutex);
+        uint64_t now = FLAGS_env->NowMicros();
+        double elapsed_sec =
+            (now - g_varying_bench_start_micros.load(
+                       std::memory_order_relaxed)) /
+            1000000.0;
+        uint64_t cur_total_done =
+            g_varying_total_ops.load(std::memory_order_relaxed);
+
+        fprintf(
+            stderr,
+            "\n================================================================"
+            "================\n"
+            "[Varying Workload Shift] >>> Starting Phase %d: %s <<<\n"
+            "  - Total Ops Ingested So Far: %" PRIu64 "\n"
+            "  - Phase Target Ops: %" PRIu64 "\n"
+            "  - Key Range: %" PRIu64 "\n"
+            "  - Workload Distribution: %s\n"
+            "  - Read/Write Ratio: %d%% Read / %d%% Write\n"
+            "  - Elapsed Time: %.1fs\n"
+            "================================================================"
+            "================\n\n",
+            phase.id, phase.name, cur_total_done, phase.target_ops, key_range,
+            phase.is_zipfian ? "Zipfian (theta=0.99)" : "Uniform Random",
+            phase.read_ratio, 100 - phase.read_ratio, elapsed_sec);
+        fflush(stderr);
+
+        DB* db = SelectDB(thread);
+        if (db && db->GetDBOptions().info_log) {
+          ROCKS_LOG_INFO(
+              db->GetDBOptions().info_log,
+              "[Varying Workload Shift] Transitioned to Phase %d: %s "
+              "(TargetOps: %" PRIu64 ", R/W: %d/%d, Dist: %s, TotalOps: %" PRIu64
+              ")",
+              phase.id, phase.name, phase.target_ops, phase.read_ratio,
+              100 - phase.read_ratio, phase.is_zipfian ? "Zipfian" : "Uniform",
+              cur_total_done);
+        }
+
+        uint64_t cur_r_hits = 0, cur_r_misses = 0, cur_w_hits = 0,
+                 cur_w_misses = 0;
+        if (dbstats) {
+          cur_r_hits =
+              dbstats->getTickerCount(Tickers::HOT_TABLE_READ_HIT_COUNT);
+          cur_r_misses =
+              dbstats->getTickerCount(Tickers::HOT_TABLE_READ_MISS_COUNT);
+          cur_w_hits =
+              dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT);
+          cur_w_misses =
+              dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_MISS_COUNT);
+        }
+        g_varying_last_read_hits.store(cur_r_hits, std::memory_order_relaxed);
+        g_varying_last_read_misses.store(cur_r_misses,
+                                         std::memory_order_relaxed);
+        g_varying_last_write_hits.store(cur_w_hits, std::memory_order_relaxed);
+        g_varying_last_write_misses.store(cur_w_misses,
+                                          std::memory_order_relaxed);
+        g_varying_last_report_micros.store(now, std::memory_order_relaxed);
+        g_varying_last_report_op.store(0, std::memory_order_relaxed);
+      }
+
+      int64_t phase_ops_left = phase.target_ops;
+      int64_t phase_ops_done = 0;
+
+      while (phase_ops_left > 0) {
+        phase_ops_left--;
+        phase_ops_done++;
+        uint64_t total_op_idx =
+            g_varying_total_ops.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        DB* db = SelectDB(thread);
+        long k;
+        if (phase.is_zipfian) {
+          k = nextValue() % key_range;
+        } else {
+          k = thread->rand.Next() % key_range;
+        }
+        GenerateKeyFromInt(k, key_range, &key);
+
+        bool is_read = false;
+        if (phase.read_ratio > 0) {
+          int next_op = thread->rand.Next() % 100;
+          if (next_op < phase.read_ratio) {
+            is_read = true;
+          }
+        }
+
+        if (is_read) {
+          Status s = db->Get(options, key, &value);
+          if (s.ok()) {
+            total_found++;
+          }
+          total_reads_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        } else {
+          if (FLAGS_benchmark_write_rate_limit > 0) {
+            thread->shared->write_rate_limiter->Request(
+                value_size + FLAGS_key_size, Env::IO_HIGH, nullptr /* stats */,
+                RateLimiter::OpType::kWrite);
+            thread->stats.ResetLastOpTime();
+          }
+          Status s = db->Put(write_options_, key, gen.Generate(value_size));
+          if (s.ok()) {
+            total_writes_done++;
+            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+          }
+        }
+
+        // Periodic window report
+        bool should_report = false;
+        if (FLAGS_varying_window_seconds > 0) {
+          uint64_t now = FLAGS_env->NowMicros();
+          uint64_t last_rep =
+              g_varying_last_report_micros.load(std::memory_order_relaxed);
+          uint64_t window_micros =
+              static_cast<uint64_t>(FLAGS_varying_window_seconds) * 1000000;
+          if (now >= last_rep + window_micros) {
+            should_report = true;
+          }
+        }
+        if (FLAGS_varying_window_ops > 0) {
+          uint64_t last_rep_op =
+              g_varying_last_report_op.load(std::memory_order_relaxed);
+          if (phase_ops_done >=
+              static_cast<int64_t>(last_rep_op + FLAGS_varying_window_ops)) {
+            should_report = true;
+          }
+        }
+
+        if (should_report && (phase_ops_done % 256 == 0)) {
+          if (g_varying_report_mutex.try_lock()) {
+            bool still_should = false;
+            uint64_t now = FLAGS_env->NowMicros();
+            uint64_t last_rep_micros =
+                g_varying_last_report_micros.load(std::memory_order_relaxed);
+            uint64_t window_micros =
+                static_cast<uint64_t>(FLAGS_varying_window_seconds) * 1000000;
+            if (FLAGS_varying_window_seconds > 0 &&
+                now >= last_rep_micros + window_micros) {
+              still_should = true;
+            }
+            uint64_t last_rep_op =
+                g_varying_last_report_op.load(std::memory_order_relaxed);
+            if (FLAGS_varying_window_ops > 0 &&
+                phase_ops_done >= static_cast<int64_t>(
+                                      last_rep_op + FLAGS_varying_window_ops)) {
+              still_should = true;
+            }
+            if (still_should) {
+              uint64_t delta_ops =
+                  (phase_ops_done > static_cast<int64_t>(last_rep_op))
+                      ? (phase_ops_done - last_rep_op)
+                      : phase_ops_done;
+              double delta_sec = (now - last_rep_micros) / 1000000.0;
+              double iops = (delta_sec > 0.0) ? (delta_ops / delta_sec) : 0.0;
+              double elapsed_sec =
+                  (now - g_varying_bench_start_micros.load(
+                             std::memory_order_relaxed)) /
+                  1000000.0;
+
+              uint64_t cur_r_hits = 0, cur_r_misses = 0, cur_w_hits = 0,
+                       cur_w_misses = 0;
+              if (dbstats) {
+                cur_r_hits =
+                    dbstats->getTickerCount(Tickers::HOT_TABLE_READ_HIT_COUNT);
+                cur_r_misses =
+                    dbstats->getTickerCount(Tickers::HOT_TABLE_READ_MISS_COUNT);
+                cur_w_hits =
+                    dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT);
+                cur_w_misses = dbstats->getTickerCount(
+                    Tickers::HOT_TABLE_WRITE_MISS_COUNT);
+              }
+              uint64_t prev_r_hits =
+                  g_varying_last_read_hits.load(std::memory_order_relaxed);
+              uint64_t prev_r_misses =
+                  g_varying_last_read_misses.load(std::memory_order_relaxed);
+              uint64_t prev_w_hits =
+                  g_varying_last_write_hits.load(std::memory_order_relaxed);
+              uint64_t prev_w_misses =
+                  g_varying_last_write_misses.load(std::memory_order_relaxed);
+
+              uint64_t delta_r_hits = (cur_r_hits >= prev_r_hits)
+                                          ? (cur_r_hits - prev_r_hits)
+                                          : cur_r_hits;
+              uint64_t delta_r_misses = (cur_r_misses >= prev_r_misses)
+                                            ? (cur_r_misses - prev_r_misses)
+                                            : cur_r_misses;
+              uint64_t delta_w_hits = (cur_w_hits >= prev_w_hits)
+                                          ? (cur_w_hits - prev_w_hits)
+                                          : cur_w_hits;
+              uint64_t delta_w_misses = (cur_w_misses >= prev_w_misses)
+                                            ? (cur_w_misses - prev_w_misses)
+                                            : cur_w_misses;
+
+              uint64_t delta_r_total = delta_r_hits + delta_r_misses;
+              uint64_t delta_w_total = delta_w_hits + delta_w_misses;
+              uint64_t delta_total = delta_r_total + delta_w_total;
+
+              double r_hit_rate = (delta_r_total > 0)
+                                      ? (delta_r_hits * 100.0 / delta_r_total)
+                                      : 0.0;
+              double w_hit_rate = (delta_w_total > 0)
+                                      ? (delta_w_hits * 100.0 / delta_w_total)
+                                      : 0.0;
+              double total_hit_rate =
+                  (delta_total > 0)
+                      ? ((delta_r_hits + delta_w_hits) * 100.0 / delta_total)
+                      : 0.0;
+
+              if (FLAGS_enable_hot_table) {
+                fprintf(
+                    stderr,
+                    "[Varying Phase %d: %s] Phase Ops: %" PRIi64 "/%" PRIu64
+                    " (Total: %" PRIu64
+                    ") | Interval: %.1f ops/sec | Elapsed: %.1fs "
+                    "| Read Hit: %.2f%% (%" PRIu64 "/%" PRIu64
+                    ") "
+                    "| Write Hit: %.2f%% (%" PRIu64 "/%" PRIu64
+                    ") "
+                    "| Total Hit: %.2f%%\n",
+                    phase.id, phase.name, phase_ops_done, phase.target_ops,
+                    total_op_idx, iops, elapsed_sec, r_hit_rate, delta_r_hits,
+                    delta_r_total, w_hit_rate, delta_w_hits, delta_w_total,
+                    total_hit_rate);
+              } else {
+                fprintf(stderr,
+                        "[Varying Phase %d: %s] Phase Ops: %" PRIi64 "/%" PRIu64
+                        " (Total: %" PRIu64
+                        ") | Interval: %.1f ops/sec | Elapsed: %.1fs\n",
+                        phase.id, phase.name, phase_ops_done, phase.target_ops,
+                        total_op_idx, iops, elapsed_sec);
+              }
+              fflush(stderr);
+
+              g_varying_last_read_hits.store(cur_r_hits,
+                                             std::memory_order_relaxed);
+              g_varying_last_read_misses.store(cur_r_misses,
+                                               std::memory_order_relaxed);
+              g_varying_last_write_hits.store(cur_w_hits,
+                                              std::memory_order_relaxed);
+              g_varying_last_write_misses.store(cur_w_misses,
+                                                std::memory_order_relaxed);
+              g_varying_last_report_micros.store(now,
+                                                 std::memory_order_relaxed);
+              g_varying_last_report_op.store(phase_ops_done,
+                                             std::memory_order_relaxed);
+            }
+            g_varying_report_mutex.unlock();
+          }
+        }
+      }
+    }
+
+    char msg[120];
+    snprintf(msg, sizeof(msg),
+             "( varying_reads:%" PRIu64 " varying_writes:%" PRIu64
+             " found:%" PRIu64 " total:%" PRIu64 ")",
+             total_reads_done, total_writes_done, total_found,
+             g_varying_total_ops.load(std::memory_order_relaxed));
+    thread->stats.AddMessage(msg);
+  }
+
   void ReadRandom(ThreadState* thread) {
     int64_t read = 0;
     int64_t found = 0;
@@ -11873,7 +12245,8 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     }
   }
   if (FLAGS_statistics || FLAGS_enable_hot_table || FLAGS_hot_table_window_seconds > 0 ||
-      FLAGS_hot_table_window_ops > 0) {
+      FLAGS_hot_table_window_ops > 0 || FLAGS_varying_window_ops > 0 ||
+      FLAGS_varying_window_seconds > 0) {
     if (!dbstats) {
       dbstats = ROCKSDB_NAMESPACE::CreateDBStatistics();
     }
