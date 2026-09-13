@@ -1048,6 +1048,39 @@ Status FlushJob::WriteLevel0Table() {
 
       cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries, total_duplicate_entries,
                                                   delta_hits, delta_misses);
+
+      // Detect hot key range shift: HotTable absorption collapsed while memtable duplicate/garbage ratio is high
+      if (!flush_hot_table && cfd_->hot_mem() && cfd_->hot_mem()->KeyCount() > 0) {
+        double cur_abs = cfd_->space_saving_topk()->GetRecentAbsorptionRatio();
+        double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
+        if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
+            cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
+          flush_hot_table = true;
+          if (!hot_stall_token && versions_ && versions_->GetColumnFamilySet()) {
+            WriteController* write_controller =
+                versions_->GetColumnFamilySet()->write_controller();
+            if (write_controller) {
+              hot_stall_token = write_controller->GetStopToken();
+              hot_flush_stall_start_micros = clock_->NowMicros();
+              cfd_->internal_stats()->AddCFStats(InternalStats::MEMTABLE_LIMIT_STOPS, 1);
+              ROCKS_LOG_WARN(
+                  db_options_.info_log,
+                  "[%s] [JOB %d] Initiating Write Stall for HotTable physical flush",
+                  cfd_->GetName().c_str(), job_context_->job_id);
+            }
+          }
+          ROCKS_LOG_INFO(
+              db_options_.info_log,
+              "[%s] [HotTable] Detected hot key range shift: absorption dropped to %.2f%% (< %.1f%%), "
+              "while memtable duplicate/garbage ratio is %.2f%% (>= %.1f%%). "
+              "Flushing stale hot table and rebuilding with new hot keys.",
+              cfd_->GetName().c_str(),
+              cur_abs * 100.0,
+              cfd_->ioptions().hot_table_min_absorption_ratio * 100.0,
+              cur_dup * 100.0,
+              cfd_->ioptions().hot_table_min_duplicate_ratio * 100.0);
+        }
+      }
     }
 
     if (flush_hot_table) {

@@ -77,3 +77,11 @@ python3 gen_uniform.py --many
 python3 gen_uniform.py --many --sparse --uint32
 python3 gen_uniform.py --many --sparse
 python3 gen_norm.py
+echo "Downsampling books and osm_cellids using C++ downsampler..."
+if [ ! -x "./downsample" ]; then
+   g++ -O3 downsample.cc -o downsample
+fi
+./downsample
+
+echo "Dataset preparation complete! Available datasets in data/:"
+ls -lh data/*uint64

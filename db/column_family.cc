@@ -838,6 +838,10 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
     for (const auto& entry : top_keys) {
       new_router->Add(entry.key);
     }
+    ROCKS_LOG_INFO(
+        ioptions_.info_log,
+        "[%s] [HotTable] Rebuilt hot table router with %zu hot keys (capacity: %zu)",
+        GetName().c_str(), top_keys.size(), capacity);
   }
   hot_router_ = std::move(new_router);
 }
