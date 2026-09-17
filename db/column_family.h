@@ -487,7 +487,8 @@ class ColumnFamilyData {
     last_hot_write_misses_ = misses;
   }
   void ExecuteVirtualFlush();
-  void RebuildHotTable(bool was_physically_flushed = true);
+  void RebuildHotTable(bool was_physically_flushed = true,
+                       uint64_t flush_log_number = 0);
 
   SpatialCountMinSketch* spatial_cms() const { return spatial_cms_.get(); }
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_shared() const { return spatial_cms_; }

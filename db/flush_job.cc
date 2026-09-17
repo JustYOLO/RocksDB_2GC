@@ -231,6 +231,13 @@ void FlushJob::PickMemTable() {
     target_log_number =
         std::min(target_log_number, cfd_->hot_mem()->GetEarliestLogNumber());
   }
+  // Defensive backstop: SetLogNumber() must be monotonically non-decreasing
+  // across flushes (VersionSet::LogAndApplyHelper asserts
+  // edit->GetLogNumber() >= cfd->GetLogNumber()). The HotTable clamp above
+  // should never regress below the already-committed log number, but this
+  // guards against it doing so if HotTable's own earliest-log bookkeeping is
+  // ever wrong, since violating it aborts the whole process.
+  target_log_number = std::max(target_log_number, cfd_->GetLogNumber());
   edit_->SetLogNumber(target_log_number);
   edit_->SetColumnFamily(cfd_->GetID());
 
@@ -1355,7 +1362,7 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok()) {
     if (cfd_->ioptions().enable_hot_table && cfd_->hot_router()) {
-      cfd_->RebuildHotTable(flush_hot_table);
+      cfd_->RebuildHotTable(flush_hot_table, GetLogNumber());
     }
     if (cfd_->ioptions().enable_level_up_compaction) {
       cfd_->DecayAndEvaluateLevelUpSkew();

@@ -792,7 +792,8 @@ void ColumnFamilyData::ExecuteVirtualFlush() {
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 }
 
-void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
+void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
+                                       uint64_t flush_log_number) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
@@ -834,6 +835,20 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
   // Workload is skewed -> enable HotTable and revert max write buffer number to base
   mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
 
+  // `flush_log_number`, when set by the flush that triggered this rebuild
+  // (see FlushJob::Run(), which calls RebuildHotTable() before its own
+  // VersionEdit is applied via LogAndApply), is the log number that flush's
+  // edit is about to commit. GetLogNumber() at this point still returns the
+  // *previous* flush's committed value, since this flush's own edit hasn't
+  // landed yet. Seeding earliest_log_num_ from the stale GetLogNumber()
+  // would let it fall behind the log number this flush is about to commit;
+  // the next flush's clamp in FlushJob::PickMemTable() would then regress
+  // its own target log number below cfd_->GetLogNumber(), tripping
+  // VersionSet::LogAndApplyHelper's "edit->GetLogNumber() >=
+  // cfd->GetLogNumber()" monotonicity assertion and aborting the process.
+  uint64_t seed_log_number =
+      flush_log_number > 0 ? flush_log_number : GetLogNumber();
+
   std::shared_ptr<HotMemTable> hot_mem;
   {
     ReadLock l(&hot_table_ptr_mutex_);
@@ -843,7 +858,7 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
     hot_mem = std::make_shared<HotMemTable>(
         internal_comparator_, ioptions_.hot_table_write_buffer_size,
         ioptions_.hot_table_max_value_size);
-    hot_mem->SetEarliestLogNumber(GetLogNumber());
+    hot_mem->SetEarliestLogNumber(seed_log_number);
     {
       WriteLock l(&hot_table_ptr_mutex_);
       hot_mem_ = hot_mem;
@@ -860,7 +875,10 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
     for (const auto& entry : top_keys) {
       new_router->Add(entry.key);
       if (hot_mem) {
-        hot_mem->Add(entry.key, Slice(), kTypeValue, 0, GetLogNumber());
+        // Same seed_log_number as above: Add()'s CAS-min update to
+        // earliest_log_num_ would otherwise drag a correctly-seeded value
+        // back down to the stale GetLogNumber().
+        hot_mem->Add(entry.key, Slice(), kTypeValue, 0, seed_log_number);
       }
     }
     ROCKS_LOG_INFO(
