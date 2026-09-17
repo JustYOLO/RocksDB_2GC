@@ -222,9 +222,16 @@ void FlushJob::PickMemTable() {
   ReadOnlyMemTable* m = mems_[0];
   edit_ = m->GetEdits();
   edit_->SetPrevLogNumber(0);
+  max_next_log_number_ = max_next_log_number;
   // SetLogNumber(log_num) indicates logs with number smaller than log_num
   // will no longer be picked up for recovery.
-  edit_->SetLogNumber(max_next_log_number);
+  uint64_t target_log_number = max_next_log_number;
+  if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem() &&
+      !cfd_->hot_mem()->IsEmpty()) {
+    target_log_number =
+        std::min(target_log_number, cfd_->hot_mem()->GetEarliestLogNumber());
+  }
+  edit_->SetLogNumber(target_log_number);
   edit_->SetColumnFamily(cfd_->GetID());
 
   // path 0 for level 0 file.
@@ -1049,36 +1056,50 @@ Status FlushJob::WriteLevel0Table() {
       cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries, total_duplicate_entries,
                                                   delta_hits, delta_misses);
 
-      // Detect hot key range shift: HotTable absorption collapsed while memtable duplicate/garbage ratio is high
-      if (!flush_hot_table && cfd_->hot_mem() && cfd_->hot_mem()->KeyCount() > 0) {
-        double cur_abs = cfd_->space_saving_topk()->GetRecentAbsorptionRatio();
-        double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
-        if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
-            cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
+      // Flush hot table if:
+      // 1) WAL size limit reached (kWalFull) and HotTable has active data
+      // 2) Hot key range shift: absorption dropped while duplicate/garbage
+      // ratio is high
+      if (!flush_hot_table && cfd_->hot_mem() && !cfd_->hot_mem()->IsEmpty()) {
+        if (flush_reason_ == FlushReason::kWalFull) {
           flush_hot_table = true;
-          if (!hot_stall_token && versions_ && versions_->GetColumnFamilySet()) {
-            WriteController* write_controller =
-                versions_->GetColumnFamilySet()->write_controller();
-            if (write_controller) {
-              hot_stall_token = write_controller->GetStopToken();
-              hot_flush_stall_start_micros = clock_->NowMicros();
-              cfd_->internal_stats()->AddCFStats(InternalStats::MEMTABLE_LIMIT_STOPS, 1);
-              ROCKS_LOG_WARN(
-                  db_options_.info_log,
-                  "[%s] [JOB %d] Initiating Write Stall for HotTable physical flush",
-                  cfd_->GetName().c_str(), job_context_->job_id);
+          ROCKS_LOG_INFO(db_options_.info_log,
+                         "[%s] [HotTable] WAL size limit reached (kWalFull). "
+                         "Flushing HotTable.",
+                         cfd_->GetName().c_str());
+        } else if (cfd_->hot_mem()->KeyCount() > 0) {
+          double cur_abs =
+              cfd_->space_saving_topk()->GetRecentAbsorptionRatio();
+          double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
+          if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
+              cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
+            flush_hot_table = true;
+            if (!hot_stall_token && versions_ &&
+                versions_->GetColumnFamilySet()) {
+              WriteController* write_controller =
+                  versions_->GetColumnFamilySet()->write_controller();
+              if (write_controller) {
+                hot_stall_token = write_controller->GetStopToken();
+                hot_flush_stall_start_micros = clock_->NowMicros();
+                cfd_->internal_stats()->AddCFStats(
+                    InternalStats::MEMTABLE_LIMIT_STOPS, 1);
+                ROCKS_LOG_WARN(db_options_.info_log,
+                               "[%s] [JOB %d] Initiating Write Stall for "
+                               "HotTable physical flush",
+                               cfd_->GetName().c_str(), job_context_->job_id);
+              }
             }
+            ROCKS_LOG_INFO(
+                db_options_.info_log,
+                "[%s] [HotTable] Detected hot key range shift: absorption "
+                "dropped to %.2f%% (< %.1f%%), "
+                "while memtable duplicate/garbage ratio is %.2f%% (>= %.1f%%). "
+                "Flushing stale hot table and rebuilding with new hot keys.",
+                cfd_->GetName().c_str(), cur_abs * 100.0,
+                cfd_->ioptions().hot_table_min_absorption_ratio * 100.0,
+                cur_dup * 100.0,
+                cfd_->ioptions().hot_table_min_duplicate_ratio * 100.0);
           }
-          ROCKS_LOG_INFO(
-              db_options_.info_log,
-              "[%s] [HotTable] Detected hot key range shift: absorption dropped to %.2f%% (< %.1f%%), "
-              "while memtable duplicate/garbage ratio is %.2f%% (>= %.1f%%). "
-              "Flushing stale hot table and rebuilding with new hot keys.",
-              cfd_->GetName().c_str(),
-              cur_abs * 100.0,
-              cfd_->ioptions().hot_table_min_absorption_ratio * 100.0,
-              cur_dup * 100.0,
-              cfd_->ioptions().hot_table_min_duplicate_ratio * 100.0);
         }
       }
     }
@@ -1089,6 +1110,9 @@ Status FlushJob::WriteLevel0Table() {
       total_num_input_entries += hot_key_count;
       total_data_size += cfd_->hot_mem()->ApproximateMemoryUsage();
       total_memory_usage += cfd_->hot_mem()->ApproximateMemoryUsage();
+      if (max_next_log_number_ > 0) {
+        edit_->SetLogNumber(max_next_log_number_);
+      }
     }
 
     RecordInHistogram(stats_, FLUSH_MEMTABLE_MEMORY_BYTES, total_memory_usage);

@@ -2580,6 +2580,11 @@ InternalIterator* DBImpl::NewInternalIterator(
     merge_iter_builder.SetMemtablePruned(true);
   }
 
+  if (super_version->hot_router && super_version->hot_router->IsActive() &&
+      super_version->hot_mem && !super_version->hot_mem->IsEmpty()) {
+    merge_iter_builder.AddIterator(super_version->hot_mem->NewIterator(arena));
+  }
+
   if (s.ok() &&
       (scan_opts == nullptr || super_version->imm->GetTotalNumEntries() > 0)) {
     // Collect all needed child iterators for immutable memtables. When scan
@@ -3353,7 +3358,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     }
   };
   if (!skip_memtable) {
-    if (sv->hot_router && sv->hot_router->IsActive() && sv->hot_mem) {
+    if (get_impl_options.get_value && sv->hot_router &&
+        sv->hot_router->IsActive() && sv->hot_mem) {
       if (sv->hot_router->MayContain(lkey.user_key())) {
         RecordTick(stats_, HOT_TABLE_ROUTER_MATCH);
         std::string hot_val;
@@ -4183,6 +4189,48 @@ Status DBImpl::MultiGetImpl(
         (read_options.read_tier == kPersistedTier &&
          has_unpersisted_data_.load(std::memory_order_relaxed));
     if (!skip_memtable) {
+      if (cfd->ioptions().enable_hot_table) {
+        auto hot_router = super_version->hot_router;
+        auto hot_mem = super_version->hot_mem;
+        if (hot_router && hot_router->IsActive() && hot_mem) {
+          for (auto mget_iter = range.begin(); mget_iter != range.end();
+               ++mget_iter) {
+            if (mget_iter->columns != nullptr) {
+              // HotTable never stores wide-column entities; let the
+              // existing mem/imm/SST path resolve these.
+              continue;
+            }
+            if (!hot_router->MayContain(mget_iter->ukey_without_ts)) {
+              RecordTick(stats_, HOT_TABLE_ROUTER_FILTERED);
+              RecordTick(stats_, HOT_TABLE_READ_MISS_COUNT);
+              continue;
+            }
+            RecordTick(stats_, HOT_TABLE_ROUTER_MATCH);
+            std::string hot_val;
+            Status hot_s = Status::OK();
+            SequenceNumber hot_seq = 0;
+            if (hot_mem->Get(mget_iter->ukey_without_ts, &hot_val, &hot_s,
+                             &hot_seq)) {
+              if (hot_s.ok()) {
+                if (mget_iter->value != nullptr) {
+                  *mget_iter->value->GetSelf() = std::move(hot_val);
+                  mget_iter->value->PinSelf();
+                }
+                *mget_iter->s = Status::OK();
+                RecordTick(stats_, HOT_TABLE_READ_HIT_COUNT);
+                RecordTick(stats_, MEMTABLE_HIT);
+                range.MarkKeyDone(mget_iter);
+              } else if (hot_s.IsNotFound()) {
+                *mget_iter->s = Status::NotFound();
+                range.MarkKeyDone(mget_iter);
+              }
+            } else {
+              RecordTick(stats_, HOT_TABLE_ROUTER_FALSE_POSITIVES);
+              RecordTick(stats_, HOT_TABLE_READ_MISS_COUNT);
+            }
+          }
+        }
+      }
       super_version->mem->MultiGet(read_options, &range, callback,
                                    false /* immutable_memtable */,
                                    memtable_blob_fetcher_ptr);

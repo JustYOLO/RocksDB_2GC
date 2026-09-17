@@ -1,7 +1,8 @@
 #pragma once
 
-#include <memory>
 #include <atomic>
+#include <memory>
+#include <vector>
 #include "rocksdb/slice.h"
 #include "memory/arena.h"
 #include "util/dynamic_bloom.h"
@@ -45,6 +46,18 @@ class HotTableRouter {
   std::atomic<size_t> key_count_{0};
   std::unique_ptr<Arena> arena_;
   std::unique_ptr<DynamicBloom> bloom_holder_;
+  // Every previous generation is retired here instead of being freed
+  // immediately: a reader that loaded `bloom_` just before a Rebuild()/
+  // Disable() swap may still be mid-MayContain()/Add() for an arbitrarily
+  // long time (thread scheduling gives no upper bound), so there is no fixed
+  // number of generations that is always safe to free eagerly. Retired
+  // generations are only freed when this router itself is destroyed.
+  // Rebuild()/Disable() run at most once per flush in practice, so this
+  // grows slowly over the router's lifetime -- the same trade-off
+  // HotMemTable already makes for resized HotNodes (see
+  // allocated_node_ptrs_ in hot_memtable.h).
+  std::vector<std::unique_ptr<Arena>> retired_arenas_;
+  std::vector<std::unique_ptr<DynamicBloom>> retired_bloom_holders_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

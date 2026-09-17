@@ -29,6 +29,7 @@ struct HotNode {
   std::atomic<uint32_t> seq_version{0}; // Seqlock: Even = stable, Odd = writing
   uint32_t user_key_len{0};
   uint32_t val_len{0};
+  uint32_t capacity{0};
   ValueType value_type{kTypeValue};
   SequenceNumber seq{0};
 
@@ -79,6 +80,9 @@ class HotMemTable {
   size_t WriteBufferSize() const { return write_buffer_size_; }
   uint32_t MaxValueSize() const { return max_val_size_; }
   bool IsFull() const { return ApproximateMemoryUsage() >= write_buffer_size_; }
+  bool IsEmpty() const {
+    return earliest_seq_.load(std::memory_order_relaxed) == kMaxSequenceNumber;
+  }
   size_t KeyCount() const;
 
   SequenceNumber GetEarliestSequenceNumber() const {

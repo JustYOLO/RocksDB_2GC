@@ -245,6 +245,7 @@ class FlushJob {
   autovector<ReadOnlyMemTable*> mems_;
   VersionEdit* edit_;
   Version* base_;
+  uint64_t max_next_log_number_{0};
   bool pick_memtable_called;
   Env::Priority thread_pri_;
 

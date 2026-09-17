@@ -20,7 +20,9 @@ class HotMemTableIterator : public InternalIterator {
     std::shared_lock<std::shared_mutex> lock(table_->index_rwlock_);
     entries_.reserve(table_->index_.size());
     for (const auto& kv : table_->index_) {
-      entries_.push_back(kv.second);
+      if (kv.second->seq > 0) {
+        entries_.push_back(kv.second);
+      }
     }
   }
 
@@ -41,7 +43,6 @@ class HotMemTableIterator : public InternalIterator {
   void Seek(const Slice& target) override {
     ParsedInternalKey pikey;
     Status s = ParseInternalKey(target, &pikey, false /* log_err_key */);
-    Slice user_key = s.ok() ? pikey.user_key : target;
 
     int left = 0;
     int right = static_cast<int>(entries_.size()) - 1;
@@ -51,12 +52,32 @@ class HotMemTableIterator : public InternalIterator {
       int mid = left + (right - left) / 2;
       HotNode* node = entries_[mid];
       Slice node_key(node->UserKey(), node->user_key_len);
-      int c = user_cmp_->Compare(node_key, user_key);
-      if (c >= 0) {
-        best = mid;
-        right = mid - 1;
+      if (s.ok()) {
+        int c = user_cmp_->Compare(node_key, pikey.user_key);
+        if (c < 0) {
+          left = mid + 1;
+        } else if (c > 0) {
+          best = mid;
+          right = mid - 1;
+        } else {
+          // user_key matches. Check sequence number: higher seq is smaller in
+          // internal order.
+          if (node->seq > pikey.sequence) {
+            // node < target, so node is before target
+            left = mid + 1;
+          } else {
+            best = mid;
+            right = mid - 1;
+          }
+        }
       } else {
-        left = mid + 1;
+        int c = user_cmp_->Compare(node_key, target);
+        if (c >= 0) {
+          best = mid;
+          right = mid - 1;
+        } else {
+          left = mid + 1;
+        }
       }
     }
     idx_ = best;
@@ -66,7 +87,6 @@ class HotMemTableIterator : public InternalIterator {
   void SeekForPrev(const Slice& target) override {
     ParsedInternalKey pikey;
     Status s = ParseInternalKey(target, &pikey, false /* log_err_key */);
-    Slice user_key = s.ok() ? pikey.user_key : target;
 
     int left = 0;
     int right = static_cast<int>(entries_.size()) - 1;
@@ -76,12 +96,31 @@ class HotMemTableIterator : public InternalIterator {
       int mid = left + (right - left) / 2;
       HotNode* node = entries_[mid];
       Slice node_key(node->UserKey(), node->user_key_len);
-      int c = user_cmp_->Compare(node_key, user_key);
-      if (c <= 0) {
-        best = mid;
-        left = mid + 1;
+      if (s.ok()) {
+        int c = user_cmp_->Compare(node_key, pikey.user_key);
+        if (c < 0) {
+          best = mid;
+          left = mid + 1;
+        } else if (c > 0) {
+          right = mid - 1;
+        } else {
+          // user_key matches. If node->seq >= pikey.sequence, node <= target in
+          // internal key order.
+          if (node->seq >= pikey.sequence) {
+            best = mid;
+            left = mid + 1;
+          } else {
+            right = mid - 1;
+          }
+        }
       } else {
-        right = mid - 1;
+        int c = user_cmp_->Compare(node_key, target);
+        if (c <= 0) {
+          best = mid;
+          left = mid + 1;
+        } else {
+          right = mid - 1;
+        }
       }
     }
     idx_ = best;
@@ -113,6 +152,7 @@ class HotMemTableIterator : public InternalIterator {
   }
 
   Status status() const override { return status_; }
+  size_t EntryCount() const { return entries_.size(); }
 
  private:
   void UpdateCurrent() {
@@ -177,25 +217,119 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
     node = it->second;
   }
 
+  // Fast path: value fits in existing node capacity
+  {
+    std::lock_guard<SpinMutex> node_lock(node->write_lock);
+    if (seq <= node->seq && node->seq > 0) {
+      return true;
+    }
+
+    if (value.size() <= node->capacity) {
+      uint32_t v = node->seq_version.load(std::memory_order_relaxed);
+      node->seq_version.store(v + 1, std::memory_order_release);
+
+      node->val_len = static_cast<uint32_t>(value.size());
+      node->value_type = type;
+      node->seq = seq;
+      if (node->val_len > 0) {
+        memcpy(node->ValBuf(), value.data(), node->val_len);
+      }
+
+      node->seq_version.store(v + 2, std::memory_order_release);
+      node->hit_count.fetch_add(1, std::memory_order_relaxed);
+
+      if (seq > 0) {
+        SequenceNumber cur_earliest =
+            earliest_seq_.load(std::memory_order_relaxed);
+        while (seq < cur_earliest &&
+               !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {
+        }
+      }
+
+      if (log_num > 0) {
+        uint64_t cur_earliest_log =
+            earliest_log_num_.load(std::memory_order_relaxed);
+        while (log_num < cur_earliest_log &&
+               !earliest_log_num_.compare_exchange_weak(cur_earliest_log,
+                                                        log_num)) {
+        }
+      }
+
+      return true;
+    }
+  }
+
+  // Slow path: value.size() > node->capacity. Dynamically reallocate a larger
+  // HotNode.
+  std::unique_lock<std::shared_mutex> lock(index_rwlock_);
+  std::string key_str = user_key.ToString();
+  auto it = index_.find(key_str);
+  if (it == index_.end()) {
+    return false;
+  }
+  node = it->second;
+
   std::lock_guard<SpinMutex> node_lock(node->write_lock);
-  if (seq <= node->seq) {
+  if (seq <= node->seq && node->seq > 0) {
     return true;
   }
 
-  uint32_t clamped_val_size = static_cast<uint32_t>(std::min<size_t>(value.size(), max_val_size_));
+  if (value.size() <= node->capacity) {
+    uint32_t v = node->seq_version.load(std::memory_order_relaxed);
+    node->seq_version.store(v + 1, std::memory_order_release);
 
-  uint32_t v = node->seq_version.load(std::memory_order_relaxed);
-  node->seq_version.store(v + 1, std::memory_order_release);
+    node->val_len = static_cast<uint32_t>(value.size());
+    node->value_type = type;
+    node->seq = seq;
+    if (node->val_len > 0) {
+      memcpy(node->ValBuf(), value.data(), node->val_len);
+    }
 
-  node->val_len = clamped_val_size;
-  node->value_type = type;
-  node->seq = seq;
-  if (clamped_val_size > 0) {
-    memcpy(node->ValBuf(), value.data(), clamped_val_size);
+    node->seq_version.store(v + 2, std::memory_order_release);
+    node->hit_count.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    uint32_t new_cap =
+        std::max(static_cast<uint32_t>(value.size()),
+                 node->capacity > 0 ? node->capacity * 2 : max_val_size_);
+    size_t new_alloc_size = sizeof(HotNode) + node->user_key_len + new_cap;
+    void* raw = malloc(new_alloc_size);
+    if (!raw) {
+      return false;
+    }
+
+    HotNode* new_node = new (raw) HotNode();
+    new_node->user_key_len = node->user_key_len;
+    new_node->val_len = static_cast<uint32_t>(value.size());
+    new_node->capacity = new_cap;
+    new_node->value_type = type;
+    new_node->seq = seq;
+    new_node->hit_count.store(
+        node->hit_count.load(std::memory_order_relaxed) + 1,
+        std::memory_order_relaxed);
+
+    memcpy(const_cast<char*>(new_node->UserKey()), node->UserKey(),
+           node->user_key_len);
+    if (new_node->val_len > 0) {
+      memcpy(new_node->ValBuf(), value.data(), new_node->val_len);
+    }
+
+    it->second = new_node;
+    allocated_node_ptrs_.push_back(raw);
+    allocated_bytes_.fetch_add(new_alloc_size, std::memory_order_relaxed);
+    // Do not touch `node` (the old, now-detached node) beyond this point: any
+    // reader that captured this pointer before the swap above may still be
+    // mid-seqlock-read on it. new_node already carries the correct seq (set
+    // above at construction); mutating the old node's seq/seq_version here
+    // would let such a reader observe a self-consistent seqlock snapshot
+    // pairing the *new* seq with the *stale* (pre-resize) value bytes.
   }
 
-  node->seq_version.store(v + 2, std::memory_order_release);
-  node->hit_count.fetch_add(1, std::memory_order_relaxed);
+  if (seq > 0) {
+    SequenceNumber cur_earliest = earliest_seq_.load(std::memory_order_relaxed);
+    while (seq < cur_earliest &&
+           !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {
+    }
+  }
 
   if (log_num > 0) {
     uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
@@ -214,19 +348,51 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
   if (it != index_.end()) {
     HotNode* node = it->second;
     std::lock_guard<SpinMutex> node_lock(node->write_lock);
-    if (seq <= node->seq) {
+    if (seq <= node->seq && node->seq > 0) {
       return true;
     }
-    uint32_t clamped_val_size = static_cast<uint32_t>(std::min<size_t>(value.size(), max_val_size_));
-    uint32_t v = node->seq_version.load(std::memory_order_relaxed);
-    node->seq_version.store(v + 1, std::memory_order_release);
-    node->val_len = clamped_val_size;
-    node->value_type = type;
-    node->seq = seq;
-    if (clamped_val_size > 0) {
-      memcpy(node->ValBuf(), value.data(), clamped_val_size);
+    if (value.size() <= node->capacity) {
+      uint32_t v = node->seq_version.load(std::memory_order_relaxed);
+      node->seq_version.store(v + 1, std::memory_order_release);
+      node->val_len = static_cast<uint32_t>(value.size());
+      node->value_type = type;
+      node->seq = seq;
+      if (node->val_len > 0) {
+        memcpy(node->ValBuf(), value.data(), node->val_len);
+      }
+      node->seq_version.store(v + 2, std::memory_order_release);
+    } else {
+      uint32_t new_cap =
+          std::max(static_cast<uint32_t>(value.size()),
+                   node->capacity > 0 ? node->capacity * 2 : max_val_size_);
+      size_t new_alloc_size = sizeof(HotNode) + node->user_key_len + new_cap;
+      void* raw = malloc(new_alloc_size);
+      if (!raw) return false;
+
+      HotNode* new_node = new (raw) HotNode();
+      new_node->user_key_len = node->user_key_len;
+      new_node->val_len = static_cast<uint32_t>(value.size());
+      new_node->capacity = new_cap;
+      new_node->value_type = type;
+      new_node->seq = seq;
+      memcpy(const_cast<char*>(new_node->UserKey()), node->UserKey(),
+             node->user_key_len);
+      if (new_node->val_len > 0) {
+        memcpy(new_node->ValBuf(), value.data(), new_node->val_len);
+      }
+      it->second = new_node;
+      allocated_node_ptrs_.push_back(raw);
+      allocated_bytes_.fetch_add(new_alloc_size, std::memory_order_relaxed);
+      // See UpdateInPlace(): do not mutate the old, now-detached node.
     }
-    node->seq_version.store(v + 2, std::memory_order_release);
+
+    if (seq > 0) {
+      SequenceNumber cur_earliest =
+          earliest_seq_.load(std::memory_order_relaxed);
+      while (seq < cur_earliest &&
+             !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {
+      }
+    }
     if (log_num > 0) {
       uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
       while (log_num < cur_earliest_log &&
@@ -235,13 +401,16 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
     return true;
   }
 
-  size_t alloc_size = sizeof(HotNode) + user_key.size() + max_val_size_;
+  uint32_t initial_cap =
+      std::max(max_val_size_, static_cast<uint32_t>(value.size()));
+  size_t alloc_size = sizeof(HotNode) + user_key.size() + initial_cap;
   void* raw = malloc(alloc_size);
   if (!raw) return false;
 
   HotNode* node = new (raw) HotNode();
   node->user_key_len = static_cast<uint32_t>(user_key.size());
-  node->val_len = static_cast<uint32_t>(std::min<size_t>(value.size(), max_val_size_));
+  node->val_len = static_cast<uint32_t>(value.size());
+  node->capacity = initial_cap;
   node->value_type = type;
   node->seq = seq;
 
@@ -254,8 +423,12 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
   allocated_node_ptrs_.push_back(raw);
   allocated_bytes_.fetch_add(alloc_size, std::memory_order_relaxed);
 
-  SequenceNumber cur_earliest = earliest_seq_.load(std::memory_order_relaxed);
-  while (seq < cur_earliest && !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {}
+  if (seq > 0) {
+    SequenceNumber cur_earliest = earliest_seq_.load(std::memory_order_relaxed);
+    while (seq < cur_earliest &&
+           !earliest_seq_.compare_exchange_weak(cur_earliest, seq)) {
+    }
+  }
 
   if (log_num > 0) {
     uint64_t cur_earliest_log = earliest_log_num_.load(std::memory_order_relaxed);
@@ -286,7 +459,15 @@ bool HotMemTable::Get(const Slice& user_key, std::string* value, Status* status,
       v1 = node->seq_version.load(std::memory_order_acquire);
     }
 
-    if (node->value_type == kTypeDeletion) {
+    if (node->seq == 0) {
+      // Pre-populated key that has not yet been written to in HotMemTable
+      v2 = node->seq_version.load(std::memory_order_acquire);
+      if (v1 == v2) return false;
+      continue;
+    }
+
+    if (node->value_type == kTypeDeletion ||
+        node->value_type == kTypeSingleDeletion) {
       if (status) *status = Status::NotFound();
       if (seq_found) *seq_found = node->seq;
       v2 = node->seq_version.load(std::memory_order_acquire);
@@ -319,21 +500,28 @@ void HotMemTable::SweepHits(std::unordered_map<std::string, uint32_t>* hit_map) 
 }
 
 InternalIterator* HotMemTable::NewIterator(Arena* arena, size_t* out_key_count) {
-  std::shared_lock<std::shared_mutex> lock(index_rwlock_);
-  if (out_key_count) {
-    *out_key_count = index_.size();
-  }
+  HotMemTableIterator* iter = nullptr;
   if (arena) {
     void* mem = arena->AllocateAligned(sizeof(HotMemTableIterator));
-    return new (mem) HotMemTableIterator(this);
+    iter = new (mem) HotMemTableIterator(this);
   } else {
-    return new HotMemTableIterator(this);
+    iter = new HotMemTableIterator(this);
   }
+  if (out_key_count) {
+    *out_key_count = iter->EntryCount();
+  }
+  return iter;
 }
 
 size_t HotMemTable::KeyCount() const {
   std::shared_lock<std::shared_mutex> lock(index_rwlock_);
-  return index_.size();
+  size_t count = 0;
+  for (const auto& kv : index_) {
+    if (kv.second->seq > 0) {
+      count++;
+    }
+  }
+  return count;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

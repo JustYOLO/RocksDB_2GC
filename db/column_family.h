@@ -436,10 +436,47 @@ class ColumnFamilyData {
   // Installs the write-path blob partition manager for this CF.
   void SetBlobPartitionManager(std::shared_ptr<BlobFilePartitionManager> mgr);
 
-  HotMemTable* hot_mem() const { return hot_mem_.get(); }
-  HotTableRouter* hot_router() const { return hot_router_.get(); }
-  std::shared_ptr<HotMemTable> hot_mem_shared() const { return hot_mem_; }
-  std::shared_ptr<HotTableRouter> hot_router_shared() const { return hot_router_; }
+  // Raw-pointer accessors: safe only when the caller can guarantee
+  // hot_mem_/hot_router_ won't be reassigned during use beyond the call
+  // itself (e.g. FlushJob's own single-threaded sequential code, or callers
+  // already holding db_mutex_). Concurrent callers without such a guarantee
+  // (e.g. the write path in write_batch.cc) must use
+  // hot_mem_shared()/hot_router_shared() instead and hold the returned
+  // shared_ptr for the duration of use.
+  //
+  // hot_table_ptr_mutex_ guards only the hot_mem_/hot_router_ shared_ptr
+  // slots themselves (not the pointed-to objects, which have their own
+  // internal synchronization) against the write path reading them
+  // concurrently with RebuildHotTable() reassigning them. std::shared_ptr
+  // is not safe to read/write concurrently without external synchronization,
+  // and a portable lock-free std::atomic<std::shared_ptr<T>> is not reliably
+  // available across this project's supported toolchains, so a plain RWMutex
+  // is used instead; the critical sections are a single pointer copy, so
+  // contention is expected to be negligible.
+  HotMemTable* hot_mem() const {
+    hot_table_ptr_mutex_.ReadLock();
+    HotMemTable* result = hot_mem_.get();
+    hot_table_ptr_mutex_.ReadUnlock();
+    return result;
+  }
+  HotTableRouter* hot_router() const {
+    hot_table_ptr_mutex_.ReadLock();
+    HotTableRouter* result = hot_router_.get();
+    hot_table_ptr_mutex_.ReadUnlock();
+    return result;
+  }
+  std::shared_ptr<HotMemTable> hot_mem_shared() const {
+    hot_table_ptr_mutex_.ReadLock();
+    std::shared_ptr<HotMemTable> result = hot_mem_;
+    hot_table_ptr_mutex_.ReadUnlock();
+    return result;
+  }
+  std::shared_ptr<HotTableRouter> hot_router_shared() const {
+    hot_table_ptr_mutex_.ReadLock();
+    std::shared_ptr<HotTableRouter> result = hot_router_;
+    hot_table_ptr_mutex_.ReadUnlock();
+    return result;
+  }
   SpaceSavingTopK* space_saving_topk() const { return space_saving_topk_.get(); }
   uint32_t cold_flush_counter() const { return cold_flush_counter_; }
   void IncrementColdFlushCounter() { cold_flush_counter_++; }
@@ -707,6 +744,8 @@ class ColumnFamilyData {
   MemTableList imm_;
   std::shared_ptr<HotMemTable> hot_mem_;
   std::shared_ptr<HotTableRouter> hot_router_;
+  // See hot_mem()/hot_router() above for what this guards.
+  mutable port::RWMutex hot_table_ptr_mutex_;
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};

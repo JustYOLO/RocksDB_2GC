@@ -25,11 +25,11 @@
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
 #include "db/range_del_aggregator.h"
-#include "db/hot_memtable.h"
-#include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
 #include "db/spatial_cms.h"
 #include "db/table_properties_collector.h"
@@ -46,6 +46,7 @@
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
+#include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -748,6 +749,8 @@ ColumnFamilyData::ColumnFamilyData(
   if (ioptions_.enable_hot_table) {
     base_write_buffer_size_ = mutable_cf_options_.write_buffer_size;
     base_max_write_buffer_number_ = mutable_cf_options_.max_write_buffer_number;
+    // No locking needed here: Initialize() runs before this CF is published
+    // to any other thread.
     hot_mem_ = std::make_shared<HotMemTable>(
         internal_comparator_, ioptions_.hot_table_write_buffer_size,
         ioptions_.hot_table_max_value_size);
@@ -775,11 +778,16 @@ ColumnFamilyData::ColumnFamilyData(
 }
 
 void ColumnFamilyData::ExecuteVirtualFlush() {
-  if (!ioptions_.enable_hot_table || !hot_mem_ || !space_saving_topk_) {
+  std::shared_ptr<HotMemTable> hot_mem;
+  {
+    ReadLock l(&hot_table_ptr_mutex_);
+    hot_mem = hot_mem_;
+  }
+  if (!ioptions_.enable_hot_table || !hot_mem || !space_saving_topk_) {
     return;
   }
   std::unordered_map<std::string, uint32_t> hit_map;
-  hot_mem_->SweepHits(&hit_map);
+  hot_mem->SweepHits(&hit_map);
   space_saving_topk_->ApplyDecayAndPenalties(hit_map);
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 }
@@ -792,7 +800,12 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
 
-  bool currently_active = (hot_router_ && hot_router_->IsActive());
+  std::shared_ptr<HotTableRouter> hot_router;
+  {
+    ReadLock l(&hot_table_ptr_mutex_);
+    hot_router = hot_router_;
+  }
+  bool currently_active = (hot_router && hot_router->IsActive());
   bool is_skewed = true;
   if (space_saving_topk_) {
     is_skewed = space_saving_topk_->IsWorkloadSkewed(
@@ -803,8 +816,8 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
   }
 
   if (!is_skewed) {
-    if (hot_router_) {
-      hot_router_->Disable();
+    if (hot_router) {
+      hot_router->Disable();
     }
     if (space_saving_topk_) {
       space_saving_topk_->Clear();
@@ -821,11 +834,20 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
   // Workload is skewed -> enable HotTable and revert max write buffer number to base
   mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
 
-  if (was_physically_flushed || !hot_mem_) {
-    hot_mem_ = std::make_shared<HotMemTable>(
+  std::shared_ptr<HotMemTable> hot_mem;
+  {
+    ReadLock l(&hot_table_ptr_mutex_);
+    hot_mem = hot_mem_;
+  }
+  if (was_physically_flushed || !hot_mem) {
+    hot_mem = std::make_shared<HotMemTable>(
         internal_comparator_, ioptions_.hot_table_write_buffer_size,
         ioptions_.hot_table_max_value_size);
-    hot_mem_->SetEarliestLogNumber(GetLogNumber());
+    hot_mem->SetEarliestLogNumber(GetLogNumber());
+    {
+      WriteLock l(&hot_table_ptr_mutex_);
+      hot_mem_ = hot_mem;
+    }
     if (was_physically_flushed) {
       RecordTick(ioptions_.statistics.get(), HOT_TABLE_PHYSICAL_FLUSH_COUNT);
     }
@@ -837,13 +859,19 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed) {
     auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
     for (const auto& entry : top_keys) {
       new_router->Add(entry.key);
+      if (hot_mem) {
+        hot_mem->Add(entry.key, Slice(), kTypeValue, 0, GetLogNumber());
+      }
     }
     ROCKS_LOG_INFO(
         ioptions_.info_log,
         "[%s] [HotTable] Rebuilt hot table router with %zu hot keys (capacity: %zu)",
         GetName().c_str(), top_keys.size(), capacity);
   }
-  hot_router_ = std::move(new_router);
+  {
+    WriteLock l(&hot_table_ptr_mutex_);
+    hot_router_ = std::move(new_router);
+  }
 }
 
 void ColumnFamilyData::DecayAndEvaluateLevelUpSkew() {
@@ -975,6 +1003,19 @@ uint64_t ColumnFamilyData::OldestLogToKeep() {
 
     if (mem_prep_log > 0 && mem_prep_log < current_log) {
       current_log = mem_prep_log;
+    }
+  }
+
+  std::shared_ptr<HotMemTable> hot_mem_for_log;
+  {
+    ReadLock l(&hot_table_ptr_mutex_);
+    hot_mem_for_log = hot_mem_;
+  }
+  if (ioptions_.enable_hot_table && hot_mem_for_log &&
+      !hot_mem_for_log->IsEmpty()) {
+    auto hot_log = hot_mem_for_log->GetEarliestLogNumber();
+    if (hot_log > 0 && hot_log < current_log) {
+      current_log = hot_log;
     }
   }
 

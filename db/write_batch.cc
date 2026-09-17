@@ -2309,23 +2309,30 @@ class MemTableInserter : public WriteBatch::Handler {
     auto* moptions = mem->GetImmutableMemTableOptions();
 
     ColumnFamilyData* cfd = cf_mems_->current();
-    if (cfd && cfd->ioptions().enable_hot_table && cfd->hot_router() &&
-        cfd->hot_router()->IsActive() && cfd->hot_mem()) {
-      if (cfd->hot_router()->MayContain(key)) {
-        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
-        if (cfd->hot_mem()->UpdateInPlace(key, value, value_type, sequence_) ||
-            cfd->hot_mem()->Add(key, value, value_type, sequence_)) {
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_HIT_COUNT);
-          MaybeAdvanceSeq(false /* batch_boundary */);
-          return Status::OK();
+    if (cfd && cfd->ioptions().enable_hot_table) {
+      auto hot_router = cfd->hot_router_shared();
+      auto hot_mem = cfd->hot_mem_shared();
+      if (hot_router && hot_router->IsActive() && hot_mem) {
+        if (hot_router->MayContain(key)) {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
+          if (hot_mem->UpdateInPlace(key, value, value_type, sequence_,
+                                     cfd->GetLogNumber())) {
+            RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
+            RecordTick(cfd->ioptions().statistics.get(),
+                       HOT_TABLE_WRITE_HIT_COUNT);
+            MaybeAdvanceSeq(false /* batch_boundary */);
+            return Status::OK();
+          } else {
+            RecordTick(cfd->ioptions().statistics.get(),
+                       HOT_TABLE_ROUTER_FALSE_POSITIVES);
+          }
         } else {
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FALSE_POSITIVES);
+          RecordTick(cfd->ioptions().statistics.get(),
+                     HOT_TABLE_ROUTER_FILTERED);
         }
-      } else {
-        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FILTERED);
+        RecordTick(cfd->ioptions().statistics.get(),
+                   HOT_TABLE_WRITE_MISS_COUNT);
       }
-      RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_MISS_COUNT);
     }
     // inplace_update_support is inconsistent with snapshots, and therefore with
     // any kind of transactions including the ones that use seq_per_batch
@@ -2548,23 +2555,30 @@ class MemTableInserter : public WriteBatch::Handler {
     MemTable* mem = cf_mems_->GetMemTable();
 
     ColumnFamilyData* cfd = cf_mems_->current();
-    if (cfd && cfd->ioptions().enable_hot_table && cfd->hot_router() &&
-        cfd->hot_router()->IsActive() && cfd->hot_mem()) {
-      if (cfd->hot_router()->MayContain(key)) {
-        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
-        if (cfd->hot_mem()->UpdateInPlace(key, Slice(), delete_type, sequence_) ||
-            cfd->hot_mem()->Add(key, Slice(), delete_type, sequence_)) {
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_HIT_COUNT);
-          MaybeAdvanceSeq();
-          return Status::OK();
+    if (cfd && cfd->ioptions().enable_hot_table) {
+      auto hot_router = cfd->hot_router_shared();
+      auto hot_mem = cfd->hot_mem_shared();
+      if (hot_router && hot_router->IsActive() && hot_mem) {
+        if (hot_router->MayContain(key)) {
+          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
+          if (hot_mem->UpdateInPlace(key, Slice(), delete_type, sequence_,
+                                     cfd->GetLogNumber())) {
+            RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
+            RecordTick(cfd->ioptions().statistics.get(),
+                       HOT_TABLE_WRITE_HIT_COUNT);
+            MaybeAdvanceSeq();
+            return Status::OK();
+          } else {
+            RecordTick(cfd->ioptions().statistics.get(),
+                       HOT_TABLE_ROUTER_FALSE_POSITIVES);
+          }
         } else {
-          RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FALSE_POSITIVES);
+          RecordTick(cfd->ioptions().statistics.get(),
+                     HOT_TABLE_ROUTER_FILTERED);
         }
-      } else {
-        RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_FILTERED);
+        RecordTick(cfd->ioptions().statistics.get(),
+                   HOT_TABLE_WRITE_MISS_COUNT);
       }
-      RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_WRITE_MISS_COUNT);
     }
     if (delete_type == kTypeRangeDeletion &&
         concurrent_memtable_writes_ == false) {

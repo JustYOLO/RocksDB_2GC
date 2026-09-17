@@ -345,6 +345,230 @@ TEST_F(HotMemTableTest, ConcurrentWritersHighestSeqWinsAndNoTornWrites) {
   ASSERT_EQ(val_s2, highest_assigned_seq);
 }
 
+TEST_F(HotMemTableTest, DynamicValueGrowthBeyondMaxValSize) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  // max_val_size initialized to 64 bytes
+  HotMemTable hot_table(cmp, 1024 * 1024, 64);
+
+  std::string small_val(40, 'a');
+  ASSERT_TRUE(hot_table.Add("resize_key", small_val, kTypeValue, 10));
+
+  std::string read_val;
+  Status s;
+  SequenceNumber seq = 0;
+  ASSERT_TRUE(hot_table.Get("resize_key", &read_val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(read_val, small_val);
+
+  // Exceed initial max_val_size (150 bytes > 64 bytes)
+  std::string med_val(150, 'b');
+  ASSERT_TRUE(hot_table.UpdateInPlace("resize_key", med_val, kTypeValue, 11));
+  ASSERT_TRUE(hot_table.Get("resize_key", &read_val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(read_val, med_val);
+  ASSERT_EQ(read_val.size(), 150);
+
+  // Exceed further with 1200 bytes
+  std::string large_val(1200, 'c');
+  ASSERT_TRUE(hot_table.UpdateInPlace("resize_key", large_val, kTypeValue, 12));
+  ASSERT_TRUE(hot_table.Get("resize_key", &read_val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(read_val, large_val);
+  ASSERT_EQ(read_val.size(), 1200);
+}
+
+TEST_F(HotMemTableTest, ConcurrentResizeNoTornSeqValuePairs) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  // Small max_val_size so the growth (resize) path triggers frequently.
+  HotMemTable hot_table(cmp, 1024 * 1024, 32);
+
+  std::string key = "resize_race_key";
+  hot_table.Add(key, std::string(16, 'a'), kTypeValue, 1);
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> seq_counter{1};
+
+  // Writer alternates value sizes across the initial capacity boundary to
+  // force repeated node reallocation -- the resize path where the old,
+  // now-detached HotNode used to get its seq/seq_version incorrectly bumped
+  // after the index already pointed at the new node.
+  std::thread writer([&]() {
+    const size_t sizes[] = {16, 40, 16, 100, 16, 500};
+    size_t idx = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      uint64_t seq = seq_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+      size_t len = sizes[idx++ % (sizeof(sizes) / sizeof(sizes[0]))];
+      // Every byte of the value encodes the seq's low byte, so a reader can
+      // detect whether the returned bytes actually correspond to a value
+      // the writer produced for the returned seq.
+      std::string val(len, static_cast<char>(seq & 0xFF));
+      hot_table.UpdateInPlace(key, val, kTypeValue, seq);
+    }
+  });
+
+  std::atomic<uint64_t> read_ops{0};
+  auto reader_func = [&]() {
+    std::string val;
+    Status s;
+    SequenceNumber seq = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (hot_table.Get(key, &val, &s, &seq)) {
+        ASSERT_OK(s);
+        if (seq == 1) {
+          ASSERT_EQ(val, std::string(16, 'a'));
+        } else {
+          // A torn (seq, value) pair -- new seq paired with stale bytes from
+          // before a resize -- would fail this check, since the stale bytes
+          // encode a different seq's low byte.
+          char expected = static_cast<char>(seq & 0xFF);
+          for (char c : val) {
+            ASSERT_EQ(c, expected);
+          }
+        }
+        read_ops.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back(reader_func);
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  stop.store(true);
+
+  writer.join();
+  for (auto& r : readers) {
+    r.join();
+  }
+
+  ASSERT_GT(read_ops.load(), 0u);
+}
+
+TEST_F(HotMemTableTest, RouterConcurrentRebuildNoUseAfterFree) {
+  HotTableRouter router(1024);
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> query_ops{0};
+
+  // Several threads keep calling Add()/MayContain() while the main thread
+  // repeatedly Rebuild()s/Disable()s the router out from under them. This
+  // does not assert on MayContain()'s result (which is inherently racy here)
+  // -- it exists to be run under ASAN/TSAN to catch the use-after-free that
+  // used to be reachable when the old bloom's backing Arena was freed before
+  // the new one was published.
+  auto query_func = [&](int tid) {
+    uint64_t i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::string key =
+          "key_" + std::to_string(tid) + "_" + std::to_string(i++);
+      router.Add(key);
+      router.MayContain(key);
+      query_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  std::vector<std::thread> queriers;
+  for (int t = 0; t < 4; ++t) {
+    queriers.emplace_back(query_func, t);
+  }
+
+  std::thread rebuilder([&]() {
+    int i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (i % 2 == 0) {
+        router.Rebuild(1024);
+      } else {
+        router.Disable();
+      }
+      i++;
+    }
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  stop.store(true);
+
+  rebuilder.join();
+  for (auto& t : queriers) {
+    t.join();
+  }
+
+  ASSERT_GT(query_ops.load(), 0u);
+}
+
+TEST_F(HotMemTableTest, PrePopulatedNodeAndSingleDelete) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 128);
+
+  // Pre-populate key with seq = 0
+  ASSERT_TRUE(hot_table.Add("prepop_key", "", kTypeValue, 0));
+  ASSERT_EQ(hot_table.KeyCount(), 0);
+  ASSERT_TRUE(hot_table.IsEmpty());
+
+  // Get on pre-populated key must return false (fall through to cold memtable)
+  std::string val;
+  Status s;
+  SequenceNumber seq = 0;
+  ASSERT_FALSE(hot_table.Get("prepop_key", &val, &s, &seq));
+
+  // Update in place with actual data
+  ASSERT_TRUE(
+      hot_table.UpdateInPlace("prepop_key", "active_val", kTypeValue, 100));
+  ASSERT_EQ(hot_table.KeyCount(), 1);
+  ASSERT_FALSE(hot_table.IsEmpty());
+  ASSERT_TRUE(hot_table.Get("prepop_key", &val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(val, "active_val");
+  ASSERT_EQ(seq, 100);
+
+  // SingleDelete update
+  ASSERT_TRUE(
+      hot_table.UpdateInPlace("prepop_key", "", kTypeSingleDeletion, 101));
+  ASSERT_TRUE(hot_table.Get("prepop_key", &val, &s, &seq));
+  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_EQ(seq, 101);
+}
+
+TEST_F(HotMemTableTest, HotMemTableIteratorFilteringAndSeeking) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 128);
+
+  // Add a pre-populated key (seq = 0)
+  hot_table.Add("key0_dummy", "", kTypeValue, 0);
+
+  // Add valid written keys
+  hot_table.Add("key1", "val1", kTypeValue, 10);
+  hot_table.Add("key2", "val2", kTypeValue, 20);
+  hot_table.Add("key3", "val3", kTypeValue, 30);
+
+  size_t count = 0;
+  std::unique_ptr<InternalIterator> iter(
+      hot_table.NewIterator(nullptr, &count));
+  // Only the 3 written keys should be counted and iterated
+  ASSERT_EQ(count, 3);
+
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+  ParsedInternalKey pik;
+  ASSERT_OK(ParseInternalKey(iter->key(), &pik, false));
+  ASSERT_EQ(pik.user_key, "key1");
+  ASSERT_EQ(iter->value(), "val1");
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(ParseInternalKey(iter->key(), &pik, false));
+  ASSERT_EQ(pik.user_key, "key2");
+
+  iter->Next();
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_OK(ParseInternalKey(iter->key(), &pik, false));
+  ASSERT_EQ(pik.user_key, "key3");
+
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
