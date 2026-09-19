@@ -910,6 +910,104 @@ bool FlushJob::MemPurgeDecider(double threshold) {
           threshold);
 }
 
+namespace {
+
+// Wraps a per-memtable InternalIterator during flush so that consecutive
+// same-user-key runs (i.e. keys that were overwritten while sitting in the
+// cold memtable) can be detected as a side effect of the SAME forward
+// traversal that BuildTable() already performs to write the SST, instead of
+// paying for a second full scan of the memtable. Only constructed when
+// enable_hot_table is set; see FlushJob::WriteLevel0Table().
+//
+// Flush drives its input with a single SeekToFirst() + repeated Next() pass
+// only (BuildTable()'s CompactionIterator never seeks or backtracks its
+// input during a flush), so Seek()/SeekForPrev()/SeekToLast()/Prev() below
+// are implemented for interface completeness only and intentionally do not
+// participate in duplicate counting.
+class HotTableDupCountingIterator : public InternalIterator {
+ public:
+  // probe: if false, this flush is backed off (see the
+  // hot_table_max_scan_backoff_flushes discussion at
+  // FlushJob::WriteLevel0Table()) and Observe() becomes a no-op, so wrapping
+  // still costs only pure delegation.
+  HotTableDupCountingIterator(InternalIterator* iter, SpaceSavingTopK* tracker,
+                              bool probe)
+      : iter_(iter), tracker_(tracker), probe_(probe) {}
+
+  ~HotTableDupCountingIterator() override {}
+
+  HotTableDupCountingIterator(const HotTableDupCountingIterator&) = delete;
+  void operator=(const HotTableDupCountingIterator&) = delete;
+
+  bool Valid() const override { return iter_->Valid(); }
+  Status status() const override { return iter_->status(); }
+  Slice key() const override { return iter_->key(); }
+  Slice value() const override { return iter_->value(); }
+  bool IsKeyPinned() const override { return iter_->IsKeyPinned(); }
+  bool IsValuePinned() const override { return iter_->IsValuePinned(); }
+  uint64_t write_unix_time() const override { return iter_->write_unix_time(); }
+  void SetPinnedItersMgr(PinnedIteratorsManager* mgr) override {
+    iter_->SetPinnedItersMgr(mgr);
+  }
+
+  void SeekToFirst() override {
+    iter_->SeekToFirst();
+    Observe();
+  }
+  void Next() override {
+    iter_->Next();
+    Observe();
+  }
+
+  void SeekToLast() override { iter_->SeekToLast(); }
+  void Seek(const Slice& target) override { iter_->Seek(target); }
+  void SeekForPrev(const Slice& target) override { iter_->SeekForPrev(target); }
+  void Prev() override { iter_->Prev(); }
+
+  // Call once after BuildTable() has fully consumed this iterator, while it
+  // is still valid (i.e. before the Arena that owns it is destroyed). Flushes
+  // any pending duplicate run and returns the total duplicate entry count
+  // observed, for SpaceSavingTopK::RecordFlushWindow().
+  uint64_t FinishAndGetDuplicateCount() {
+    if (probe_ && dup_count_ >= 2) {
+      tracker_->Update(prev_user_key_, dup_count_);
+      total_duplicate_entries_ += dup_count_;
+      dup_count_ = 0;
+    }
+    return total_duplicate_entries_;
+  }
+
+ private:
+  void Observe() {
+    if (!probe_ || !iter_->Valid()) {
+      return;
+    }
+    ParsedInternalKey pikey;
+    if (!ParseInternalKey(iter_->key(), &pikey, /*log_err_key=*/false).ok()) {
+      return;
+    }
+    if (dup_count_ > 0 && pikey.user_key == prev_user_key_) {
+      dup_count_++;
+    } else {
+      if (dup_count_ >= 2) {
+        tracker_->Update(prev_user_key_, dup_count_);
+        total_duplicate_entries_ += dup_count_;
+      }
+      prev_user_key_.assign(pikey.user_key.data(), pikey.user_key.size());
+      dup_count_ = 1;
+    }
+  }
+
+  InternalIterator* const iter_;
+  SpaceSavingTopK* const tracker_;
+  const bool probe_;
+  std::string prev_user_key_;
+  uint64_t dup_count_ = 0;
+  uint64_t total_duplicate_entries_ = 0;
+};
+
+}  // namespace
+
 Status FlushJob::WriteLevel0Table() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
@@ -990,20 +1088,50 @@ Status FlushJob::WriteLevel0Table() {
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:num_memtables",
                              &mems_size);
     assert(job_context_);
+
+    // Whether this flush should run the (now essentially free, fused)
+    // duplicate-key bookkeeping below. Once the cold memtable has looked
+    // non-skewed for a while, back off to probing only every Nth flush
+    // instead of every flush -- see hot_table_max_scan_backoff_flushes.
+    // cold_flush_counter() is already incremented once per flush, earlier in
+    // FlushJob::Run(), before WriteLevel0Table() is called, so it is stable
+    // for the duration of this flush.
+    const bool hot_table_scan_enabled =
+        cfd_->ioptions().enable_hot_table && cfd_->space_saving_topk();
+    bool should_probe = true;
+    if (hot_table_scan_enabled) {
+      uint32_t interval = SpaceSavingTopK::ComputeScanProbeInterval(
+          cfd_->space_saving_topk()->GetConsecutiveFlatWindows(),
+          cfd_->ioptions().hot_table_consecutive_threshold_windows,
+          cfd_->ioptions().hot_table_max_scan_backoff_flushes);
+      should_probe = (cfd_->cold_flush_counter() % interval == 0);
+    }
+    std::vector<HotTableDupCountingIterator*> dup_counting_iters;
     for (ReadOnlyMemTable* m : mems_) {
       ROCKS_LOG_INFO(db_options_.info_log,
                      "[%s] [JOB %d] Flushing memtable id %" PRIu64
                      " with next log file: %" PRIu64 ", marked_for_flush: %d\n",
                      cfd_->GetName().c_str(), job_context_->job_id, m->GetID(),
                      m->GetNextLogNumber(), m->IsMarkedForFlush());
+      InternalIterator* mem_iter;
       if (logical_strip_timestamp) {
-        memtables.push_back(m->NewTimestampStrippingIterator(
+        mem_iter = m->NewTimestampStrippingIterator(
             ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-            /*prefix_extractor=*/nullptr, ts_sz));
+            /*prefix_extractor=*/nullptr, ts_sz);
       } else {
-        memtables.push_back(
+        mem_iter =
             m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-                           /*prefix_extractor=*/nullptr, /*for_flush=*/true));
+                           /*prefix_extractor=*/nullptr, /*for_flush=*/true);
+      }
+      if (hot_table_scan_enabled) {
+        auto* dup_it =
+            new (arena.AllocateAligned(sizeof(HotTableDupCountingIterator)))
+                HotTableDupCountingIterator(mem_iter, cfd_->space_saving_topk(),
+                                            should_probe);
+        dup_counting_iters.push_back(dup_it);
+        memtables.push_back(dup_it);
+      } else {
+        memtables.push_back(mem_iter);
       }
       auto* range_del_iter =
           logical_strip_timestamp
@@ -1021,52 +1149,20 @@ Status FlushJob::WriteLevel0Table() {
       total_num_range_deletes += m->NumRangeDeletion();
     }
 
-    // Identify and record keys in the flushed cold memtable(s) that appeared >= 2 times
-    if (cfd_->ioptions().enable_hot_table && cfd_->space_saving_topk()) {
-      uint64_t total_duplicate_entries = 0;
-      for (ReadOnlyMemTable* m : mems_) {
-        InternalIterator* scan_it = m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-                                                   /*prefix_extractor=*/nullptr, /*for_flush=*/true);
-        std::string prev_user_key;
-        uint64_t dup_count = 0;
-
-        for (scan_it->SeekToFirst(); scan_it->Valid(); scan_it->Next()) {
-          ParsedInternalKey pikey;
-          if (ParseInternalKey(scan_it->key(), &pikey, false /* log_err_key */).ok()) {
-            if (dup_count > 0 && pikey.user_key == prev_user_key) {
-              dup_count++;
-            } else {
-              if (dup_count >= 2) {
-                cfd_->space_saving_topk()->Update(prev_user_key, dup_count);
-                total_duplicate_entries += dup_count;
-              }
-              prev_user_key = pikey.user_key.ToString();
-              dup_count = 1;
-            }
-          }
-        }
-        if (dup_count >= 2) {
-          cfd_->space_saving_topk()->Update(prev_user_key, dup_count);
-          total_duplicate_entries += dup_count;
-        }
-      }
-      uint64_t cur_hits = 0;
-      uint64_t cur_misses = 0;
-      if (stats_) {
-        cur_hits = stats_->getTickerCount(HOT_TABLE_WRITE_HIT_COUNT);
-        cur_misses = stats_->getTickerCount(HOT_TABLE_WRITE_MISS_COUNT);
-      }
-      uint64_t delta_hits = (cur_hits >= cfd_->last_hot_write_hits()) ? (cur_hits - cfd_->last_hot_write_hits()) : cur_hits;
-      uint64_t delta_misses = (cur_misses >= cfd_->last_hot_write_misses()) ? (cur_misses - cfd_->last_hot_write_misses()) : cur_misses;
-      cfd_->set_last_hot_write_stats(cur_hits, cur_misses);
-
-      cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries, total_duplicate_entries,
-                                                  delta_hits, delta_misses);
-
+    if (hot_table_scan_enabled) {
       // Flush hot table if:
       // 1) WAL size limit reached (kWalFull) and HotTable has active data
       // 2) Hot key range shift: absorption dropped while duplicate/garbage
       // ratio is high
+      //
+      // These ratios reflect the PREVIOUS flush window's duplicate scan, not
+      // this one: the duplicate count for THIS flush's cold memtable(s) is
+      // now computed as a side effect of BuildTable()'s own traversal below,
+      // so it isn't known yet at this point. This lags the "hot key range
+      // shift" trigger by exactly one flush -- negligible in practice, and
+      // RebuildHotTable()'s activate/deactivate decision (which runs after
+      // BuildTable(), once this flush's fresh ratio is available) is
+      // unaffected.
       if (!flush_hot_table && cfd_->hot_mem() && !cfd_->hot_mem()->IsEmpty()) {
         if (flush_reason_ == FlushReason::kWalFull) {
           flush_hot_table = true;
@@ -1225,6 +1321,38 @@ Status FlushJob::WriteLevel0Table() {
       flush_input_records_ = flush_stats.num_input_records;
       flush_output_records_ = flush_stats.num_output_records;
       flush_dropped_records_ = flush_stats.num_dropped_records;
+
+      // Pull the duplicate-key counts observed as a side effect of the
+      // traversal BuildTable() just performed (see
+      // HotTableDupCountingIterator above), and feed the same
+      // SpaceSavingTopK bookkeeping the old standalone scan used to feed
+      // directly, before BuildTable() ran. Must happen before the Arena
+      // (which owns these iterators) goes out of scope, further down in this
+      // function.
+      if (hot_table_scan_enabled) {
+        uint64_t total_duplicate_entries = 0;
+        for (auto* dup_it : dup_counting_iters) {
+          total_duplicate_entries += dup_it->FinishAndGetDuplicateCount();
+        }
+        uint64_t cur_hits = 0;
+        uint64_t cur_misses = 0;
+        if (stats_) {
+          cur_hits = stats_->getTickerCount(HOT_TABLE_WRITE_HIT_COUNT);
+          cur_misses = stats_->getTickerCount(HOT_TABLE_WRITE_MISS_COUNT);
+        }
+        uint64_t delta_hits = (cur_hits >= cfd_->last_hot_write_hits())
+                                  ? (cur_hits - cfd_->last_hot_write_hits())
+                                  : cur_hits;
+        uint64_t delta_misses =
+            (cur_misses >= cfd_->last_hot_write_misses())
+                ? (cur_misses - cfd_->last_hot_write_misses())
+                : cur_misses;
+        cfd_->set_last_hot_write_stats(cur_hits, cur_misses);
+
+        cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries,
+                                                     total_duplicate_entries,
+                                                     delta_hits, delta_misses);
+      }
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());

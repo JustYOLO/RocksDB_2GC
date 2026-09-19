@@ -111,6 +111,7 @@ struct ImmutableCFOptions {
   double hot_table_min_duplicate_ratio;
   double hot_table_min_absorption_ratio;
   uint32_t hot_table_consecutive_threshold_windows;
+  uint32_t hot_table_max_scan_backoff_flushes;
 
   bool enable_level_up_compaction;
   uint32_t level_up_warmth_threshold;

@@ -251,6 +251,36 @@ TEST_F(HotMemTableTest, RouterDisableAndAdaptiveRebuild) {
   ASSERT_EQ(tracker.QualifiedHeavyHittersCount(2), 2);
 }
 
+TEST_F(HotMemTableTest, ScanProbeIntervalBacksOffOnceConfidentlyFlat) {
+  struct TestCase {
+    std::string name;
+    uint32_t flat_windows;
+    uint32_t threshold_windows;
+    uint32_t max_backoff_flushes;
+    uint32_t expected_interval;
+  };
+  TestCase cases[] = {
+      // Still within (or at) the threshold: probe every flush.
+      {"zero_flat_windows", 0, 2, 16, 1},
+      {"at_threshold", 2, 2, 16, 1},
+      // Past the threshold: interval grows with flat_windows, capped by
+      // max_backoff_flushes.
+      {"just_past_threshold", 3, 2, 16, 3},
+      {"grows_with_flatness", 10, 2, 16, 10},
+      {"capped_by_max_backoff", 100, 2, 16, 16},
+      // Defensive clamp: a misconfigured max_backoff_flushes of 0 must not
+      // produce a modulo-by-zero interval at the call site.
+      {"zero_max_backoff_clamped_to_one", 100, 2, 0, 1},
+  };
+  for (const auto& tc : cases) {
+    SCOPED_TRACE(tc.name);
+    ASSERT_EQ(
+        SpaceSavingTopK::ComputeScanProbeInterval(
+            tc.flat_windows, tc.threshold_windows, tc.max_backoff_flushes),
+        tc.expected_interval);
+  }
+}
+
 TEST_F(HotMemTableTest, ConcurrentWritersHighestSeqWinsAndNoTornWrites) {
   InternalKeyComparator cmp(BytewiseComparator());
   HotMemTable hot_table(cmp, 1024 * 1024, 256);

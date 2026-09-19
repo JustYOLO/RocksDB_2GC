@@ -192,6 +192,16 @@ bool SpaceSavingTopK::IsWorkloadSkewed(bool currently_active, double min_dup_rat
   }
 }
 
+uint32_t SpaceSavingTopK::ComputeScanProbeInterval(
+    uint32_t flat_windows, uint32_t threshold_windows,
+    uint32_t max_backoff_flushes) {
+  if (flat_windows <= threshold_windows) {
+    return 1;
+  }
+  uint32_t max_backoff = std::max<uint32_t>(1, max_backoff_flushes);
+  return std::min(flat_windows, max_backoff);
+}
+
 void SpaceSavingTopK::Clear() {
   std::lock_guard<std::mutex> lock(mutex_);
   entries_.clear();

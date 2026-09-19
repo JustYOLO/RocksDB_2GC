@@ -460,6 +460,16 @@ struct AdvancedColumnFamilyOptions {
   double hot_table_min_duplicate_ratio = 0.20;
   double hot_table_min_absorption_ratio = 0.20;
   uint32_t hot_table_consecutive_threshold_windows = 2;
+  // Once the cold memtable has looked non-skewed (no significant duplicate
+  // keys) for more than hot_table_consecutive_threshold_windows flushes in a
+  // row, the per-flush duplicate-key detection is only re-probed once every
+  // N flushes instead of every flush, where N grows with how long the
+  // workload has stayed flat, up to this cap. Sized this way because
+  // re-probing on every flush costs nothing extra once the scan is fused
+  // into the flush's own traversal (see FlushJob::WriteLevel0Table), but the
+  // per-key bookkeeping itself is still worth skipping once the workload has
+  // been confidently non-skewed for a while.
+  uint32_t hot_table_max_scan_backoff_flushes = 16;
 
   // Level Up Compaction options
   bool enable_level_up_compaction = false;

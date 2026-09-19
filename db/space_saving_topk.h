@@ -48,6 +48,17 @@ class SpaceSavingTopK {
                         double min_abs_ratio = 0.20,
                         uint32_t consecutive_threshold_windows = 2);
 
+  // Once a workload has looked flat (non-skewed) for more than
+  // threshold_windows consecutive flush windows, the caller can back off how
+  // often it re-probes for duplicate keys instead of probing every flush.
+  // Returns the number of flushes that should elapse between probes: 1 (probe
+  // every flush) while flat_windows is still within threshold_windows, else
+  // min(flat_windows, max_backoff_flushes), clamped to be at least 1. Used by
+  // FlushJob::WriteLevel0Table() to gate its (fused) duplicate-key scan.
+  static uint32_t ComputeScanProbeInterval(uint32_t flat_windows,
+                                           uint32_t threshold_windows,
+                                           uint32_t max_backoff_flushes);
+
   // Clear tracker state
   void Clear();
 

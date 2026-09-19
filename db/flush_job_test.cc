@@ -9,11 +9,16 @@
 #include <array>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
 #include "db/memtable.h"
+#include "db/space_saving_topk.h"
 #include "db/version_set.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/cache.h"
@@ -183,6 +188,28 @@ class FlushJobTest : public FlushJobTestBase {
                          BytewiseComparator()) {}
 };
 
+// enable_hot_table must be set before SetUp() builds the column families
+// (SetUp() runs after this constructor, per the usual gtest lifecycle), so
+// it is set here rather than in the TEST_F bodies below.
+class FlushJobHotTableTest : public FlushJobTestBase {
+ public:
+  FlushJobHotTableTest()
+      : FlushJobTestBase(test::PerThreadDBPath("flush_job_hot_table_test"),
+                         BytewiseComparator()) {
+    cf_options_.enable_hot_table = true;
+    cf_options_.hot_table_write_buffer_size = 1024 * 1024;
+    cf_options_.hot_table_max_value_size = 256;
+    cf_options_.hot_table_min_duplicate_ratio = 0.20;
+    cf_options_.hot_table_min_absorption_ratio = 0.20;
+    // A single skewed (or flat) flush window is enough to flip
+    // IsWorkloadSkewed()'s decision, so SpaceSavingTopK::Clear() (which
+    // fires on a losing decision) never fires on the very first flush these
+    // tests exercise, and the just-recorded duplicate ratio survives long
+    // enough to be observed.
+    cf_options_.hot_table_consecutive_threshold_windows = 1;
+  }
+};
+
 TEST_F(FlushJobTest, Empty) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
@@ -303,6 +330,140 @@ TEST_F(FlushJobTest, NonEmpty) {
   ASSERT_EQ(17, file_meta.oldest_blob_file_number);
   mock_table_factory_->AssertSingleFile(inserted_keys);
   job_context.Clean();
+}
+
+TEST_F(FlushJobHotTableTest, DuplicateScanFusedMatchesManualCount) {
+  JobContext job_context(0);
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
+                                           kMaxSequenceNumber);
+  new_mem->Ref();
+
+  SequenceNumber seq = 1;
+  // 5 unique keys: no duplicates.
+  for (int i = 0; i < 5; i++) {
+    std::string key = "unique" + std::to_string(i);
+    ASSERT_OK(new_mem->Add(seq++, kTypeValue, key, "v", nullptr));
+  }
+  // "dup_a": a duplicate run of length 2.
+  ASSERT_OK(new_mem->Add(seq++, kTypeValue, "dup_a", "v1", nullptr));
+  ASSERT_OK(new_mem->Add(seq++, kTypeValue, "dup_a", "v2", nullptr));
+  // "dup_b": a duplicate run of length 3.
+  ASSERT_OK(new_mem->Add(seq++, kTypeValue, "dup_b", "v1", nullptr));
+  ASSERT_OK(new_mem->Add(seq++, kTypeValue, "dup_b", "v2", nullptr));
+  ASSERT_OK(new_mem->Add(seq++, kTypeValue, "dup_b", "v3", nullptr));
+
+  new_mem->ConstructFragmentedRangeTombstones();
+  autovector<ReadOnlyMemTable*> to_delete;
+  cfd->imm()->Add(new_mem, &to_delete);
+  for (auto& m : to_delete) {
+    delete m;
+  }
+
+  EventLogger event_logger(db_options_.info_log.get());
+  job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
+  FlushJob flush_job(
+      dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
+      std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
+      versions_.get(), &mutex_, &shutting_down_, &job_context,
+      FlushReason::kTest, nullptr, nullptr, nullptr, kNoCompression,
+      db_options_.statistics.get(), &event_logger, true,
+      true /* sync_output_directory */, true /* write_manifest */,
+      Env::Priority::USER, nullptr /*IOTracer*/, empty_seqno_to_time_mapping_);
+
+  FileMetaData file_meta;
+  mutex_.Lock();
+  flush_job.PickMemTable();
+  ASSERT_OK(flush_job.Run(nullptr, &file_meta));
+  mutex_.Unlock();
+  job_context.Clean();
+
+  // 10 total entries (5 unique + 2 for dup_a + 3 for dup_b); 5 of those are
+  // "duplicate" entries (dup_a's 2 + dup_b's 3) -> 50% duplicate ratio. This
+  // is computed as a side effect of BuildTable()'s own traversal (see
+  // HotTableDupCountingIterator in flush_job.cc) instead of a second,
+  // separate scan -- this test asserts the fused result matches what the
+  // old standalone scan would have computed.
+  ASSERT_NEAR(cfd->space_saving_topk()->GetRecentDuplicateRatio(), 0.5, 1e-9);
+  ASSERT_EQ(cfd->space_saving_topk()->QualifiedHeavyHittersCount(2), 2u);
+}
+
+TEST_F(FlushJobHotTableTest, HotKeyRangeShiftDecisionLagsOneFlush) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  ASSERT_TRUE(cfd->hot_mem() != nullptr);
+
+  // Populate the HotTable with one key so KeyCount() > 0, satisfying the
+  // "hot key range shift" branch's precondition in
+  // FlushJob::WriteLevel0Table().
+  ASSERT_TRUE(cfd->hot_mem()->Add("hot_key", "v", kTypeValue, /*seq=*/1));
+  ASSERT_GT(cfd->hot_mem()->KeyCount(), 0u);
+
+  Statistics* stats = db_options_.statistics.get();
+
+  auto run_flush = [&](std::vector<std::pair<std::string, int>> key_counts) {
+    JobContext job_context(0);
+    auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
+                                             kMaxSequenceNumber);
+    new_mem->Ref();
+    SequenceNumber seq = 1;
+    for (const auto& kc : key_counts) {
+      for (int i = 0; i < kc.second; i++) {
+        ASSERT_OK(new_mem->Add(seq++, kTypeValue, kc.first, "v", nullptr));
+      }
+    }
+    new_mem->ConstructFragmentedRangeTombstones();
+    autovector<ReadOnlyMemTable*> to_delete;
+    cfd->imm()->Add(new_mem, &to_delete);
+    for (auto& m : to_delete) {
+      delete m;
+    }
+    EventLogger event_logger(db_options_.info_log.get());
+    job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
+    FlushJob flush_job(
+        dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
+        std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
+        versions_.get(), &mutex_, &shutting_down_, &job_context,
+        FlushReason::kTest, nullptr, nullptr, nullptr, kNoCompression, stats,
+        &event_logger, true, true /* sync_output_directory */,
+        true /* write_manifest */, Env::Priority::USER, nullptr /*IOTracer*/,
+        empty_seqno_to_time_mapping_);
+    FileMetaData file_meta;
+    mutex_.Lock();
+    flush_job.PickMemTable();
+    ASSERT_OK(flush_job.Run(nullptr, &file_meta));
+    mutex_.Unlock();
+    job_context.Clean();
+  };
+
+  uint64_t physical_flushes_before =
+      stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+
+  // Flush #1: this flush's OWN cold memtable is heavily duplicated (a key
+  // repeated 20 times out of 21 entries -> ~95% duplicate ratio) -- clearly
+  // enough to trigger a "hot key range shift" physical flush if that
+  // decision used this flush's own, freshly-computed ratio. But at the
+  // point the decision is made (before BuildTable()), nothing has been
+  // recorded yet for this flush -- the ratio is still whatever the
+  // *previous* flush window left it at (0, initially) -- so it must NOT
+  // trigger a physical HotTable flush.
+  run_flush({{"unique_a", 1}, {"heavy_dup_1", 20}});
+  ASSERT_EQ(stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT),
+            physical_flushes_before);
+
+  // Flush #2: also heavily duplicated (a different key, same ~95% ratio).
+  // Its "hot key range shift" decision reads flush #1's now-recorded ratio
+  // -- one flush late, exactly as designed (see the comment at the "hot key
+  // range shift" check in FlushJob::WriteLevel0Table()) -- so it triggers a
+  // physical HotTable flush this time. (Flush #2 is deliberately given its
+  // own qualifying duplicate ratio too, rather than none at all:
+  // RebuildHotTable's separate IsWorkloadSkewed() re-evaluation at the end of
+  // this SAME flush uses this flush's own freshly-recorded ratio, and needs it
+  // to still read as skewed for the physical flush to actually take effect
+  // instead of being immediately reverted -- that reevaluation is orthogonal to
+  // the lagged trigger decision this test is targeting.)
+  run_flush({{"unique_b", 1}, {"heavy_dup_2", 20}});
+  ASSERT_EQ(stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT),
+            physical_flushes_before + 1);
 }
 
 TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {

@@ -1157,6 +1157,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       hot_table_min_absorption_ratio(cf_options.hot_table_min_absorption_ratio),
       hot_table_consecutive_threshold_windows(
           cf_options.hot_table_consecutive_threshold_windows),
+      hot_table_max_scan_backoff_flushes(
+          cf_options.hot_table_max_scan_backoff_flushes),
       enable_level_up_compaction(cf_options.enable_level_up_compaction),
       level_up_warmth_threshold(cf_options.level_up_warmth_threshold),
       level_up_min_skew_ratio(cf_options.level_up_min_skew_ratio),

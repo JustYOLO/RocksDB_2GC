@@ -176,7 +176,8 @@ DEFINE_string(
     "fillzipf,"
     "testzipf,"
     "openandcompact,"
-    "approximatememtablestats",
+    "approximatememtablestats,"
+    "tencenttrace",
 
     "Comma-separated list of operations to run in the specified"
     " order. Available benchmarks:\n"
@@ -283,7 +284,9 @@ DEFINE_string(
     "--twitter_trace_file\n"
     "\tapproximatememtablestats -- Tests accuracy of "
     "GetApproximateMemTableStats, ideally\n"
-    "after fillrandom, where actual answer is batch_size");
+    "after fillrandom, where actual answer is batch_size\n"
+    "\ttencenttrace -- Replay a Tencent CBS trace CSV from "
+    "--tencent_trace_file\n");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
@@ -1372,6 +1375,15 @@ DEFINE_int64(
 DEFINE_string(block_cache_trace_file, "", "Block cache trace file path.");
 DEFINE_int32(trace_replay_threads, 1,
              "The number of threads to replay, must >=1.");
+
+DEFINE_string(tencent_trace_file, "",
+              "Path to a Tencent CBS trace file. Expected CSV format: "
+              "timestamp,offset,size,iotype,volumeid, where offset and size "
+              "are in 512-byte sectors and iotype is 0 for read, 1 for "
+              "write. VolumeID is ignored (flat offset keyspace).");
+DEFINE_uint64(tencent_trace_max_ops, 0,
+              "Stop tencenttrace after this many replayed Get/Put "
+              "operations. 0 means replay the entire file.");
 
 DEFINE_bool(io_uring_enabled, true,
             "If true, enable the use of IO uring if the platform supports it");
@@ -4763,6 +4775,18 @@ class Benchmark {
           ErrorExit();
         }
         method = &Benchmark::Replay;
+      } else if (name == "tencenttrace") {
+        if (num_threads > 1) {
+          fprintf(stderr, "tencenttrace currently supports only 1 thread\n");
+          ErrorExit();
+        }
+        if (FLAGS_tencent_trace_file.empty()) {
+          fprintf(stderr,
+                  "Please set --tencent_trace_file to the Tencent trace "
+                  "path\n");
+          ErrorExit();
+        }
+        method = &Benchmark::TencentTrace;
       } else if (name == "twittertrace") {
         if (num_threads > 1) {
           fprintf(stderr, "twittertrace currently supports only 1 thread\n");
@@ -11764,6 +11788,138 @@ class Benchmark {
     } else {
       fprintf(stderr, "Replay failed. Error: %s\n", s.ToString().c_str());
     }
+  }
+
+  // Replays a Tencent CBS block-storage I/O trace (CSV format:
+  // timestamp,offset,size,iotype,volumeid; offset/size in 512-byte sectors,
+  // iotype 0=read/1=write) as Get/Put operations against a single RocksDB.
+  // VolumeID is intentionally ignored (flat offset keyspace).
+  void TencentTrace(ThreadState* thread) {
+    if (db_.db == nullptr) {
+      fprintf(stderr, "tencenttrace: only single-DB mode is supported.\n");
+      ErrorExit();
+    }
+    DB* db = db_.db;
+
+    std::ifstream in(FLAGS_tencent_trace_file);
+    if (!in) {
+      fprintf(stderr, "tencenttrace: failed to open trace file '%s'\n",
+              FLAGS_tencent_trace_file.c_str());
+      ErrorExit();
+    }
+
+    RandomGenerator gen;
+    ReadOptions read_opts = read_options_;
+    WriteOptions write_opts = write_options_;
+
+    uint64_t total_lines = 0;
+    uint64_t skipped_lines = 0;
+    uint64_t total_gets = 0;
+    uint64_t total_puts = 0;
+    uint64_t total_found = 0;
+    uint64_t total_bytes = 0;
+
+    std::string line;
+    char key_buf[8];
+
+    while (std::getline(in, line)) {
+      total_lines++;
+
+      std::vector<std::string> fields;
+      fields.reserve(5);
+      std::stringstream ss(line);
+      std::string field;
+      while (std::getline(ss, field, ',')) {
+        fields.push_back(field);
+      }
+
+      if (fields.size() != 5) {
+        skipped_lines++;
+        continue;
+      }
+
+      uint64_t offset_sectors = 0;
+      uint64_t size_sectors = 0;
+      int iotype = 0;
+      try {
+        offset_sectors = std::stoull(fields[1]);
+        size_sectors = std::stoull(fields[2]);
+        iotype = std::stoi(fields[3]);
+      } catch (const std::exception&) {
+        skipped_lines++;
+        continue;
+      }
+
+      uint64_t byte_offset = offset_sectors * 512;
+      uint64_t byte_size = size_sectors * 512;
+
+      // Fixed-width big-endian encoding so byte-wise key comparison matches
+      // numeric offset ordering (PutFixed64/EncodeFixed64 are little-endian
+      // on x86 and would not preserve this ordering).
+      for (int i = 0; i < 8; ++i) {
+        key_buf[7 - i] = static_cast<char>((byte_offset >> (i * 8)) & 0xFF);
+      }
+      Slice key(key_buf, sizeof(key_buf));
+
+      Status s;
+      if (iotype == 0) {
+        std::string val;
+        s = db->Get(read_opts, key, &val);
+        if (s.ok()) {
+          total_found++;
+          total_bytes += key.size() + val.size();
+        } else if (!s.IsNotFound()) {
+          fprintf(stderr, "tencenttrace: Get error: %s\n",
+                  s.ToString().c_str());
+          ErrorExit();
+        }
+        total_gets++;
+        thread->stats.FinishedOps(&db_, db, 1, kRead);
+      } else {
+        Slice val = gen.Generate(static_cast<unsigned int>(byte_size));
+        s = db->Put(write_opts, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "tencenttrace: Put error: %s\n",
+                  s.ToString().c_str());
+          ErrorExit();
+        }
+        total_puts++;
+        total_bytes += key.size() + val.size();
+        thread->stats.FinishedOps(&db_, db, 1, kWrite);
+      }
+
+      if (total_lines % 1000000 == 0) {
+        fprintf(stdout,
+                "tencenttrace: processed %" PRIu64 " lines (gets:%" PRIu64
+                ", puts:%" PRIu64 ")\n",
+                total_lines, total_gets, total_puts);
+        fflush(stdout);
+      }
+
+      if (FLAGS_tencent_trace_max_ops > 0 &&
+          total_gets + total_puts >= FLAGS_tencent_trace_max_ops) {
+        fprintf(stdout,
+                "tencenttrace: reached --tencent_trace_max_ops=%" PRIu64
+                ", stopping\n",
+                FLAGS_tencent_trace_max_ops);
+        break;
+      }
+    }
+
+    char msg[200];
+    snprintf(msg, sizeof(msg),
+             "lines:%" PRIu64 " gets:%" PRIu64 " puts:%" PRIu64
+             " found:%" PRIu64 " skipped:%" PRIu64 " bytes:%" PRIu64,
+             total_lines, total_gets, total_puts, total_found, skipped_lines,
+             total_bytes);
+    thread->stats.AddMessage(msg);
+
+    fprintf(stdout,
+            "tencenttrace: completed from tencent_trace_file: %s "
+            "(lines:%" PRIu64 ", gets:%" PRIu64 ", puts:%" PRIu64
+            ", found:%" PRIu64 ", skipped:%" PRIu64 ")\n",
+            FLAGS_tencent_trace_file.c_str(), total_lines, total_gets,
+            total_puts, total_found, skipped_lines);
   }
 
   void TwitterTrace(ThreadState* thread) {

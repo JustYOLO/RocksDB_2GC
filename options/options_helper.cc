@@ -381,6 +381,8 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->hot_table_min_absorption_ratio = ioptions.hot_table_min_absorption_ratio;
   cf_opts->hot_table_consecutive_threshold_windows =
       ioptions.hot_table_consecutive_threshold_windows;
+  cf_opts->hot_table_max_scan_backoff_flushes =
+      ioptions.hot_table_max_scan_backoff_flushes;
 
   cf_opts->enable_level_up_compaction = ioptions.enable_level_up_compaction;
   cf_opts->level_up_warmth_threshold = ioptions.level_up_warmth_threshold;
