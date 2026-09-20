@@ -832,8 +832,9 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
     return;
   }
 
-  // Workload is skewed -> enable HotTable and revert max write buffer number to base
-  mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
+  // Workload is skewed -> HotTable stays/becomes active. Whether the cold
+  // path keeps borrowing the bonus memtable slot is decided at the end of
+  // this function, once hot_mem_'s post-rebuild fill level is known.
 
   // `flush_log_number`, when set by the flush that triggered this rebuild
   // (see FlushJob::Run(), which calls RebuildHotTable() before its own
@@ -890,6 +891,31 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
     WriteLock l(&hot_table_ptr_mutex_);
     hot_router_ = std::move(new_router);
   }
+
+  // Only revoke the cold path's bonus memtable slot once the HotMemTable
+  // that will actually be live going forward (post fetch/replace above, and
+  // after this window's top-k keys have been (re-)seeded into it) has
+  // genuinely used up its own byte budget. hot_mem is non-null in the
+  // normal enable_hot_table path (Initialize() always constructs hot_mem_,
+  // and the fetch/replace block above replaces it if it was ever null);
+  // treat a defensive null as "no verified spare capacity" and revert.
+  bool hot_mem_has_spare_capacity = hot_mem && !hot_mem->IsFull();
+  int extra_memtables = static_cast<int>(ioptions_.hot_table_write_buffer_size /
+                                         base_write_buffer_size_);
+  if (extra_memtables < 1) extra_memtables = 1;
+  mutable_cf_options_.max_write_buffer_number =
+      hot_mem_has_spare_capacity
+          ? base_max_write_buffer_number_ + extra_memtables
+          : base_max_write_buffer_number_;
+
+  ROCKS_LOG_INFO(
+      ioptions_.info_log,
+      "[%s] [HotTable] max_write_buffer_number %s (hot_mem usage: %zu/%zu "
+      "bytes)",
+      GetName().c_str(),
+      hot_mem_has_spare_capacity ? "kept at bonus level" : "reverted to base",
+      hot_mem ? hot_mem->ApproximateMemoryUsage() : size_t{0},
+      hot_mem ? hot_mem->WriteBufferSize() : size_t{0});
 }
 
 void ColumnFamilyData::DecayAndEvaluateLevelUpSkew() {
