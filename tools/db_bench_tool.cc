@@ -2189,15 +2189,6 @@ DEFINE_string(twitter_trace_file, "",
               "Path to Twitter trace file. Expected CSV format: "
               "timestamp,key,key_size,value_size,client_id,op,ttl.");
 
-DEFINE_uint64(twitter_chunk_bytes, 10ULL * 1024 * 1024 * 1024,
-              "Twitter trace progress reporting interval in input text bytes. "
-              "0 means report only at EOF.");
-
-DEFINE_uint64(
-    twitter_queue_bytes, 256ULL * 1024 * 1024,
-    "Maximum bytes of Twitter trace text buffered between reader and replayer. "
-    "0 means unbounded.");
-
 DEFINE_bool(twittertrace_skip_reads, false,
             "Skip Get ops in twittertrace, replaying writes only.");
 
@@ -3390,57 +3381,6 @@ class Benchmark {
   bool use_blob_db_;    // Stacked BlobDB
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
-
-  struct TwitterTraceRecord {
-    uint64_t timestamp = 0;
-    std::string key;
-    uint32_t key_size = 0;
-    uint32_t value_size = 0;
-    uint32_t client_id = 0;
-    std::string op;
-    uint32_t ttl = 0;
-  };
-
-  bool ParseTwitterTraceLine(const std::string& line, TwitterTraceRecord* rec) {
-    if (line.empty()) {
-      return false;
-    }
-
-    std::vector<std::string> cols;
-    cols.reserve(7);
-
-    size_t start = 0;
-    while (true) {
-      size_t pos = line.find(',', start);
-      if (pos == std::string::npos) {
-        cols.emplace_back(line.substr(start));
-        break;
-      }
-      cols.emplace_back(line.substr(start, pos - start));
-      start = pos + 1;
-      if (cols.size() > 7) {
-        break;
-      }
-    }
-
-    if (cols.size() != 7) {
-      return false;
-    }
-
-    try {
-      rec->timestamp = static_cast<uint64_t>(std::stoull(cols[0]));
-      rec->key = cols[1];
-      rec->key_size = static_cast<uint32_t>(std::stoul(cols[2]));
-      rec->value_size = static_cast<uint32_t>(std::stoul(cols[3]));
-      rec->client_id = static_cast<uint32_t>(std::stoul(cols[4]));
-      rec->op = cols[5];
-      rec->ttl = static_cast<uint32_t>(std::stoul(cols[6]));
-    } catch (...) {
-      return false;
-    }
-
-    return true;
-  }
 
   class ErrorHandlerListener : public EventListener {
    public:
@@ -11922,12 +11862,17 @@ class Benchmark {
             total_puts, total_found, skipped_lines);
   }
 
+  // Replays a Twitter cache trace (CSV format:
+  // timestamp,key,key_size,value_size,client_id,op,ttl) as Get/Put
+  // operations against a single RocksDB. get/gets are reads; set/add/
+  // replace/append/prepend are writes with a fresh random value of the
+  // trace's declared value_size; any other op (cas/delete/incr/decr) is
+  // skipped.
   void TwitterTrace(ThreadState* thread) {
     if (db_.db == nullptr) {
       fprintf(stderr, "twittertrace: only single-DB mode is supported.\n");
       ErrorExit();
     }
-
     DB* db = db_.db;
 
     if (FLAGS_twitter_trace_file.empty()) {
@@ -11943,201 +11888,77 @@ class Benchmark {
       ErrorExit();
     }
 
-    uint64_t file_size = 0;
-    Status fs_s = FLAGS_env->GetFileSize(FLAGS_twitter_trace_file, &file_size);
-    if (!fs_s.ok()) {
-      file_size = 0;
-    }
-
-    const uint64_t report_interval = (FLAGS_twitter_chunk_bytes == 0)
-                                         ? std::numeric_limits<uint64_t>::max()
-                                         : FLAGS_twitter_chunk_bytes;
-    const uint64_t queue_limit = FLAGS_twitter_queue_bytes;
+    RandomGenerator gen;
+    ReadOptions read_opts = read_options_;
+    WriteOptions write_opts = write_options_;
 
     uint64_t total_lines = 0;
+    uint64_t skipped_lines = 0;
     uint64_t total_gets = 0;
     uint64_t total_puts = 0;
     uint64_t total_found = 0;
     uint64_t total_bytes = 0;
     const uint64_t put_limit = FLAGS_twittertrace_put_limit;
-    ReadOptions read_opts = read_options_;
-    WriteOptions write_opts = write_options_;
 
-    std::string value_buf;
+    std::string line;
+    while (std::getline(in, line)) {
+      total_lines++;
 
-    struct TwitterTraceItem {
-      TwitterTraceRecord rec;
-      uint64_t text_bytes = 0;
-    };
-
-    std::mutex queue_mu;
-    std::condition_variable queue_cv_not_empty;
-    std::condition_variable queue_cv_not_full;
-    std::queue<TwitterTraceItem> queue;
-    uint64_t queue_bytes = 0;
-    bool reader_done = false;
-    std::atomic<bool> stop_processing(false);
-
-    auto request_stop_processing = [&]() {
-      stop_processing.store(true, std::memory_order_release);
-      {
-        std::lock_guard<std::mutex> lock(queue_mu);
-        reader_done = true;
-      }
-      queue_cv_not_empty.notify_all();
-      queue_cv_not_full.notify_all();
-    };
-
-    auto log_progress = [&](uint64_t chunk_bytes, uint64_t cumulative_bytes,
-                            uint64_t chunk_index) {
-      if (chunk_bytes == 0) {
-        return;
-      }
-      if (file_size > 0) {
-        double pct = 100.0 * static_cast<long double>(cumulative_bytes) /
-                     static_cast<long double>(file_size);
-        fprintf(stdout,
-                "twittertrace: loaded chunk %" PRIu64
-                " (%.3f GiB text, %.2f%% of file)\n",
-                chunk_index,
-                static_cast<double>(chunk_bytes) / (1024.0 * 1024.0 * 1024.0),
-                pct);
-      } else {
-        fprintf(
-            stdout,
-            "twittertrace: loaded chunk %" PRIu64
-            " (%.3f GiB text, cumulative %.3f GiB)\n",
-            chunk_index,
-            static_cast<double>(chunk_bytes) / (1024.0 * 1024.0 * 1024.0),
-            static_cast<double>(cumulative_bytes) / (1024.0 * 1024.0 * 1024.0));
-      }
-      fflush(stdout);
-    };
-
-    std::thread reader([&]() {
-      std::string line;
-      uint64_t text_bytes_in_chunk = 0;
-      uint64_t total_text_bytes = 0;
-      uint64_t chunk_index = 0;
-
-      while (std::getline(in, line)) {
-        if (stop_processing.load(std::memory_order_acquire)) {
-          break;
-        }
-
-        uint64_t line_bytes = static_cast<uint64_t>(line.size()) + 1;
-        total_text_bytes += line_bytes;
-        text_bytes_in_chunk += line_bytes;
-
-        TwitterTraceRecord rec;
-        if (!ParseTwitterTraceLine(line, &rec)) {
-          continue;
-        }
-
-        std::unique_lock<std::mutex> lock(queue_mu);
-        queue_cv_not_full.wait(lock, [&]() {
-          return reader_done || queue_limit == 0 ||
-                 (queue_bytes + line_bytes <= queue_limit) ||
-                 (queue_bytes == 0 && line_bytes > queue_limit);
-        });
-        if (reader_done) {
-          break;
-        }
-        queue.push(TwitterTraceItem{std::move(rec), line_bytes});
-        queue_bytes += line_bytes;
-        lock.unlock();
-        queue_cv_not_empty.notify_one();
-
-        if (text_bytes_in_chunk >= report_interval) {
-          chunk_index++;
-          log_progress(text_bytes_in_chunk, total_text_bytes, chunk_index);
-          text_bytes_in_chunk = 0;
-        }
+      std::vector<std::string> fields;
+      fields.reserve(7);
+      std::stringstream ss(line);
+      std::string field;
+      while (std::getline(ss, field, ',')) {
+        fields.push_back(field);
       }
 
-      if (text_bytes_in_chunk > 0 || total_text_bytes == 0) {
-        chunk_index++;
-        log_progress(text_bytes_in_chunk, total_text_bytes, chunk_index);
+      if (fields.size() != 7) {
+        skipped_lines++;
+        continue;
       }
 
-      {
-        std::lock_guard<std::mutex> lock(queue_mu);
-        reader_done = true;
-      }
-      queue_cv_not_empty.notify_all();
-    });
+      const std::string& key_str = fields[1];
+      const std::string& op = fields[5];
 
-    uint64_t chunk_index = 0;
-    uint64_t chunk_lines = 0;
-    uint64_t chunk_gets = 0;
-    uint64_t chunk_puts = 0;
-    uint64_t chunk_found = 0;
-    uint64_t chunk_bytes = 0;
-
-    while (true) {
-      if (put_limit > 0 && total_puts >= put_limit) {
-        request_stop_processing();
-        break;
+      uint64_t value_size = 0;
+      try {
+        value_size = std::stoull(fields[3]);
+      } catch (const std::exception&) {
+        skipped_lines++;
+        continue;
       }
 
-      if (FLAGS_target_db_size_bytes > 0 &&
-          thread->shared->target_db_size_reached.Load()) {
-        request_stop_processing();
-        break;
-      }
-
-      TwitterTraceItem item;
-      {
-        std::unique_lock<std::mutex> lock(queue_mu);
-        queue_cv_not_empty.wait(
-            lock, [&]() { return reader_done || !queue.empty(); });
-        if (queue.empty()) {
-          break;
-        }
-        item = std::move(queue.front());
-        queue.pop();
-        queue_bytes -= item.text_bytes;
-      }
-      queue_cv_not_full.notify_one();
-
-      const auto& rec = item.rec;
+      Slice key(key_str);
       Status s;
-      Slice key(rec.key);
       bool stop_for_target_db_size = false;
 
-      if (rec.op == "get" || rec.op == "gets") {
+      if (op == "get" || op == "gets") {
         if (FLAGS_twittertrace_skip_reads) {
           continue;
         }
-        chunk_gets++;
         std::string val;
         s = db->Get(read_opts, key, &val);
         if (s.ok()) {
-          chunk_found++;
-          chunk_bytes += key.size() + val.size();
+          total_found++;
+          total_bytes += key.size() + val.size();
         } else if (!s.IsNotFound()) {
           fprintf(stderr, "twittertrace: Get error: %s\n",
                   s.ToString().c_str());
           ErrorExit();
         }
+        total_gets++;
         thread->stats.FinishedOps(&db_, db, 1, kRead);
-      } else if (rec.op == "set" || rec.op == "add" || rec.op == "replace" ||
-                 rec.op == "append" || rec.op == "prepend") {
-        chunk_puts++;
-        total_puts++;
-
-        if (value_buf.size() < rec.value_size) {
-          value_buf.assign(rec.value_size, 'x');
-        }
-        Slice val(value_buf.data(), rec.value_size);
-
+      } else if (op == "set" || op == "add" || op == "replace" ||
+                 op == "append" || op == "prepend") {
+        Slice val = gen.Generate(static_cast<unsigned int>(value_size));
         s = db->Put(write_opts, key, val);
         if (!s.ok()) {
           fprintf(stderr, "twittertrace: Put error: %s\n",
                   s.ToString().c_str());
           ErrorExit();
         }
-        chunk_bytes += key.size() + rec.value_size;
+        total_puts++;
+        total_bytes += key.size() + value_size;
         thread->stats.FinishedOps(&db_, db, 1, kWrite);
         stop_for_target_db_size =
             ShouldStopForTargetDbSize(thread, "twittertrace", total_puts);
@@ -12145,64 +11966,42 @@ class Benchmark {
         continue;
       }
 
-      chunk_lines++;
-      if (chunk_lines >= 1000000) {
-        chunk_index++;
+      if (total_lines % 1000000 == 0) {
         fprintf(stdout,
-                "twittertrace: replayed chunk %" PRIu64 " (lines:%" PRIu64
-                ", gets:%" PRIu64 ", puts:%" PRIu64 ")\n",
-                chunk_index, chunk_lines, chunk_gets, chunk_puts);
+                "twittertrace: processed %" PRIu64 " lines (gets:%" PRIu64
+                ", puts:%" PRIu64 ")\n",
+                total_lines, total_gets, total_puts);
         fflush(stdout);
+      }
 
-        total_lines += chunk_lines;
-        total_gets += chunk_gets;
-        total_found += chunk_found;
-        total_bytes += chunk_bytes;
-
-        chunk_lines = 0;
-        chunk_gets = 0;
-        chunk_puts = 0;
-        chunk_found = 0;
-        chunk_bytes = 0;
+      if (put_limit > 0 && total_puts >= put_limit) {
+        fprintf(stdout,
+                "twittertrace: reached --twittertrace_put_limit=%" PRIu64
+                ", stopping\n",
+                put_limit);
+        break;
       }
 
       if (stop_for_target_db_size) {
-        request_stop_processing();
         break;
       }
-    }
-
-    if (chunk_lines > 0) {
-      chunk_index++;
-      fprintf(stdout,
-              "twittertrace: replayed chunk %" PRIu64 " (lines:%" PRIu64
-              ", gets:%" PRIu64 ", puts:%" PRIu64 ")\n",
-              chunk_index, chunk_lines, chunk_gets, chunk_puts);
-      fflush(stdout);
-
-      total_lines += chunk_lines;
-      total_gets += chunk_gets;
-      total_found += chunk_found;
-      total_bytes += chunk_bytes;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(queue_mu);
-      reader_done = true;
-    }
-    queue_cv_not_full.notify_all();
-    if (reader.joinable()) {
-      reader.join();
     }
 
     thread->stats.AddBytes(total_bytes);
 
     char msg[256];
     snprintf(msg, sizeof(msg),
-             "(twittertrace total_lines:%" PRIu64 " gets:%" PRIu64
-             " (found:%" PRIu64 ") puts:%" PRIu64 ")",
-             total_lines, total_gets, total_found, total_puts);
+             "lines:%" PRIu64 " gets:%" PRIu64 " (found:%" PRIu64
+             ") puts:%" PRIu64 " skipped:%" PRIu64,
+             total_lines, total_gets, total_found, total_puts, skipped_lines);
     thread->stats.AddMessage(msg);
+
+    fprintf(stdout,
+            "twittertrace: completed from twitter_trace_file: %s "
+            "(lines:%" PRIu64 ", gets:%" PRIu64 ", puts:%" PRIu64
+            ", found:%" PRIu64 ", skipped:%" PRIu64 ")\n",
+            FLAGS_twitter_trace_file.c_str(), total_lines, total_gets,
+            total_puts, total_found, skipped_lines);
     ReportTargetDbSizeFinal(thread, "twittertrace", total_puts);
   }
 
