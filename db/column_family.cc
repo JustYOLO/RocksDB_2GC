@@ -797,6 +797,22 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
   if (!ioptions_.enable_hot_table) {
     return;
   }
+  if (!was_physically_flushed && hot_rebuild_in_flight_.load(
+                                     std::memory_order_acquire)) {
+    // Routine virtual-flush call from a cold flush (was_physically_flushed
+    // == false). A background HotTable physical rebuild is currently
+    // transitioning hot_mem_/hot_router_ for this CF (DBImpl::
+    // BackgroundCallHotTableRebuild() holds hot_rebuild_in_flight_ for the
+    // whole job, including the window where hot_mem_ is already Close()d
+    // but not yet swapped out). Proceeding here would reseed new candidate
+    // keys into the router (HotTableRouter::Add() always succeeds) while
+    // the corresponding HotMemTable::Add() calls silently no-op against the
+    // already-closed hot_mem_ -- desyncing the router from hot_mem_ and
+    // producing router matches that can never actually hit. Skip this
+    // round entirely; the next cold flush (after the background rebuild
+    // finishes and hot_rebuild_in_flight_ clears) will catch up.
+    return;
+  }
   size_t capacity = ioptions_.hot_table_write_buffer_size /
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
