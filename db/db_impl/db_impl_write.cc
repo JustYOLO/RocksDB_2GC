@@ -2125,7 +2125,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     if (!should_switch_wal) {
       for (auto cfd : *column_families) {
         if (cfd->ioptions().enable_hot_table && cfd->hot_mem() &&
-            cfd->hot_mem()->KeyCount() > 0) {
+            !cfd->hot_mem()->IsEmpty()) {
           should_switch_wal = true;
           break;
         }

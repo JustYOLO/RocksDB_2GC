@@ -178,8 +178,19 @@ void DBImpl::BackgroundCallHotTableRebuild(ColumnFamilyData* cfd) {
     // SetLogNumber(), so cfd_->GetLogNumber() is untouched by it, and
     // RebuildHotTable()'s own fallback (seed from GetLogNumber() when
     // flush_log_number == 0) is exactly correct here.
+    //
+    // Hand off the single-flight guard we've held since dispatch: release
+    // it right here (still holding mutex_ continuously, so no other thread
+    // can observe it free until RebuildHotTable() re-acquires it a moment
+    // later) so RebuildHotTable()'s own TryBeginHotTableRebuild() succeeds
+    // instead of seeing "already held by myself" and bailing out. Passing
+    // &mutex_ lets it unlock around its own expensive reseed section
+    // (GetTopK() + up to ~800K HotMemTable::Add() calls) instead of that
+    // running while every other write/flush/compaction in the DB is
+    // blocked on mutex_ -- see the comment on RebuildHotTable() itself.
+    cfd->EndHotTableRebuild();
     cfd->RebuildHotTable(/*was_physically_flushed=*/true,
-                         /*flush_log_number=*/0);
+                         /*flush_log_number=*/0, &mutex_);
   } else if (!s.IsShutdownInProgress() && !s.IsColumnFamilyDropped()) {
     // Not treated as a DB-wide background error: the data this job was
     // flushing is still safely durable in the WAL (HotTable writes go

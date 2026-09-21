@@ -1179,7 +1179,7 @@ Status FlushJob::WriteLevel0Table() {
                          "[%s] [HotTable] WAL size limit reached (kWalFull). "
                          "Flushing HotTable.",
                          cfd_->GetName().c_str());
-        } else if (cfd_->hot_mem()->KeyCount() > 0) {
+        } else if (!cfd_->hot_mem()->IsEmpty()) {
           double cur_abs =
               cfd_->space_saving_topk()->GetRecentAbsorptionRatio();
           double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
@@ -1211,7 +1211,15 @@ Status FlushJob::WriteLevel0Table() {
     // must not include HotTable's entries.
     uint64_t hot_key_count_for_logging = 0;
     if (flush_hot_table) {
-      hot_key_count_for_logging = cfd_->hot_mem()->KeyCount();
+      // Estimate rather than call KeyCount() (an O(n) scan under hot_mem_'s
+      // own shared lock, for logging purposes only): db_mutex_ is already
+      // unlocked at this point (see the unlock above, before this block),
+      // so a concurrent background rebuild for this same CF (which holds
+      // that same lock exclusively per-Add() call in its reseed loop) could
+      // otherwise be blocked behind this scan for its entire duration.
+      hot_key_count_for_logging =
+          cfd_->hot_mem()->ApproximateMemoryUsage() /
+          (32 + cfd_->ioptions().hot_table_max_value_size);
       total_data_size += cfd_->hot_mem()->ApproximateMemoryUsage();
       total_memory_usage += cfd_->hot_mem()->ApproximateMemoryUsage();
       if (max_next_log_number_ > 0) {
@@ -1634,7 +1642,7 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok()) {
     if (cfd_->ioptions().enable_hot_table && cfd_->hot_router()) {
-      cfd_->RebuildHotTable(flush_hot_table, GetLogNumber());
+      cfd_->RebuildHotTable(flush_hot_table, GetLogNumber(), db_mutex_);
     }
     if (cfd_->ioptions().enable_level_up_compaction) {
       cfd_->DecayAndEvaluateLevelUpSkew();

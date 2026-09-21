@@ -794,26 +794,42 @@ void ColumnFamilyData::ExecuteVirtualFlush() {
 }
 
 void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
-                                       uint64_t flush_log_number) {
+                                       uint64_t flush_log_number,
+                                       InstrumentedMutex* db_mutex) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
-  if (!was_physically_flushed && hot_rebuild_in_flight_.load(
-                                     std::memory_order_acquire)) {
-    // Routine virtual-flush call from a cold flush (was_physically_flushed
-    // == false). A background HotTable physical rebuild is currently
-    // transitioning hot_mem_/hot_router_ for this CF (DBImpl::
-    // BackgroundCallHotTableRebuild() holds hot_rebuild_in_flight_ for the
-    // whole job, including the window where hot_mem_ is already Close()d
-    // but not yet swapped out). Proceeding here would reseed new candidate
-    // keys into the router (HotTableRouter::Add() always succeeds) while
-    // the corresponding HotMemTable::Add() calls silently no-op against the
-    // already-closed hot_mem_ -- desyncing the router from hot_mem_ and
-    // producing router matches that can never actually hit. Skip this
-    // round entirely; the next cold flush (after the background rebuild
-    // finishes and hot_rebuild_in_flight_ clears) will catch up.
-    return;
+  // Single-flight guard for this function's entire body, covering both the
+  // was_physically_flushed==true (background-rebuild) and ==false
+  // (routine virtual-flush) cases uniformly. This is required once the
+  // expensive section below can run with db_mutex unlocked (see the
+  // comment there): without it, two calls for the same CF -- e.g. this
+  // routine virtual-flush call racing a background physical rebuild that
+  // already Close()d hot_mem_ but hasn't swapped it out yet -- could
+  // interleave, reseeding new candidate keys into the router (whose Add()
+  // always succeeds) while the corresponding HotMemTable::Add() calls
+  // silently no-op against an already-closed hot_mem_. That desyncs the
+  // router from hot_mem_ and produces router matches that can never
+  // actually hit.
+  //
+  // DBImpl::BackgroundCallHotTableRebuild() already holds this same guard
+  // (acquired via TryBeginHotTableRebuild() before dispatch) across its
+  // whole job -- including this call -- and explicitly EndHotTableRebuild()s
+  // right before calling in here, handing off ownership so the
+  // TryBeginHotTableRebuild() below succeeds instead of seeing "already
+  // held by myself" and bailing. That hand-off happens without ever
+  // unlocking db_mutex, so no third party can observe the guard as free
+  // in between. The inline deliberate-flush path in
+  // FlushJob::WriteLevel0Table() (kWalFull/kShutDown/kManualFlush) holds no
+  // guard at all beforehand, so it relies on acquiring it here directly.
+  if (!TryBeginHotTableRebuild()) {
+    return;  // A rebuild for this CF is already in flight elsewhere.
   }
+  struct GuardRelease {
+    ColumnFamilyData* cfd;
+    ~GuardRelease() { cfd->EndHotTableRebuild(); }
+  } guard_release{this};
+
   size_t capacity = ioptions_.hot_table_write_buffer_size /
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
@@ -903,6 +919,28 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
   auto new_router = std::make_shared<HotTableRouter>(capacity);
 
   if (space_saving_topk_) {
+    // The rest of this block is the expensive part of a rebuild: GetTopK()
+    // extracts (and, for a large capacity, partially sorts) up to `capacity`
+    // candidates out of up to 2*capacity tracked entries, and the loop below
+    // performs up to `capacity` HotTableRouter::Add() bloom-filter inserts
+    // and HotMemTable::Add() std::map inserts (each with its own malloc).
+    // At the ~800K-entry capacities this feature is tuned for, this is
+    // O(capacity) in-memory work that has been measured taking hundreds of
+    // milliseconds to a couple of seconds. None of it touches db_mutex_-
+    // protected state: GetTopK()/ApplyDecayAndPenalties() on
+    // space_saving_topk_ are protected by that object's own internal mutex;
+    // new_router is a not-yet-published local object; hot_mem is either a
+    // not-yet-published fresh instance (was_physically_flushed) or the
+    // live one, whose Add() is protected by its own index_rwlock_
+    // independent of db_mutex_. So unlock db_mutex_ (when the caller passed
+    // one) for this section instead of blocking every other write, flush,
+    // and compaction in the DB for the full duration -- the
+    // TryBeginHotTableRebuild() guard above already ensures no other
+    // RebuildHotTable() call for this CF can run concurrently and observe
+    // torn state while it's unlocked.
+    if (db_mutex) {
+      db_mutex->Unlock();
+    }
     auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
     for (const auto& entry : top_keys) {
       new_router->Add(entry.key);
@@ -912,6 +950,9 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
         // back down to the stale GetLogNumber().
         hot_mem->Add(entry.key, Slice(), kTypeValue, 0, seed_log_number);
       }
+    }
+    if (db_mutex) {
+      db_mutex->Lock();
     }
     ROCKS_LOG_INFO(
         ioptions_.info_log,

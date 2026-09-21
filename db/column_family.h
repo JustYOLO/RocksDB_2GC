@@ -487,8 +487,19 @@ class ColumnFamilyData {
     last_hot_write_misses_ = misses;
   }
   void ExecuteVirtualFlush();
+  // If db_mutex is non-null, the expensive part of the rebuild (extracting
+  // the top-K candidates from space_saving_topk_ and reseeding up to
+  // hot_table_write_buffer_size / (32 + hot_table_max_value_size) entries
+  // into the router and a fresh/live HotMemTable -- an O(capacity) amount
+  // of in-memory work that can run into the hundreds of milliseconds to
+  // low seconds at large capacities) runs with db_mutex unlocked, so it
+  // does not block every other write/flush/compaction in the DB for its
+  // duration. REQUIRES: db_mutex held by the caller on entry (and held
+  // again on return); safe to omit (pass nullptr) only for callers that
+  // already know they hold no lock worth releasing here.
   void RebuildHotTable(bool was_physically_flushed = true,
-                       uint64_t flush_log_number = 0);
+                       uint64_t flush_log_number = 0,
+                       InstrumentedMutex* db_mutex = nullptr);
 
   // Set by the write path (cheap, relaxed) the moment it observes hot_mem_
   // has become full; consumed by DBImpl's background-rebuild dispatcher to
