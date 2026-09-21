@@ -28,9 +28,26 @@ void DBImpl::MaybeScheduleHotTableRebuild(ColumnFamilyData* cfd) {
     // already closed by a rebuild that's in flight/just finished.
     return;
   }
+  // Throttle: require at least one decay cycle (ExecuteVirtualFlush(), tied
+  // to virtual_flush_interval_flushes cold flushes) since the last
+  // dispatched physical rebuild for this CF. Without this, a capacity-only
+  // trigger can refire almost immediately after a rebuild: reseeding the
+  // (unchanged, since no decay ran) top-K candidate set alone can consume
+  // most of hot_table_write_buffer_size, so hot_mem_->IsFull() often goes
+  // true again within milliseconds -- a "reseed storm" of back-to-back
+  // rebuilds that all reseed the same stale key set, wasting I/O and
+  // (worse) repeatedly reopening the redirect-then-capture cutover window.
+  // Waiting for a fresh decay cycle bounds physical-rebuild frequency to
+  // roughly the cold-flush cadence, matching what the original synchronous
+  // design implicitly had (physical flushes were only ever checked at cold
+  // flush time).
+  if (cfd->GetHotDecayEpoch() <= cfd->GetHotRebuildDecayEpoch()) {
+    return;
+  }
   if (!cfd->TryBeginHotTableRebuild()) {
     return;  // Another dispatch already has this CF's rebuild in flight.
   }
+  cfd->SetHotRebuildDecayEpoch(cfd->GetHotDecayEpoch());
 
   cfd->Ref();
   bg_hot_table_rebuild_scheduled_++;

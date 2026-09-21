@@ -789,6 +789,7 @@ void ColumnFamilyData::ExecuteVirtualFlush() {
   std::unordered_map<std::string, uint32_t> hit_map;
   hot_mem->SweepHits(&hit_map);
   space_saving_topk_->ApplyDecayAndPenalties(hit_map);
+  BumpAndGetHotDecayEpoch();
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 }
 
@@ -822,7 +823,21 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
     ReadLock l(&hot_table_ptr_mutex_);
     hot_router = hot_router_;
   }
-  bool currently_active = (hot_router && hot_router->IsActive());
+  // For a physical-flush-triggered rebuild, HotTable was necessarily active
+  // and full just moments ago (that is the only way this call happens) --
+  // don't re-derive "was active" from hot_router's current IsActive(),
+  // which DBImpl::BackgroundCallHotTableRebuild() has already forced to
+  // false (via HotTableRouter::Disable()) as part of the write-redirection
+  // cutover, before this call ever runs. Feeding that artificially-false
+  // signal into IsWorkloadSkewed() below would incorrectly exercise its
+  // "currently inactive" hysteresis branch (which requires several
+  // consecutive skewed windows before re-activating, and otherwise takes
+  // the early-return path just below -- leaving hot_mem_/hot_router_
+  // permanently stuck in their closed/disabled state and clearing
+  // space_saving_topk_ -- even though the workload never actually stopped
+  // being skewed).
+  bool currently_active =
+      was_physically_flushed || (hot_router && hot_router->IsActive());
   bool is_skewed = true;
   if (space_saving_topk_) {
     is_skewed = space_saving_topk_->IsWorkloadSkewed(

@@ -503,6 +503,26 @@ class ColumnFamilyData {
     return hot_rebuild_needed_.exchange(false, std::memory_order_relaxed);
   }
 
+  // Incremented once per ExecuteVirtualFlush() call (i.e. once per decay
+  // cycle: every virtual_flush_interval_flushes-th cold flush). Used to
+  // throttle background physical rebuilds -- see GetHotRebuildDecayEpoch()/
+  // SetHotRebuildDecayEpoch() below and their use in
+  // DBImpl::MaybeScheduleHotTableRebuild().
+  uint32_t BumpAndGetHotDecayEpoch() {
+    return hot_decay_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  }
+  uint32_t GetHotDecayEpoch() const {
+    return hot_decay_epoch_.load(std::memory_order_acquire);
+  }
+  // The hot decay epoch (see above) as of the last dispatched background
+  // physical rebuild for this CF.
+  uint32_t GetHotRebuildDecayEpoch() const {
+    return hot_rebuild_decay_epoch_.load(std::memory_order_acquire);
+  }
+  void SetHotRebuildDecayEpoch(uint32_t epoch) {
+    hot_rebuild_decay_epoch_.store(epoch, std::memory_order_release);
+  }
+
   // Single-flight guard against two concurrent background HotTable physical
   // rebuilds racing for the same CF (the event-driven write-path trigger and
   // the periodic fallback check can both fire for the same fill event).
@@ -775,6 +795,9 @@ class ColumnFamilyData {
   std::atomic<bool> hot_rebuild_needed_{false};
   // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
   std::atomic<bool> hot_rebuild_in_flight_{false};
+  // See BumpAndGetHotDecayEpoch()/GetHotRebuildDecayEpoch() above.
+  std::atomic<uint32_t> hot_decay_epoch_{0};
+  std::atomic<uint32_t> hot_rebuild_decay_epoch_{0};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};
