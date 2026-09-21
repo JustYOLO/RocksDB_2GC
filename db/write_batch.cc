@@ -2320,6 +2320,9 @@ class MemTableInserter : public WriteBatch::Handler {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
+            if (hot_mem->IsFull()) {
+              cfd->MarkHotRebuildNeeded();
+            }
             MaybeAdvanceSeq(false /* batch_boundary */);
             return Status::OK();
           } else {
@@ -2566,6 +2569,9 @@ class MemTableInserter : public WriteBatch::Handler {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
+            if (hot_mem->IsFull()) {
+              cfd->MarkHotRebuildNeeded();
+            }
             MaybeAdvanceSeq();
             return Status::OK();
           } else {

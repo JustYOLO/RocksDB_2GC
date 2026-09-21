@@ -7,6 +7,7 @@
 #include "db/hot_memtable.h"
 #include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -597,6 +598,125 @@ TEST_F(HotMemTableTest, HotMemTableIteratorFilteringAndSeeking) {
 
   iter->Next();
   ASSERT_FALSE(iter->Valid());
+}
+
+// The following three tests cover HotMemTable::Close() -- the correctness
+// barrier the zero-stall HotTable background-rebuild design relies on in
+// place of the old DB-wide WriteController stop token. See its comment in
+// hot_memtable.h and the fast-path lock-scope comment in UpdateInPlace().
+
+TEST_F(HotMemTableTest, UpdateInPlaceAndAddReturnFalseAfterClose) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 256);
+
+  ASSERT_TRUE(hot_table.Add("existing_key", "v1", kTypeValue, 10));
+  hot_table.Close();
+  ASSERT_TRUE(hot_table.IsClosed());
+
+  // Existing key: both the fast (in-capacity) and slow (resize) paths must
+  // reject.
+  ASSERT_FALSE(
+      hot_table.UpdateInPlace("existing_key", "v2", kTypeValue, 11));
+  ASSERT_FALSE(hot_table.UpdateInPlace(
+      "existing_key", std::string(1000, 'x'), kTypeValue, 12));
+  // New key via Add() must also reject.
+  ASSERT_FALSE(hot_table.Add("new_key", "v", kTypeValue, 13));
+
+  // The pre-close value must be unaffected by the rejected updates.
+  std::string val;
+  Status s;
+  SequenceNumber seq = 0;
+  ASSERT_TRUE(hot_table.Get("existing_key", &val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(val, "v1");
+  ASSERT_EQ(seq, 10);
+}
+
+TEST_F(HotMemTableTest, NewIteratorAfterCloseIsStableAndComplete) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 256);
+
+  hot_table.Add("a", "val_a", kTypeValue, 10);
+  hot_table.Add("b", "val_b", kTypeValue, 20);
+  hot_table.Add("c", "val_c", kTypeValue, 30);
+
+  hot_table.Close();
+
+  // Post-close mutations are rejected (proven by the previous test); a
+  // NewIterator() taken after Close() must see exactly the pre-close data,
+  // with no further synchronization required by the caller.
+  size_t count = 0;
+  std::unique_ptr<InternalIterator> iter(hot_table.NewIterator(nullptr, &count));
+  ASSERT_EQ(count, 3u);
+
+  iter->SeekToFirst();
+  std::vector<std::string> keys;
+  std::vector<std::string> vals;
+  for (; iter->Valid(); iter->Next()) {
+    ParsedInternalKey pik;
+    ASSERT_OK(ParseInternalKey(iter->key(), &pik, false));
+    keys.push_back(pik.user_key.ToString());
+    vals.push_back(iter->value().ToString());
+  }
+  ASSERT_EQ(keys, (std::vector<std::string>{"a", "b", "c"}));
+  ASSERT_EQ(vals, (std::vector<std::string>{"val_a", "val_b", "val_c"}));
+}
+
+TEST_F(HotMemTableTest, CloseBlocksUntilInFlightFastPathWriteCompletes) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 256);
+  hot_table.Add("race_key", "initial", kTypeValue, 1);
+
+  // Widen the race window: once the writer thread has acquired the fast
+  // path's shared_lock (and is about to mutate the node), pause it there
+  // briefly. This gives the main thread's concurrent Close() call a
+  // reliable opportunity to attempt (and have to wait for) the exclusive
+  // lock while the writer still holds the shared one -- the exact
+  // interleaving this test exists to exercise, rather than leaving it to
+  // chance scheduling.
+  std::atomic<bool> writer_holding_lock{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "HotMemTable::UpdateInPlace:FastPath:HoldingSharedLock", [&](void*) {
+        writer_holding_lock.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::atomic<bool> update_returned{false};
+  std::thread writer([&]() {
+    bool ok = hot_table.UpdateInPlace("race_key", "written_by_writer",
+                                      kTypeValue, 2);
+    update_returned.store(true, std::memory_order_release);
+    // The writer reached the sync point (thus passed the pre-lock closed_
+    // check) before Close() was ever called below, so it must succeed.
+    ASSERT_TRUE(ok);
+  });
+
+  // Wait until the writer is actually holding the shared lock (and thus
+  // mid-sleep inside the callback above) before racing Close() against it.
+  while (!writer_holding_lock.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  hot_table.Close();
+  // If Close() incorrectly returned while the writer was still inside its
+  // shared_lock scope (mid-sleep in the callback, mutation not yet
+  // performed), this would be reachable with update_returned still false.
+  // Close()'s drain (a unique_lock on the same index_rwlock_) cannot be
+  // granted while that shared_lock is held, so this is only reachable once
+  // the writer's scope -- and thus the write itself -- has fully completed.
+  ASSERT_TRUE(update_returned.load(std::memory_order_acquire));
+
+  writer.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  std::string val;
+  Status s;
+  SequenceNumber seq = 0;
+  ASSERT_TRUE(hot_table.Get("race_key", &val, &s, &seq));
+  ASSERT_OK(s);
+  ASSERT_EQ(val, "written_by_writer");
+  ASSERT_EQ(seq, 2);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

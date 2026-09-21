@@ -387,6 +387,12 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     InstallSuperVersionAndScheduleWork(cfd, superversion_context);
+    // Opportunistic, cheap check: this cold flush's own RebuildHotTable()
+    // call (inside flush_job.Run() -> WriteLevel0Table()) may have just
+    // reseeded HotTable's router/table over its byte budget. This catches
+    // that case immediately rather than waiting for the coarser periodic
+    // fallback (see MaybeScheduleHotTableRebuild()'s comment in db_impl.h).
+    MaybeScheduleHotTableRebuild(cfd);
     if (made_progress) {
       *made_progress = true;
     }

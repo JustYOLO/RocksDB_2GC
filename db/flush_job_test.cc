@@ -435,35 +435,36 @@ TEST_F(FlushJobHotTableTest, HotKeyRangeShiftDecisionLagsOneFlush) {
     job_context.Clean();
   };
 
-  uint64_t physical_flushes_before =
-      stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+  // HOT_TABLE_PHYSICAL_FLUSH_COUNT is no longer a usable signal here: a
+  // "hot key range shift" detection now defers the actual physical flush to
+  // DBImpl's background rebuild job (see ColumnFamilyData::
+  // MarkHotRebuildNeeded()/ConsumeHotRebuildNeeded(), and the
+  // hot_needs_background_rebuild flag in FlushJob::WriteLevel0Table()) rather
+  // than flushing inline within this same FlushJob::Run() call, and this test
+  // exercises FlushJob in isolation with no live DBImpl to run that job. What
+  // this test actually verifies -- that the shift decision lags by exactly
+  // one flush window -- is now observed via ConsumeHotRebuildNeeded() instead.
+  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
 
   // Flush #1: this flush's OWN cold memtable is heavily duplicated (a key
   // repeated 20 times out of 21 entries -> ~95% duplicate ratio) -- clearly
-  // enough to trigger a "hot key range shift" physical flush if that
-  // decision used this flush's own, freshly-computed ratio. But at the
-  // point the decision is made (before BuildTable()), nothing has been
-  // recorded yet for this flush -- the ratio is still whatever the
-  // *previous* flush window left it at (0, initially) -- so it must NOT
-  // trigger a physical HotTable flush.
+  // enough to trigger a "hot key range shift" rebuild if that decision used
+  // this flush's own, freshly-computed ratio. But at the point the decision
+  // is made (before BuildTable()), nothing has been recorded yet for this
+  // flush -- the ratio is still whatever the *previous* flush window left it
+  // at (0, initially) -- so it must NOT mark a rebuild as needed.
   run_flush({{"unique_a", 1}, {"heavy_dup_1", 20}});
-  ASSERT_EQ(stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT),
-            physical_flushes_before);
+  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
 
   // Flush #2: also heavily duplicated (a different key, same ~95% ratio).
   // Its "hot key range shift" decision reads flush #1's now-recorded ratio
   // -- one flush late, exactly as designed (see the comment at the "hot key
-  // range shift" check in FlushJob::WriteLevel0Table()) -- so it triggers a
-  // physical HotTable flush this time. (Flush #2 is deliberately given its
-  // own qualifying duplicate ratio too, rather than none at all:
-  // RebuildHotTable's separate IsWorkloadSkewed() re-evaluation at the end of
-  // this SAME flush uses this flush's own freshly-recorded ratio, and needs it
-  // to still read as skewed for the physical flush to actually take effect
-  // instead of being immediately reverted -- that reevaluation is orthogonal to
-  // the lagged trigger decision this test is targeting.)
+  // range shift" check in FlushJob::WriteLevel0Table()) -- so it marks a
+  // rebuild as needed this time.
   run_flush({{"unique_b", 1}, {"heavy_dup_2", 20}});
-  ASSERT_EQ(stats->getTickerCount(HOT_TABLE_PHYSICAL_FLUSH_COUNT),
-            physical_flushes_before + 1);
+  ASSERT_TRUE(cfd->ConsumeHotRebuildNeeded());
+  // ConsumeHotRebuildNeeded() clears the flag once read.
+  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
 }
 
 TEST_F(FlushJobHotTableTest, BonusRetainedUntilHotMemFull) {

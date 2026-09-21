@@ -490,6 +490,30 @@ class ColumnFamilyData {
   void RebuildHotTable(bool was_physically_flushed = true,
                        uint64_t flush_log_number = 0);
 
+  // Set by the write path (cheap, relaxed) the moment it observes hot_mem_
+  // has become full; consumed by DBImpl's background-rebuild dispatcher to
+  // decide whether a physical HotTable flush needs to be scheduled. This
+  // exists because ColumnFamilyData has no reachable DBImpl* to call the
+  // dispatcher directly from the write path.
+  void MarkHotRebuildNeeded() {
+    hot_rebuild_needed_.store(true, std::memory_order_relaxed);
+  }
+  // Atomically consumes the flag (true->false); returns whether it was set.
+  bool ConsumeHotRebuildNeeded() {
+    return hot_rebuild_needed_.exchange(false, std::memory_order_relaxed);
+  }
+
+  // Single-flight guard against two concurrent background HotTable physical
+  // rebuilds racing for the same CF (the event-driven write-path trigger and
+  // the periodic fallback check can both fire for the same fill event).
+  bool TryBeginHotTableRebuild() {
+    bool expected = false;
+    return hot_rebuild_in_flight_.compare_exchange_strong(expected, true);
+  }
+  void EndHotTableRebuild() {
+    hot_rebuild_in_flight_.store(false, std::memory_order_release);
+  }
+
   SpatialCountMinSketch* spatial_cms() const { return spatial_cms_.get(); }
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_shared() const { return spatial_cms_; }
   void DecayAndEvaluateLevelUpSkew();
@@ -747,6 +771,10 @@ class ColumnFamilyData {
   std::shared_ptr<HotTableRouter> hot_router_;
   // See hot_mem()/hot_router() above for what this guards.
   mutable port::RWMutex hot_table_ptr_mutex_;
+  // See MarkHotRebuildNeeded()/ConsumeHotRebuildNeeded() above.
+  std::atomic<bool> hot_rebuild_needed_{false};
+  // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
+  std::atomic<bool> hot_rebuild_in_flight_{false};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};

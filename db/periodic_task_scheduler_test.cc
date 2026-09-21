@@ -79,7 +79,11 @@ TEST_F(PeriodicTaskSchedulerTest, Basic) {
 
   const PeriodicTaskScheduler& scheduler =
       dbfull()->TEST_GetPeriodicTaskScheduler();
-  ASSERT_EQ((int)PeriodicTaskType::kMax - 1, scheduler.TEST_GetValidTaskNum());
+  // kMax - 2: every task type registers by default except kRecordSeqnoTime
+  // (needs a preserve-seconds option this test doesn't set) and
+  // kHotTableRebuildCheck (needs enable_hot_table on some CF, which this
+  // test's default Options don't set either).
+  ASSERT_EQ((int)PeriodicTaskType::kMax - 2, scheduler.TEST_GetValidTaskNum());
 
   ASSERT_EQ(1, dump_st_counter);
   ASSERT_EQ(1, pst_st_counter);
@@ -481,8 +485,9 @@ TEST_F(PeriodicTaskSchedulerTest, MultiInstances) {
   auto dbi = static_cast_with_check<DBImpl>(dbs[kInstanceNum - 1].get());
 
   const PeriodicTaskScheduler& scheduler = dbi->TEST_GetPeriodicTaskScheduler();
-  // kRecordSeqnoTime is not registered since the feature is not enabled
-  ASSERT_EQ(kInstanceNum * ((int)PeriodicTaskType::kMax - 1),
+  // kRecordSeqnoTime is not registered since the feature is not enabled, and
+  // neither is kHotTableRebuildCheck since no CF here enables HotTable.
+  ASSERT_EQ(kInstanceNum * ((int)PeriodicTaskType::kMax - 2),
             scheduler.TEST_GetValidTaskNum());
 
   int expected_run = kInstanceNum;

@@ -2135,6 +2135,15 @@ class DBImpl : public DB {
     Env::Priority thread_pri_;
   };
 
+  // Argument passed to the background HotTable physical-flush thread. Holds
+  // a Ref()-ed cfd because, unlike flush (which redynamically re-picks its
+  // target CF from flush_queue_ every time it runs), each HotTable rebuild
+  // dispatch targets one specific, already-selected CF.
+  struct HotTableRebuildArg {
+    DBImpl* db_;
+    ColumnFamilyData* cfd_;
+  };
+
   // Information for a manual compaction
   struct ManualCompactionState {
     ManualCompactionState(ColumnFamilyData* _cfd, int _input_level,
@@ -2717,6 +2726,29 @@ class DBImpl : public DB {
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
                          Env::Priority thread_pri);
+
+  // Zero-stall HotTable physical-flush background rebuild. See
+  // db/hot_table_flush_job.h and the design doc for the full picture.
+  //
+  // REQUIRES: mutex_ held. Dispatches a background job for `cfd` if (and
+  // only if) its HotTable is actually full and no rebuild for this CF is
+  // already in flight (single-flight guard via
+  // ColumnFamilyData::TryBeginHotTableRebuild()). Safe/cheap to call
+  // speculatively -- most calls are expected to no-op.
+  void MaybeScheduleHotTableRebuild(ColumnFamilyData* cfd);
+  // Coarse periodic fallback trigger (see PeriodicTaskType::
+  // kHotTableRebuildCheck): sweeps all HotTable-enabled CFs and calls
+  // MaybeScheduleHotTableRebuild() on each. The primary trigger is
+  // event-driven (ColumnFamilyData::MarkHotRebuildNeeded(), set from the
+  // write path in write_batch.cc the moment a hot write observes
+  // HotMemTable::IsFull()); this only exists to bound the worst-case
+  // latency for the rarer case where HotTable fills up without that flag
+  // ever being consulted promptly (e.g. very few HotTable-hit writes
+  // between checks).
+  void HotTableRebuildCheck();
+  static void BGWorkHotTableRebuild(void* arg);
+  static void UnscheduleHotTableRebuildCallback(void* arg);
+  void BackgroundCallHotTableRebuild(ColumnFamilyData* cfd);
 
   Compaction* CreateIntendedCompactionForwardedToBottomPriorityPool(
       Compaction* c);
@@ -3409,6 +3441,12 @@ class DBImpl : public DB {
 
   // stores the number of flushes are currently running
   int num_running_flushes_ = 0;
+
+  // number of background HotTable physical-flush rebuild jobs, submitted to
+  // the LOW pool. Guards destructor/shutdown safety the same way
+  // bg_flush_scheduled_ does for flush -- see WaitForBackgroundWork() and
+  // ~DBImpl().
+  int bg_hot_table_rebuild_scheduled_ = 0;
 
   // number of background obsolete file purge jobs, submitted to the HIGH pool
   int bg_purge_scheduled_ = 0;

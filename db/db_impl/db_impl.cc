@@ -266,6 +266,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   periodic_task_functions_.emplace(
       PeriodicTaskType::kTriggerCompaction,
       [this]() { this->TriggerPeriodicCompaction(); });
+  periodic_task_functions_.emplace(
+      PeriodicTaskType::kHotTableRebuildCheck,
+      [this]() { this->HotTableRebuildCheck(); });
 
   versions_.reset(new VersionSet(
       dbname_, &immutable_db_options_, mutable_db_options_, file_options_,
@@ -491,7 +494,8 @@ Status DBImpl::ResumeImpl(DBRecoverContext context) {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_pressure_callback_in_progress_) {
+         bg_flush_scheduled_ || bg_hot_table_rebuild_scheduled_ ||
+         bg_pressure_callback_in_progress_) {
     bg_cv_.Wait();
   }
 }
@@ -818,7 +822,8 @@ Status DBImpl::CloseHelper() {
 
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_flush_scheduled_ || bg_hot_table_rebuild_scheduled_ ||
+         bg_purge_scheduled_ ||
          bg_pressure_callback_in_progress_ ||
          bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
          async_wal_precreate_state_ == AsyncWALPrecreateState::kScheduled ||
@@ -1219,6 +1224,39 @@ Status DBImpl::StartPeriodicTaskScheduler() {
       PeriodicTaskType::kTriggerCompaction,
       periodic_task_functions_.at(PeriodicTaskType::kTriggerCompaction),
       ComputeTriggerCompactionPeriod(), /*run_immediately=*/false);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Coarse fallback trigger for HotTable's background physical-flush
+  // rebuild -- see MaybeScheduleHotTableRebuild()'s comment in db_impl.h.
+  // A fixed 1s period is fine: this only needs to bound worst-case latency
+  // for the rare case the event-driven trigger doesn't fire promptly, not
+  // detect fullness itself (PeriodicTaskScheduler's granularity is whole
+  // seconds; see db/periodic_task_scheduler.h).
+  //
+  // Registered only when at least one CF actually enables HotTable
+  // (enable_hot_table is immutable, so this is checked once here rather
+  // than re-evaluated like kRecordSeqnoTime's mutable-option-driven
+  // registration) -- otherwise every DB, including ones that never touch
+  // HotTable, would carry an always-on periodic task, which several
+  // existing tests' exact valid-task-count assertions do not expect. A CF
+  // created later (after Open()) with HotTable enabled is not covered by
+  // this check; that is out of scope for now since every current caller of
+  // this feature enables it at Open() time.
+  bool any_cf_has_hot_table = false;
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (!cfd->IsDropped() && cfd->ioptions().enable_hot_table) {
+      any_cf_has_hot_table = true;
+      break;
+    }
+  }
+  if (any_cf_has_hot_table) {
+    s = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kHotTableRebuildCheck,
+        periodic_task_functions_.at(PeriodicTaskType::kHotTableRebuildCheck),
+        /*repeat_period_seconds=*/1, /*run_immediately=*/false);
+  }
 
   return s;
 }

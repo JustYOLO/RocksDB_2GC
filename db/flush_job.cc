@@ -1015,22 +1015,31 @@ Status FlushJob::WriteLevel0Table() {
   const uint64_t start_micros = clock_->NowMicros();
   const uint64_t start_cpu_micros = clock_->CPUMicros();
   Status s;
+  // flush_hot_table: HotTable is flushed INLINE, synchronously, as part of
+  // this same job -- reserved for the deliberate flush reasons below, where
+  // the caller needs a synchronous "everything is durable in SST now"
+  // guarantee (WAL-size-limit relief, shutdown, manual Flush()).
+  //
+  // hot_needs_background_rebuild: HotTable is merely full (or a hot-key-range
+  // shift was detected), independent of why *this* cold flush happened. This
+  // is the common, steady-state case, and is deferred to
+  // DBImpl::MaybeScheduleHotTableRebuild()'s background job instead of
+  // running inline -- see db/hot_table_flush_job.h and the design doc. That
+  // job redirects writes via HotMemTable::Close() (rather than blocking them
+  // via a DB-wide stop token, which is what this function used to do here)
+  // and performs the actual flush off this thread entirely.
   bool flush_hot_table = false;
+  bool hot_needs_background_rebuild = false;
   if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem()) {
-    if (cfd_->hot_mem()->IsFull() || flush_reason_ == FlushReason::kWalFull ||
-        flush_reason_ == FlushReason::kShutDown || flush_reason_ == FlushReason::kManualFlush) {
+    if (flush_reason_ == FlushReason::kWalFull ||
+        flush_reason_ == FlushReason::kShutDown ||
+        flush_reason_ == FlushReason::kManualFlush) {
       flush_hot_table = true;
+    } else if (cfd_->hot_mem()->IsFull()) {
+      hot_needs_background_rebuild = true;
     }
   }
 
-  // The stop token used to be acquired here, wrapping the entire combined
-  // build below. It is now acquired exactly once, narrowly, immediately
-  // before HotTable's own BuildTable() call further down -- see the
-  // `if (s.ok() && flush_hot_table)` block near the end of this function.
-  // Declared here (rather than in that later scope) only so its lifetime
-  // extends correctly through RebuildHotTable()'s subsequent hot_mem_ swap.
-  std::unique_ptr<WriteControllerToken> hot_stall_token;
-  uint64_t hot_flush_stall_start_micros = 0;
   FileMetaData hot_meta_;
 
   meta_.temperature = mutable_cf_options_.default_write_temperature;
@@ -1157,9 +1166,15 @@ Status FlushJob::WriteLevel0Table() {
       // RebuildHotTable()'s activate/deactivate decision (which runs after
       // BuildTable(), once this flush's fresh ratio is available) is
       // unaffected.
-      if (!flush_hot_table && cfd_->hot_mem() && !cfd_->hot_mem()->IsEmpty()) {
+      if (!flush_hot_table && !hot_needs_background_rebuild &&
+          cfd_->hot_mem() && !cfd_->hot_mem()->IsEmpty()) {
         if (flush_reason_ == FlushReason::kWalFull) {
-          flush_hot_table = true;
+          // Unreachable in practice: the initial decision above already sets
+          // flush_hot_table (not this flag) whenever flush_reason_ ==
+          // kWalFull, which would have skipped this whole block via the
+          // !flush_hot_table guard. Kept as-is (translated to the new flag)
+          // to avoid changing pre-existing behavior/structure here.
+          hot_needs_background_rebuild = true;
           ROCKS_LOG_INFO(db_options_.info_log,
                          "[%s] [HotTable] WAL size limit reached (kWalFull). "
                          "Flushing HotTable.",
@@ -1170,7 +1185,7 @@ Status FlushJob::WriteLevel0Table() {
           double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
           if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
               cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
-            flush_hot_table = true;
+            hot_needs_background_rebuild = true;
             ROCKS_LOG_INFO(
                 db_options_.info_log,
                 "[%s] [HotTable] Detected hot key range shift: absorption "
@@ -1183,6 +1198,9 @@ Status FlushJob::WriteLevel0Table() {
                 cfd_->ioptions().hot_table_min_duplicate_ratio * 100.0);
           }
         }
+      }
+      if (hot_needs_background_rebuild) {
+        cfd_->MarkHotRebuildNeeded();
       }
     }
 
@@ -1400,23 +1418,16 @@ Status FlushJob::WriteLevel0Table() {
 
     Status hot_s;
     if (s.ok() && flush_hot_table) {
-      // Single stop-token acquisition site for the whole function. Runs
-      // strictly after the cold BuildTable() call above has already
-      // completed -- the cold flush is never wrapped by this token.
-      if (versions_ && versions_->GetColumnFamilySet()) {
-        WriteController* write_controller =
-            versions_->GetColumnFamilySet()->write_controller();
-        if (write_controller) {
-          hot_stall_token = write_controller->GetStopToken();
-          hot_flush_stall_start_micros = clock_->NowMicros();
-          cfd_->internal_stats()->AddCFStats(
-              InternalStats::MEMTABLE_LIMIT_STOPS, 1);
-          ROCKS_LOG_WARN(db_options_.info_log,
-                         "[%s] [JOB %d] Initiating Write Stall for HotTable "
-                         "physical flush",
-                         cfd_->GetName().c_str(), job_context_->job_id);
-        }
+      // Redirect (rather than block) writes for the duration of this inline
+      // hot-table flush: disable routing to this generation, then Close()
+      // it as the actual no-lost-write barrier (see HotMemTable::Close()'s
+      // comment). This replaces the DB-wide WriteController stop token that
+      // used to be acquired here -- Close() gives the identical guarantee
+      // scoped to just this CF's HotTable, with zero write blocking.
+      if (cfd_->hot_router()) {
+        cfd_->hot_router()->Disable();
       }
+      cfd_->hot_mem()->Close();
 
       hot_meta_.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
       hot_meta_.epoch_number = cfd_->NewEpochNumber();
@@ -1627,22 +1638,6 @@ Status FlushJob::WriteLevel0Table() {
     }
     if (cfd_->ioptions().enable_level_up_compaction) {
       cfd_->DecayAndEvaluateLevelUpSkew();
-    }
-  }
-
-  if (hot_stall_token) {
-    uint64_t stall_micros = clock_->NowMicros() - hot_flush_stall_start_micros;
-    hot_stall_token.reset();
-    RecordTick(stats_, STALL_MICROS, stall_micros);
-    RecordInHistogram(stats_, WRITE_STALL, stall_micros);
-    cfd_->internal_stats()->AddDBStats(
-        InternalStats::kIntStatsWriteStallMicros, stall_micros);
-    ROCKS_LOG_INFO(
-        db_options_.info_log,
-        "[%s] [JOB %d] HotTable physical flush completed; Write Stall ended (%" PRIu64 " micros)",
-        cfd_->GetName().c_str(), job_context_->job_id, stall_micros);
-    if (db_cv_) {
-      db_cv_->SignalAll();
     }
   }
 

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <thread>
 #include "memory/arena.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -204,21 +205,47 @@ HotMemTable::~HotMemTable() {
   }
 }
 
+void HotMemTable::Close() {
+  closed_.store(true, std::memory_order_release);
+  // Barrier: cannot be granted while any in-flight Add()/UpdateInPlace()
+  // still holds index_rwlock_ (shared or exclusive), and every such call
+  // rechecks closed_ immediately after acquiring it. See the closed_ comment
+  // in hot_memtable.h and the fast-path lock-scope comment in
+  // UpdateInPlace() for the full argument.
+  std::unique_lock<std::shared_mutex> drain(index_rwlock_);
+}
+
 bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
                                ValueType type, SequenceNumber seq,
                                uint64_t log_num) {
-  HotNode* node = nullptr;
+  if (closed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  // Fast path: look up the node and mutate it under a single continuous
+  // shared_lock scope (rather than releasing the lock between lookup and
+  // mutation). This is required for Close() to be a correct barrier: Close()
+  // drains by briefly taking index_rwlock_ in exclusive mode, which cannot be
+  // granted while any shared_lock holder (i.e. any in-flight fast-path
+  // writer, from the closed_ recheck below through the end of this scope) is
+  // still active. Holding the shared lock this long does not add contention
+  // between concurrent fast-path writers to different keys -- shared holders
+  // never block each other -- it only makes Close()/Add() (which need the
+  // exclusive lock) wait for in-flight fast-path writers to finish, which is
+  // exactly the drain semantics Close() needs.
   {
     std::shared_lock<std::shared_mutex> lock(index_rwlock_);
+    if (closed_.load(std::memory_order_acquire)) {
+      return false;
+    }
     auto it = index_.find(user_key.ToString());
     if (it == index_.end()) {
       return false;
     }
-    node = it->second;
-  }
+    HotNode* node = it->second;
+    TEST_SYNC_POINT(
+        "HotMemTable::UpdateInPlace:FastPath:HoldingSharedLock");
 
-  // Fast path: value fits in existing node capacity
-  {
     std::lock_guard<SpinMutex> node_lock(node->write_lock);
     if (seq <= node->seq && node->seq > 0) {
       return true;
@@ -262,12 +289,15 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
   // Slow path: value.size() > node->capacity. Dynamically reallocate a larger
   // HotNode.
   std::unique_lock<std::shared_mutex> lock(index_rwlock_);
+  if (closed_.load(std::memory_order_acquire)) {
+    return false;
+  }
   std::string key_str = user_key.ToString();
   auto it = index_.find(key_str);
   if (it == index_.end()) {
     return false;
   }
-  node = it->second;
+  HotNode* node = it->second;
 
   std::lock_guard<SpinMutex> node_lock(node->write_lock);
   if (seq <= node->seq && node->seq > 0) {
@@ -342,7 +372,13 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
 
 bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
                       SequenceNumber seq, uint64_t log_num) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return false;
+  }
   std::unique_lock<std::shared_mutex> lock(index_rwlock_);
+  if (closed_.load(std::memory_order_acquire)) {
+    return false;
+  }
   std::string key_str = user_key.ToString();
   auto it = index_.find(key_str);
   if (it != index_.end()) {

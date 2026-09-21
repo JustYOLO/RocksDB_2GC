@@ -73,6 +73,18 @@ class HotMemTable {
 
   std::shared_mutex& index_rwlock() const { return index_rwlock_; }
 
+  // Permanently stops accepting new writes. After Close() returns, no
+  // in-flight or future call to Add()/UpdateInPlace() can still be mutating
+  // this table -- any such call has either already fully completed (and its
+  // effect is visible to a reader that starts after Close() returns) or will
+  // return false without touching any node. This is the barrier that makes
+  // it safe to iterate/flush this table from a thread other than the writer
+  // that closed it, with no further synchronization.
+  //
+  // Closing twice is safe (idempotent).
+  void Close();
+  bool IsClosed() const { return closed_.load(std::memory_order_acquire); }
+
   size_t ApproximateMemoryUsage() const {
     return allocated_bytes_.load(std::memory_order_relaxed);
   }
@@ -118,6 +130,7 @@ class HotMemTable {
   std::atomic<size_t> allocated_bytes_{0};
   std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
   std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
+  std::atomic<bool> closed_{false};
 
   mutable std::shared_mutex index_rwlock_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;
