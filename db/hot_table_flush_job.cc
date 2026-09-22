@@ -17,6 +17,7 @@
 #include "logging/logging.h"
 #include "memory/arena.h"
 #include "monitoring/instrumented_mutex.h"
+#include "monitoring/iostats_context_imp.h"
 #include "monitoring/statistics_impl.h"
 #include "table/table_builder.h"
 
@@ -75,6 +76,7 @@ Status HotTableFlushJob::Run() {
 
   {
     db_mutex_->Unlock();
+    IOSTATS_RESET(bytes_written);
 
     SystemClock* clock = db_options_.clock;
     int64_t current_time_raw = 0;
@@ -160,6 +162,14 @@ Status HotTableFlushJob::Run() {
           IOOptions(), nullptr,
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
+
+    // Mirrors FlushJob::RecordFlushIOStats(): rocksdb.flush.write.bytes is
+    // otherwise cold-flush-only, silently excluding every byte this
+    // standalone job writes. Same thread-local IOStatsContext mechanism,
+    // safe here since this job always runs on its own background thread,
+    // never interleaved with a cold FlushJob's own reset/read pair.
+    RecordTick(stats_, FLUSH_WRITE_BYTES, IOSTATS(bytes_written));
+    IOSTATS_RESET(bytes_written);
 
     db_mutex_->Lock();
   }
