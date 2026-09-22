@@ -317,6 +317,13 @@ const PeriodicTaskScheduler& DBImpl::TEST_GetPeriodicTaskScheduler() const {
   return periodic_task_scheduler_;
 }
 
+void DBImpl::TEST_MaybeScheduleHotTableRebuild(
+    ColumnFamilyHandle* column_family) {
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  InstrumentedMutexLock l(&mutex_);
+  MaybeScheduleHotTableRebuild(cfh->cfd());
+}
+
 SeqnoToTimeMapping DBImpl::TEST_GetSeqnoToTimeMapping() const {
   InstrumentedMutexLock l(&mutex_);
   return seqno_to_time_mapping_;

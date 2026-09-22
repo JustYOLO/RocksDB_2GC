@@ -92,15 +92,20 @@ void DBImpl::UnscheduleHotTableRebuildCallback(void* arg) {
   std::unique_ptr<HotTableRebuildArg> ha(static_cast<HotTableRebuildArg*>(arg));
   DBImpl* db = ha->db_;
   ColumnFamilyData* cfd = ha->cfd_;
-  {
-    InstrumentedMutexLock l(&db->mutex_);
-    db->bg_hot_table_rebuild_scheduled_--;
-    cfd->EndHotTableRebuild();
-    if (cfd->UnrefAndTryDelete()) {
-      // cfd was the last reference; already deleted -- do not touch it again.
-    }
-    db->bg_cv_.SignalAll();
+  // Reachable only from CloseHelper()'s env_->UnSchedule() sweep, which
+  // already holds mutex_ when it synchronously invokes this callback (on
+  // the calling thread -- see ThreadPoolImpl::Impl::UnSchedule()) for a
+  // still-queued job. Do NOT re-lock mutex_ here -- see
+  // UnscheduleFlushCallback/UnscheduleCompactionCallback for the same
+  // established pattern; re-locking here self-deadlocks the shutdown
+  // thread against a mutex it already owns.
+  db->mutex_.AssertHeld();
+  db->bg_hot_table_rebuild_scheduled_--;
+  cfd->EndHotTableRebuild();
+  if (cfd->UnrefAndTryDelete()) {
+    // cfd was the last reference; already deleted -- do not touch it again.
   }
+  db->bg_cv_.SignalAll();
   TEST_SYNC_POINT("DBImpl::UnscheduleHotTableRebuildCallback");
 }
 

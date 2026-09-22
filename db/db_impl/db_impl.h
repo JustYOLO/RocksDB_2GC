@@ -1301,6 +1301,11 @@ class DBImpl : public DB {
 
   const PeriodicTaskScheduler& TEST_GetPeriodicTaskScheduler() const;
 
+  // Directly invokes MaybeScheduleHotTableRebuild() for the given CF's
+  // current state, bypassing the need to organically trigger it via the
+  // write path or a cold flush completing. For tests only.
+  void TEST_MaybeScheduleHotTableRebuild(ColumnFamilyHandle* column_family);
+
   static Status TEST_ValidateOptions(const DBOptions& db_options) {
     return ValidateOptions(db_options);
   }

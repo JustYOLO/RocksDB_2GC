@@ -29,9 +29,11 @@
 #include "db/attribute_group_iterator_impl.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
+#include "db/hot_memtable.h"
 #include "db/job_context.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
@@ -65,6 +67,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/cast_util.h"
 #include "util/compression.h"
 #include "util/defer.h"
 #include "util/mutexlock.h"
@@ -7779,6 +7782,55 @@ TEST_F(DBTest, ShuttingDownNotBlockStalledWrites) {
   CancelAllBackgroundWork(db_.get(), true);
 
   thd.join();
+}
+
+// Regression test for a shutdown deadlock: CloseHelper() unschedules every
+// still-queued background job while holding mutex_ (db_impl.cc), and for a
+// job matching HotTable's rebuild tag, that synchronously invokes
+// DBImpl::UnscheduleHotTableRebuildCallback() on the same (already-locked)
+// thread. That callback used to try to re-lock mutex_ itself, self-deadlocking
+// the thread against a mutex it already held. Reproduces the exact scenario
+// that hit it: a HotTable physical-rebuild job dispatched but still sitting
+// in the LOW-priority queue (never picked up, since this test sets 0
+// background threads there) at the moment the DB is closed.
+TEST_F(DBTest, HotTableRebuildQueuedAtShutdownNoDeadlock) {
+  Options options = CurrentOptions();
+  options.enable_hot_table = true;
+  options.hot_table_write_buffer_size = 4096;
+  options.hot_table_max_value_size = 64;
+  Reopen(options);
+
+  // Guarantee the dispatched rebuild job stays queued rather than starting:
+  // no LOW-priority worker will ever pick it up.
+  env_->SetBackgroundThreads(0, Env::Priority::LOW);
+
+  auto* cfh =
+      static_cast_with_check<ColumnFamilyHandleImpl>(dbfull()->DefaultColumnFamily());
+  ColumnFamilyData* cfd = cfh->cfd();
+  ASSERT_NE(cfd->hot_mem(), nullptr);
+
+  // Force hot_mem_ over its byte budget directly, bypassing the need to
+  // organically warm up HotTable's router through real traffic.
+  for (int i = 0; !cfd->hot_mem()->IsFull(); i++) {
+    ASSERT_TRUE(cfd->hot_mem()->Add("hot_key_" + std::to_string(i),
+                                    std::string(48, 'v'), kTypeValue,
+                                    i + 1));
+  }
+  // Satisfy MaybeScheduleHotTableRebuild()'s reseed-storm throttle (requires
+  // at least one decay cycle since the last dispatched rebuild; both start
+  // at epoch 0, so a fresh CF would otherwise never dispatch).
+  cfd->BumpAndGetHotDecayEpoch();
+
+  ASSERT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 0u);
+  dbfull()->TEST_MaybeScheduleHotTableRebuild(dbfull()->DefaultColumnFamily());
+
+  // The job above must have actually been queued for this test to be
+  // exercising the intended scenario, not trivially passing because nothing
+  // was dispatched.
+  ASSERT_EQ(env_->GetThreadPoolQueueLen(Env::Priority::LOW), 1u);
+
+  // This used to hang forever; reaching here at all is the regression check.
+  ASSERT_OK(dbfull()->Close());
 }
 
 TEST_F(DBTest, FileReadSampledStats) {
