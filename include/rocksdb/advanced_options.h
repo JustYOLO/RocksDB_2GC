@@ -883,6 +883,18 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   bool report_bg_io_stats = false;
 
+  // Record a per-phase latency breakdown of flush (memtable iterator setup,
+  // read+merge, SST block writes, file finish, MANIFEST install, and -- when
+  // enable_hot_table is also set -- hot-key detection) into dedicated
+  // Statistics histograms, if true. This adds StopWatch/StopWatchNano
+  // instrumentation to the flush path, so it is off by default; enable it
+  // only when analyzing flush latency breakdown.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through SetOptions() API
+  bool report_flush_time_breakdown = false;
+
   // Setting this option to true disallows ordinary writes to the column family
   // and it can only be populated through import and ingestion. It is intended
   // to protect "ingestion only" column families. This option is not currently

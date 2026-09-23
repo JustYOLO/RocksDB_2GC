@@ -92,7 +92,8 @@ Status BuildTable(
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
     InternalStats::CompactionStats* flush_stats,
     std::vector<BlobFileGarbage>* blob_file_garbages, bool fast_sst_open,
-    CompactionIterationStats* compaction_iteration_stats) {
+    CompactionIterationStats* compaction_iteration_stats,
+    const BuildTablePhaseTimings* phase_timings) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -261,8 +262,11 @@ Status BuildTable(
     SequenceNumber smallest_preferred_seqno = kMaxSequenceNumber;
     std::string key_after_flush_buf;
     std::string value_buf;
+    const bool time_phases = phase_timings != nullptr;
+    uint64_t read_merge_nanos = 0;
+    uint64_t write_block_nanos = 0;
     c_iter.SeekToFirst();
-    for (; c_iter.Valid(); c_iter.Next()) {
+    while (c_iter.Valid()) {
       const Slice& key = c_iter.key();
       const Slice& value = c_iter.value();
       ParsedInternalKey ikey = c_iter.ikey();
@@ -299,7 +303,13 @@ Status BuildTable(
       if (!s.ok()) {
         break;
       }
-      builder->Add(key_after_flush, value_after_flush);
+      if (time_phases) {
+        StopWatchNano timer(ioptions.clock, /*auto_start=*/true);
+        builder->Add(key_after_flush, value_after_flush);
+        write_block_nanos += timer.ElapsedNanos();
+      } else {
+        builder->Add(key_after_flush, value_after_flush);
+      }
 
       if (flush_stats) {
         flush_stats->num_output_records++;
@@ -329,6 +339,14 @@ Status BuildTable(
         ThreadStatusUtil::SetThreadOperationProperty(
             ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
       }
+
+      if (time_phases) {
+        StopWatchNano timer(ioptions.clock, /*auto_start=*/true);
+        c_iter.Next();
+        read_merge_nanos += timer.ElapsedNanos();
+      } else {
+        c_iter.Next();
+      }
     }
     if (!s.ok()) {
       c_iter.status().PermitUncheckedError();
@@ -343,7 +361,13 @@ Status BuildTable(
            range_del_it->Next()) {
         auto tombstone = range_del_it->Tombstone();
         std::pair<InternalKey, Slice> kv = tombstone.Serialize();
-        builder->Add(kv.first.Encode(), kv.second);
+        if (time_phases) {
+          StopWatchNano timer(ioptions.clock, /*auto_start=*/true);
+          builder->Add(kv.first.Encode(), kv.second);
+          write_block_nanos += timer.ElapsedNanos();
+        } else {
+          builder->Add(kv.first.Encode(), kv.second);
+        }
         if (flush_stats) {
           flush_stats->num_output_records++;
         }
@@ -364,6 +388,13 @@ Status BuildTable(
           last_tombstone_start_user_key = range_del_it->start_key();
         }
       }
+    }
+
+    if (time_phases) {
+      RecordTimeToHistogram(ioptions.stats, phase_timings->read_merge_micros,
+                            read_merge_nanos / 1000);
+      RecordTimeToHistogram(ioptions.stats, phase_timings->write_block_micros,
+                            write_block_nanos / 1000);
     }
 
     TEST_SYNC_POINT("BuildTable:BeforeFinishBuildTable");
@@ -410,7 +441,12 @@ Status BuildTable(
           ioptions.compaction_style == CompactionStyle::kCompactionStyleFIFO
               ? meta->file_creation_time
               : meta->oldest_ancester_time);
-      s = builder->Finish();
+      {
+        StopWatch sw(ioptions.clock, ioptions.stats,
+                     time_phases ? phase_timings->finish_micros
+                                 : Histograms::HISTOGRAM_ENUM_MAX);
+        s = builder->Finish();
+      }
     }
     if (io_status->ok()) {
       *io_status = builder->io_status();

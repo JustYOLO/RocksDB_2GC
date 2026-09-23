@@ -450,6 +450,13 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
      "rocksdb.flush.write_buffer_full.memtable.memory.bytes"},
     {FLUSH_WRITE_BUFFER_MANAGER_MEMTABLE_MEMORY_BYTES,
      "rocksdb.flush.write_buffer_manager.memtable.memory.bytes"},
+    {FLUSH_MEM_ITERATOR_SETUP_MICROS,
+     "rocksdb.flush.mem.iterator.setup.micros"},
+    {FLUSH_READ_MERGE_MICROS, "rocksdb.flush.read.merge.micros"},
+    {FLUSH_WRITE_BLOCK_MICROS, "rocksdb.flush.write.block.micros"},
+    {FLUSH_FINISH_MICROS, "rocksdb.flush.finish.micros"},
+    {FLUSH_INSTALL_MICROS, "rocksdb.flush.install.micros"},
+    {FLUSH_HOT_KEY_DETECT_MICROS, "rocksdb.flush.hot.key.detect.micros"},
 };
 
 std::shared_ptr<Statistics> CreateDBStatistics() {

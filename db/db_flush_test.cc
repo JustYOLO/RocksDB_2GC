@@ -4109,6 +4109,124 @@ TEST_F(DBFlushTest, FlushAfterReadPathRangeTombstoneInsertion) {
   ASSERT_EQ(Get("f"), "vf");
 }
 
+// report_flush_time_breakdown defaults to false: none of the new per-phase
+// flush latency histograms should record anything, confirming the
+// zero-overhead-when-unused contract (BuildTable() gets a nullptr
+// phase_timings, and the coarse StopWatches around setup/install are
+// constructed with HISTOGRAM_ENUM_MAX).
+TEST_F(DBFlushTest, FlushTimeBreakdownDisabledByDefault) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  ASSERT_OK(TryReopen(options));
+
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(Flush());
+
+  for (uint32_t hist :
+       {FLUSH_MEM_ITERATOR_SETUP_MICROS, FLUSH_READ_MERGE_MICROS,
+        FLUSH_WRITE_BLOCK_MICROS, FLUSH_FINISH_MICROS, FLUSH_INSTALL_MICROS,
+        FLUSH_HOT_KEY_DETECT_MICROS}) {
+    HistogramData data;
+    options.statistics->histogramData(hist, &data);
+    EXPECT_EQ(data.count, 0u);
+  }
+}
+
+// With report_flush_time_breakdown = true (and HotTable not enabled), the
+// cold-flush phase histograms should each record at least one sample per
+// flush, while the HotTable-only FLUSH_HOT_KEY_DETECT_MICROS stays at 0.
+TEST_F(DBFlushTest, FlushTimeBreakdownEnabled) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.report_flush_time_breakdown = true;
+  ASSERT_OK(TryReopen(options));
+
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Put("key2", "value2"));
+  ASSERT_OK(Flush());
+
+  for (uint32_t hist :
+       {FLUSH_MEM_ITERATOR_SETUP_MICROS, FLUSH_READ_MERGE_MICROS,
+        FLUSH_WRITE_BLOCK_MICROS, FLUSH_FINISH_MICROS, FLUSH_INSTALL_MICROS}) {
+    HistogramData data;
+    options.statistics->histogramData(hist, &data);
+    EXPECT_GE(data.count, 1u);
+  }
+  HistogramData hot_data;
+  options.statistics->histogramData(FLUSH_HOT_KEY_DETECT_MICROS, &hot_data);
+  EXPECT_EQ(hot_data.count, 0u);
+
+  // Sanity bound: the phase histograms should not sum to more than the
+  // existing end-to-end FLUSH_TIME histogram (they cover a subset of it --
+  // memtable pick and MANIFEST install are not included on either side of
+  // this comparison, so this is a bound, not an equality).
+  HistogramData flush_time, read_merge, write_block, finish, sync;
+  options.statistics->histogramData(FLUSH_TIME, &flush_time);
+  options.statistics->histogramData(FLUSH_READ_MERGE_MICROS, &read_merge);
+  options.statistics->histogramData(FLUSH_WRITE_BLOCK_MICROS, &write_block);
+  options.statistics->histogramData(FLUSH_FINISH_MICROS, &finish);
+  options.statistics->histogramData(TABLE_SYNC_MICROS, &sync);
+  EXPECT_LE(read_merge.sum + write_block.sum + finish.sum + sync.sum,
+            flush_time.sum);
+}
+
+// With both report_flush_time_breakdown and enable_hot_table set, the
+// HotTableDupCountingIterator wrapper (which observes the cold memtable's
+// flush scan to detect duplicate keys) should record its own added cost in
+// isolation via FLUSH_HOT_KEY_DETECT_MICROS.
+TEST_F(DBFlushTest, FlushTimeBreakdownHotKeyDetection) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.report_flush_time_breakdown = true;
+  options.enable_hot_table = true;
+  options.hot_table_write_buffer_size = 4096;
+  options.hot_table_max_value_size = 64;
+  ASSERT_OK(TryReopen(options));
+
+  for (int i = 0; i < 5; i++) {
+    ASSERT_OK(Put("dupkey", "value" + std::to_string(i)));
+  }
+  ASSERT_OK(Put("otherkey", "othervalue"));
+  ASSERT_OK(Flush());
+
+  HistogramData hot_data;
+  options.statistics->histogramData(FLUSH_HOT_KEY_DETECT_MICROS, &hot_data);
+  EXPECT_GE(hot_data.count, 1u);
+}
+
+// Recovery (DB close + reopen, which drives BuildTable() via the WAL replay
+// path in db_impl_open.cc) must stay unaffected: it never passes
+// phase_timings, so none of the new histograms should move, even with
+// report_flush_time_breakdown enabled.
+TEST_F(DBFlushTest, FlushTimeBreakdownNotRecordedDuringRecovery) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.report_flush_time_breakdown = true;
+  ASSERT_OK(TryReopen(options));
+
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(dbfull()->SyncWAL());
+
+  HistogramData before;
+  options.statistics->histogramData(FLUSH_READ_MERGE_MICROS, &before);
+  EXPECT_EQ(before.count, 0u);
+
+  ASSERT_OK(TryReopen(options));
+
+  HistogramData after;
+  options.statistics->histogramData(FLUSH_READ_MERGE_MICROS, &after);
+  EXPECT_EQ(after.count, before.count);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

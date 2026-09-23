@@ -183,6 +183,8 @@ void FlushJob::RecordFlushIOStats() {
                flush_iteration_stats_.num_record_drop_obsolete);
     flush_iteration_stats_.num_record_drop_obsolete = 0;
   }
+  RecordTick(stats_, FILTER_OPERATION_TOTAL_TIME,
+             flush_iteration_stats_.total_filter_time);
   ThreadStatusUtil::IncreaseThreadOperationProperty(
       ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
@@ -365,6 +367,10 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     } else {
       TEST_SYNC_POINT("FlushJob::InstallResults");
       // Replace immutable memtable with the generated Table
+      StopWatch install_sw(clock_, stats_,
+                           mutable_cf_options_.report_flush_time_breakdown
+                               ? FLUSH_INSTALL_MICROS
+                               : Histograms::HISTOGRAM_ENUM_MAX);
       s = cfd_->imm()->TryInstallMemtableFlushResults(
               cfd_, mems_, prep_tracker, versions_, db_mutex_,
               meta_.fd.GetNumber(), &job_context_->memtables_to_free, db_directory_,
@@ -930,9 +936,21 @@ class HotTableDupCountingIterator : public InternalIterator {
   // hot_table_max_scan_backoff_flushes discussion at
   // FlushJob::WriteLevel0Table()) and Observe() becomes a no-op, so wrapping
   // still costs only pure delegation.
+  // time_detection: gates whether Observe() also measures its own added
+  // cost (isolated from the wrapped iterator's delegated calls) into
+  // FLUSH_HOT_KEY_DETECT_MICROS. Off by default (see
+  // AdvancedColumnFamilyOptions::report_flush_time_breakdown); clock/stats
+  // are unused and may be nullptr when time_detection is false.
   HotTableDupCountingIterator(InternalIterator* iter, SpaceSavingTopK* tracker,
-                              bool probe)
-      : iter_(iter), tracker_(tracker), probe_(probe) {}
+                              bool probe, bool time_detection,
+                              SystemClock* clock = nullptr,
+                              Statistics* stats = nullptr)
+      : iter_(iter),
+        tracker_(tracker),
+        probe_(probe),
+        time_detection_(time_detection),
+        clock_(clock),
+        stats_(stats) {}
 
   ~HotTableDupCountingIterator() override {}
 
@@ -974,11 +992,25 @@ class HotTableDupCountingIterator : public InternalIterator {
       total_duplicate_entries_ += dup_count_;
       dup_count_ = 0;
     }
+    if (time_detection_) {
+      RecordTimeToHistogram(stats_, FLUSH_HOT_KEY_DETECT_MICROS,
+                            detect_nanos_ / 1000);
+    }
     return total_duplicate_entries_;
   }
 
  private:
   void Observe() {
+    if (time_detection_) {
+      StopWatchNano timer(clock_, /*auto_start=*/true);
+      ObserveImpl();
+      detect_nanos_ += timer.ElapsedNanos();
+    } else {
+      ObserveImpl();
+    }
+  }
+
+  void ObserveImpl() {
     if (!probe_ || !iter_->Valid()) {
       return;
     }
@@ -1001,10 +1033,17 @@ class HotTableDupCountingIterator : public InternalIterator {
   InternalIterator* const iter_;
   SpaceSavingTopK* const tracker_;
   const bool probe_;
+  const bool time_detection_;
+  SystemClock* const clock_;
+  Statistics* const stats_;
   std::string prev_user_key_;
   uint64_t dup_count_ = 0;
   uint64_t total_duplicate_entries_ = 0;
+  uint64_t detect_nanos_ = 0;
 };
+
+constexpr BuildTablePhaseTimings kFlushPhaseTimings{
+    FLUSH_READ_MERGE_MICROS, FLUSH_WRITE_BLOCK_MICROS, FLUSH_FINISH_MICROS};
 
 }  // namespace
 
@@ -1110,46 +1149,56 @@ Status FlushJob::WriteLevel0Table() {
       should_probe = (cfd_->cold_flush_counter() % interval == 0);
     }
     std::vector<HotTableDupCountingIterator*> dup_counting_iters;
-    for (ReadOnlyMemTable* m : mems_) {
-      ROCKS_LOG_INFO(db_options_.info_log,
-                     "[%s] [JOB %d] Flushing memtable id %" PRIu64
-                     " with next log file: %" PRIu64 ", marked_for_flush: %d\n",
-                     cfd_->GetName().c_str(), job_context_->job_id, m->GetID(),
-                     m->GetNextLogNumber(), m->IsMarkedForFlush());
-      InternalIterator* mem_iter;
-      if (logical_strip_timestamp) {
-        mem_iter = m->NewTimestampStrippingIterator(
-            ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-            /*prefix_extractor=*/nullptr, ts_sz);
-      } else {
-        mem_iter =
-            m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-                           /*prefix_extractor=*/nullptr, /*for_flush=*/true);
+    {
+      StopWatch mem_iterator_setup_sw(
+          clock_, stats_,
+          mutable_cf_options_.report_flush_time_breakdown
+              ? FLUSH_MEM_ITERATOR_SETUP_MICROS
+              : Histograms::HISTOGRAM_ENUM_MAX);
+      for (ReadOnlyMemTable* m : mems_) {
+        ROCKS_LOG_INFO(
+            db_options_.info_log,
+            "[%s] [JOB %d] Flushing memtable id %" PRIu64
+            " with next log file: %" PRIu64 ", marked_for_flush: %d\n",
+            cfd_->GetName().c_str(), job_context_->job_id, m->GetID(),
+            m->GetNextLogNumber(), m->IsMarkedForFlush());
+        InternalIterator* mem_iter;
+        if (logical_strip_timestamp) {
+          mem_iter = m->NewTimestampStrippingIterator(
+              ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+              /*prefix_extractor=*/nullptr, ts_sz);
+        } else {
+          mem_iter =
+              m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+                             /*prefix_extractor=*/nullptr, /*for_flush=*/true);
+        }
+        if (hot_table_scan_enabled) {
+          auto* dup_it =
+              new (arena.AllocateAligned(sizeof(HotTableDupCountingIterator)))
+                  HotTableDupCountingIterator(
+                      mem_iter, cfd_->space_saving_topk(), should_probe,
+                      mutable_cf_options_.report_flush_time_breakdown, clock_,
+                      stats_);
+          dup_counting_iters.push_back(dup_it);
+          memtables.push_back(dup_it);
+        } else {
+          memtables.push_back(mem_iter);
+        }
+        auto* range_del_iter =
+            logical_strip_timestamp
+                ? m->NewTimestampStrippingRangeTombstoneIterator(
+                      ro, kMaxSequenceNumber, ts_sz)
+                : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                                               true /* immutable_memtable */);
+        if (range_del_iter != nullptr) {
+          range_del_iters.emplace_back(range_del_iter);
+        }
+        total_num_input_entries += m->NumEntries();
+        total_num_deletes += m->NumDeletion();
+        total_data_size += m->GetDataSize();
+        total_memory_usage += m->ApproximateMemoryUsage();
+        total_num_range_deletes += m->NumRangeDeletion();
       }
-      if (hot_table_scan_enabled) {
-        auto* dup_it =
-            new (arena.AllocateAligned(sizeof(HotTableDupCountingIterator)))
-                HotTableDupCountingIterator(mem_iter, cfd_->space_saving_topk(),
-                                            should_probe);
-        dup_counting_iters.push_back(dup_it);
-        memtables.push_back(dup_it);
-      } else {
-        memtables.push_back(mem_iter);
-      }
-      auto* range_del_iter =
-          logical_strip_timestamp
-              ? m->NewTimestampStrippingRangeTombstoneIterator(
-                    ro, kMaxSequenceNumber, ts_sz)
-              : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
-                                             true /* immutable_memtable */);
-      if (range_del_iter != nullptr) {
-        range_del_iters.emplace_back(range_del_iter);
-      }
-      total_num_input_entries += m->NumEntries();
-      total_num_deletes += m->NumDeletion();
-      total_data_size += m->GetDataSize();
-      total_memory_usage += m->ApproximateMemoryUsage();
-      total_num_range_deletes += m->NumRangeDeletion();
     }
 
     if (hot_table_scan_enabled) {
@@ -1328,7 +1377,9 @@ Status FlushJob::WriteLevel0Table() {
           &table_properties_, write_hint, full_history_ts_low, blob_callback_,
           base_, &memtable_payload_bytes, &memtable_garbage_bytes, &flush_stats,
           blob_file_garbages_for_filtering, fast_sst_open_,
-          &flush_iteration_stats_);
+          &flush_iteration_stats_,
+          mutable_cf_options_.report_flush_time_breakdown ? &kFlushPhaseTimings
+                                                          : nullptr);
       flush_input_records_ = flush_stats.num_input_records;
       flush_output_records_ = flush_stats.num_output_records;
       flush_dropped_records_ = flush_stats.num_dropped_records;

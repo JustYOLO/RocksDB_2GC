@@ -21,6 +21,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/options.h"
+#include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
@@ -38,6 +39,24 @@ class TableCache;
 class TableBuilder;
 class WritableFileWriter;
 class BlobFileCompletionCallback;
+
+// Optional, caller-supplied set of Statistics histograms that BuildTable()
+// records a per-phase latency breakdown into. Left at the default
+// (HISTOGRAM_ENUM_MAX) for a given field, or omitted entirely (nullptr
+// phase_timings), that phase's timer is skipped -- StopWatch/StopWatchNano
+// no-op when given HISTOGRAM_ENUM_MAX, so callers that don't ask for this
+// (e.g. recovery, repair) pay no extra cost. Used to let flush attribute
+// this breakdown to its own histograms without BuildTable() needing to know
+// which caller (flush vs. recovery vs. repair) it is.
+struct BuildTablePhaseTimings {
+  // Accumulated time inside InternalIterator::Next() calls that pull
+  // records from the input iterator (read + merge + keep/drop decision).
+  Histograms read_merge_micros = Histograms::HISTOGRAM_ENUM_MAX;
+  // Accumulated time inside TableBuilder::Add() calls.
+  Histograms write_block_micros = Histograms::HISTOGRAM_ENUM_MAX;
+  // Time inside TableBuilder::Finish().
+  Histograms finish_micros = Histograms::HISTOGRAM_ENUM_MAX;
+};
 
 // Convenience function for NewTableBuilder on the embedded table_factory.
 TableBuilder* NewTableBuilder(const TableBuilderOptions& tboptions,
@@ -84,6 +103,7 @@ Status BuildTable(
     InternalStats::CompactionStats* flush_stats = nullptr,
     std::vector<BlobFileGarbage>* blob_file_garbages = nullptr,
     bool fast_sst_open = false,
-    CompactionIterationStats* compaction_iteration_stats = nullptr);
+    CompactionIterationStats* compaction_iteration_stats = nullptr,
+    const BuildTablePhaseTimings* phase_timings = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

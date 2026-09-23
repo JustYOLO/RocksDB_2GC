@@ -869,6 +869,30 @@ enum Histograms : uint32_t {
   // Distribution of total memtable memory usage for WBM-triggered flushes.
   FLUSH_WRITE_BUFFER_MANAGER_MEMTABLE_MEMORY_BYTES,
 
+  // Per-phase flush latency breakdown. Only recorded when
+  // AdvancedColumnFamilyOptions::report_flush_time_breakdown is set; off by
+  // default since it adds StopWatch/StopWatchNano instrumentation to flush.
+  //
+  // Time opening iterators over the memtable(s) being flushed.
+  FLUSH_MEM_ITERATOR_SETUP_MICROS,
+  // Accumulated time reading and k-way merging records out of the memtable
+  // iterators, including the keep/drop decision for each record (garbage
+  // collection is fused into this read, not a separate pass).
+  FLUSH_READ_MERGE_MICROS,
+  // Accumulated time writing surviving records into the output SST's blocks.
+  FLUSH_WRITE_BLOCK_MICROS,
+  // Time finalizing the output SST file (filter/index/footer blocks).
+  FLUSH_FINISH_MICROS,
+  // Time installing the flush result into the LSM tree (MANIFEST write).
+  FLUSH_INSTALL_MICROS,
+  // Time spent on HotTable hot-key detection (duplicate-key bookkeeping
+  // layered on top of the normal memtable's flush scan) when
+  // AdvancedColumnFamilyOptions::enable_hot_table is set. This is the only
+  // added cost a HotTable-enabled flush's normal memtable path pays relative
+  // to an ordinary flush -- see FLUSH_READ_MERGE_MICROS for the (unaffected)
+  // read/merge/garbage-drop cost shared by both.
+  FLUSH_HOT_KEY_DETECT_MICROS,
+
   HISTOGRAM_ENUM_MAX
 };
 

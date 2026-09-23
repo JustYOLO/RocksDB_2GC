@@ -201,6 +201,7 @@ struct MutableCFOptions {
             options.max_sequential_skip_in_iterations),
         paranoid_file_checks(options.paranoid_file_checks),
         report_bg_io_stats(options.report_bg_io_stats),
+        report_flush_time_breakdown(options.report_flush_time_breakdown),
         compression(options.compression),
         bottommost_compression(options.bottommost_compression),
         compression_opts(options.compression_opts),
@@ -274,6 +275,7 @@ struct MutableCFOptions {
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
         report_bg_io_stats(false),
+        report_flush_time_breakdown(false),
         compression(GetDefaultCompressionType()),
         bottommost_compression(kDisableCompressionOption),
         last_level_temperature(Temperature::kUnknown),
@@ -383,6 +385,7 @@ struct MutableCFOptions {
   uint64_t max_sequential_skip_in_iterations;
   bool paranoid_file_checks;
   bool report_bg_io_stats;
+  bool report_flush_time_breakdown;
   CompressionType compression;
   CompressionType bottommost_compression;
   CompressionOptions compression_opts;

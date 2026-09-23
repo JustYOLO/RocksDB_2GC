@@ -1789,6 +1789,12 @@ DEFINE_uint64(inplace_update_num_locks,
 
 DEFINE_bool(enable_hot_table, false,
             "Enable Adaptive In-Place Hot Table architecture");
+DEFINE_bool(report_flush_time_breakdown, false,
+            "Enable per-phase flush latency breakdown histograms (memtable "
+            "iterator setup, read+merge, SST block writes, file finish, "
+            "MANIFEST install, and -- with --enable_hot_table -- hot-key "
+            "detection). Adds measurement overhead to flush; off by "
+            "default.");
 DEFINE_uint64(hot_table_write_buffer_size, 64 * 1024 * 1024,
               "Size of Hot Table in bytes");
 DEFINE_uint32(hot_table_max_value_size, 1024,
@@ -5902,6 +5908,7 @@ class Benchmark {
     options.inplace_update_support = FLAGS_inplace_update_support;
     options.inplace_update_num_locks = FLAGS_inplace_update_num_locks;
     options.enable_hot_table = FLAGS_enable_hot_table;
+    options.report_flush_time_breakdown = FLAGS_report_flush_time_breakdown;
     options.hot_table_write_buffer_size = FLAGS_hot_table_write_buffer_size;
     options.hot_table_max_value_size = FLAGS_hot_table_max_value_size;
     options.virtual_flush_interval_flushes = FLAGS_virtual_flush_interval_flushes;
@@ -12199,9 +12206,10 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
       db_bench_exit(1);
     }
   }
-  if (FLAGS_statistics || FLAGS_enable_hot_table || FLAGS_hot_table_window_seconds > 0 ||
-      FLAGS_hot_table_window_ops > 0 || FLAGS_varying_window_ops > 0 ||
-      FLAGS_varying_window_seconds > 0) {
+  if (FLAGS_statistics || FLAGS_enable_hot_table ||
+      FLAGS_hot_table_window_seconds > 0 || FLAGS_hot_table_window_ops > 0 ||
+      FLAGS_varying_window_ops > 0 || FLAGS_varying_window_seconds > 0 ||
+      FLAGS_report_flush_time_breakdown) {
     if (!dbstats) {
       dbstats = ROCKSDB_NAMESPACE::CreateDBStatistics();
     }

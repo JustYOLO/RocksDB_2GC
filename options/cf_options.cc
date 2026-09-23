@@ -371,6 +371,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, report_bg_io_stats),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"report_flush_time_breakdown",
+         {offsetof(struct MutableCFOptions, report_flush_time_breakdown),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"disable_auto_compactions",
          {offsetof(struct MutableCFOptions, disable_auto_compactions),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -1336,6 +1340,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  paranoid_file_checks);
   ROCKS_LOG_INFO(log, "                       report_bg_io_stats: %d",
                  report_bg_io_stats);
+  ROCKS_LOG_INFO(log, "              report_flush_time_breakdown: %d",
+                 report_flush_time_breakdown);
   ROCKS_LOG_INFO(log, "                              compression: %d",
                  static_cast<int>(compression));
   ROCKS_LOG_INFO(log, "          experimental_mempurge_threshold: %f",
