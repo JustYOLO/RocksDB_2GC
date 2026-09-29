@@ -2124,8 +2124,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     bool should_switch_wal = (num_cfs > 1);
     if (!should_switch_wal) {
       for (auto cfd : *column_families) {
-        if (cfd->ioptions().enable_hot_table && cfd->hot_mem() &&
-            !cfd->hot_mem()->IsEmpty()) {
+        if (cfd->ioptions().enable_hot_table && cfd->ActiveHotTableHasData()) {
           should_switch_wal = true;
           break;
         }
@@ -2684,6 +2683,8 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
 
   for (const auto cfd : cfds) {
     cfd->Ref();
+    // The WAL limit also seals the HotTable, so its WALs can be released.
+    cfd->RequestHotTableSeal();
     status = SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
@@ -2740,11 +2741,14 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
       if (cfd->IsDropped()) {
         continue;
       }
-      if (!cfd->mem()->IsEmpty() && !cfd->imm()->IsFlushPendingOrRunning()) {
-        // We only consider flush on CFs with bytes in the mutable memtable,
-        // and no immutable memtables for which flush has yet to finish. If
-        // we triggered flush on CFs already trying to flush, we would risk
-        // creating too many immutable memtables leading to write stalls.
+      if ((!cfd->mem()->IsEmpty() || cfd->ActiveHotTableHasData()) &&
+          !cfd->imm()->IsFlushPendingOrRunning()) {
+        // We only consider flush on CFs with bytes in the mutable memtable
+        // (or, once a HotTable's memory is charged to this same
+        // WriteBufferManager, in its active HotTable), and no immutable
+        // memtables for which flush has yet to finish. If we triggered
+        // flush on CFs already trying to flush, we would risk creating too
+        // many immutable memtables leading to write stalls.
         uint64_t seq = cfd->mem()->GetCreationSeq();
         if (cfd_picked == nullptr || seq < seq_num_for_cf_picked) {
           cfd_picked = cfd;
@@ -2772,10 +2776,15 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
     nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
   }
   for (const auto cfd : cfds) {
-    if (cfd->mem()->IsEmpty()) {
+    if (cfd->mem()->IsEmpty() && !cfd->ActiveHotTableHasData()) {
       continue;
     }
     cfd->Ref();
+    // A HotTable's memory is charged to this same WriteBufferManager (see
+    // HotMemTable's AllocTracker use), so a flush triggered to relieve its
+    // pressure must also seal the HotTable, or that memory has no way to be
+    // released.
+    cfd->RequestHotTableSeal();
     status = SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
@@ -3076,7 +3085,10 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   flush_reasons.reserve(cfds.size());
   for (auto& cfd : cfds) {
     FlushReason flush_reason = FlushReason::kWriteBufferFull;
-    if (status.ok() && !cfd->mem()->IsEmpty()) {
+    // A requested HotTable seal switches the memtable even when it is empty.
+    if (status.ok() &&
+        (!cfd->mem()->IsEmpty() || (cfd->HotTableSealRequested() &&
+                                    cfd->ActiveHotTableHasData()))) {
       flush_reason = cfd->mem()->GetFlushReason();
       status = SwitchMemtable(cfd, context);
     }
@@ -3401,6 +3413,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context,
     cfd->blob_partition_manager()->RotateCurrentGeneration();
   }
 
+  cfd->OnMemtableSwitch(cfd->mem(), cur_wal_number_);
   cfd->mem()->SetNextLogNumber(cur_wal_number_);
   assert(new_mem != nullptr);
   cfd->imm()->Add(cfd->mem(), &context->memtables_to_free_);

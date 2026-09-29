@@ -47,6 +47,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class DBImpl;
+class HotMemTable;
 class MemTable;
 class SnapshotChecker;
 class TableCache;
@@ -160,6 +161,14 @@ class FlushJob {
   // process has not matured yet.
   Status MemPurge();
   bool MemPurgeDecider(double threshold);
+  // True if any picked memtable carries a sealed HotTable. MemPurge rewrites
+  // only memtable contents, so it must not run on such memtables.
+  bool MemtablesHaveSealedHotTable() const;
+  // Requires db_mutex held. After a successful flush: sweeps the hit counts
+  // of the flushed HotTables, then either stages the next HotTable (none
+  // active) or checks for a hot-key shift that should end the active one.
+  void UpdateHotTableAfterFlush(
+      const std::vector<HotMemTable*>& flushed_hot_mems);
   // The rate limiter priority (io_priority) is determined dynamically here.
   Env::IOPriority GetRateLimiterPriority();
   std::unique_ptr<FlushJobInfo> GetFlushJobInfo() const;

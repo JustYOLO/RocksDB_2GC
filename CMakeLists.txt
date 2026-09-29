@@ -799,7 +799,6 @@ set(SOURCES
         db/db_impl/db_impl_compaction_flush.cc
         db/db_impl/db_impl_files.cc
         db/db_impl/db_impl_follower.cc
-        db/db_impl/db_impl_hot_table.cc
         db/db_impl/db_impl_open.cc
         db/db_impl/db_impl_debug.cc
         db/db_impl/db_impl_experimental.cc
@@ -817,7 +816,6 @@ set(SOURCES
         db/flush_scheduler.cc
         db/forward_iterator.cc
         db/hot_memtable.cc
-        db/hot_table_flush_job.cc
         db/hot_table_router.cc
         db/import_column_family_job.cc
         db/internal_stats.cc

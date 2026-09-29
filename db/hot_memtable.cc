@@ -192,17 +192,24 @@ class HotMemTableIterator : public InternalIterator {
 };
 
 HotMemTable::HotMemTable(const InternalKeyComparator& cmp, size_t write_buffer_size,
-                         uint32_t max_val_size)
+                         uint32_t max_val_size,
+                         WriteBufferManager* write_buffer_manager)
     : internal_comparator_(cmp),
       write_buffer_size_(write_buffer_size > 0 ? write_buffer_size : 64 * 1024 * 1024),
       max_val_size_(max_val_size > 0 ? max_val_size : 1024),
-      index_(KeyComparatorWrapper{cmp.user_comparator()}) {}
+      index_(KeyComparatorWrapper{cmp.user_comparator()}),
+      mem_tracker_(write_buffer_manager) {}
 
 HotMemTable::~HotMemTable() {
   std::unique_lock<std::shared_mutex> lock(index_rwlock_);
   for (void* ptr : allocated_node_ptrs_) {
     free(ptr);
   }
+  lock.unlock();
+  // Mirrors MemTable's destructor: release this table's charge against the
+  // WriteBufferManager. Safe even if Close() (and thus DoneAllocating()) was
+  // never called, e.g. a table discarded while still pending.
+  mem_tracker_.FreeMem();
 }
 
 void HotMemTable::Close() {
@@ -213,6 +220,12 @@ void HotMemTable::Close() {
   // in hot_memtable.h and the fast-path lock-scope comment in
   // UpdateInPlace() for the full argument.
   std::unique_lock<std::shared_mutex> drain(index_rwlock_);
+  drain.unlock();
+  // No allocation can happen past this point (every allocating path rechecks
+  // closed_ immediately after acquiring index_rwlock_, and the drain above
+  // has waited out anything already past that check). Mirrors
+  // MemTable::MarkImmutable()'s mem_tracker_.DoneAllocating() call.
+  mem_tracker_.DoneAllocating();
 }
 
 bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
@@ -346,6 +359,11 @@ bool HotMemTable::UpdateInPlace(const Slice& user_key, const Slice& value,
     it->second = new_node;
     allocated_node_ptrs_.push_back(raw);
     allocated_bytes_.fetch_add(new_alloc_size, std::memory_order_relaxed);
+    if (!mem_tracker_.is_freed()) {
+      // Existing key growing its value slot: no new index_ entry, so no
+      // additional per-key overhead to charge.
+      mem_tracker_.Allocate(new_alloc_size);
+    }
     // Do not touch `node` (the old, now-detached node) beyond this point: any
     // reader that captured this pointer before the swap above may still be
     // mid-seqlock-read on it. new_node already carries the correct seq (set
@@ -419,6 +437,10 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
       it->second = new_node;
       allocated_node_ptrs_.push_back(raw);
       allocated_bytes_.fetch_add(new_alloc_size, std::memory_order_relaxed);
+      if (!mem_tracker_.is_freed()) {
+        // Existing key growing its value slot: no new index_ entry.
+        mem_tracker_.Allocate(new_alloc_size);
+      }
       // See UpdateInPlace(): do not mutate the old, now-detached node.
     }
 
@@ -457,7 +479,14 @@ bool HotMemTable::Add(const Slice& user_key, const Slice& value, ValueType type,
 
   index_[key_str] = node;
   allocated_node_ptrs_.push_back(raw);
-  allocated_bytes_.fetch_add(alloc_size, std::memory_order_relaxed);
+  // Brand-new key: also account for the index_ entry's own overhead (the
+  // std::map node plus its heap-allocated key copy), which allocated_bytes_
+  // otherwise never sees.
+  allocated_bytes_.fetch_add(alloc_size + kHotTableIndexOverheadBytes,
+                             std::memory_order_relaxed);
+  if (!mem_tracker_.is_freed()) {
+    mem_tracker_.Allocate(alloc_size + kHotTableIndexOverheadBytes);
+  }
 
   if (seq > 0) {
     SequenceNumber cur_earliest = earliest_seq_.load(std::memory_order_relaxed);

@@ -24,6 +24,7 @@
 #include "cache/cache_entry_stats.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
+#include "db/hot_memtable.h"
 #include "db/write_stall_stats.h"
 #include "port/port.h"
 #include "rocksdb/system_clock.h"
@@ -1314,18 +1315,35 @@ bool InternalStats::HandleBackgroundErrors(uint64_t* value, DBImpl* /*db*/,
 
 bool InternalStats::HandleCurSizeActiveMemTable(uint64_t* value, DBImpl* /*db*/,
                                                 Version* /*version*/) {
-  // Current size of the active memtable
+  // Current size of the active memtable, plus its active HotTable (if any):
+  // both accept writes for the same epoch, so both count as "active".
   // Using ApproximateMemoryUsageFast to avoid the need for synchronization
   *value = cfd_->mem()->ApproximateMemoryUsageFast();
+  if (cfd_->ioptions().enable_hot_table) {
+    std::shared_ptr<HotMemTable> hot = cfd_->hot_mem_shared();
+    if (hot != nullptr) {
+      *value += hot->ApproximateMemoryUsage();
+    }
+  }
   return true;
 }
 
 bool InternalStats::HandleCurSizeAllMemTables(uint64_t* value, DBImpl* /*db*/,
                                               Version* /*version*/) {
-  // Current size of the active memtable + immutable memtables
+  // Current size of the active memtable + immutable memtables, plus the
+  // active HotTable and any HotTables sealed with an unflushed immutable
+  // memtable (a pair's HotTable is never flushed separately from its
+  // memtable, so both are "unflushed" for exactly the same duration).
   // Using ApproximateMemoryUsageFast to avoid the need for synchronization
   *value = cfd_->mem()->ApproximateMemoryUsageFast() +
            cfd_->imm()->ApproximateUnflushedMemTablesMemoryUsage();
+  if (cfd_->ioptions().enable_hot_table) {
+    std::shared_ptr<HotMemTable> hot = cfd_->hot_mem_shared();
+    if (hot != nullptr) {
+      *value += hot->ApproximateMemoryUsage();
+    }
+    *value += cfd_->imm()->ApproximateSealedHotTablesMemoryUsage();
+  }
   return true;
 }
 
@@ -1334,6 +1352,19 @@ bool InternalStats::HandleSizeAllMemTables(uint64_t* value, DBImpl* /*db*/,
   // Using ApproximateMemoryUsageFast to avoid the need for synchronization
   *value = cfd_->mem()->ApproximateMemoryUsageFast() +
            cfd_->imm()->ApproximateMemoryUsage();
+  if (cfd_->ioptions().enable_hot_table) {
+    // Note: this only adds currently-unflushed HotTable memory, not memory
+    // from a sealed HotTable retained past its own flush purely for
+    // max_write_buffer_size_to_maintain history (imm()->ApproximateMemoryUsage()
+    // above does account for that for ordinary memtables). HotTables are not
+    // retained in that history list, so this is a slight undercount in that
+    // uncommon configuration only.
+    std::shared_ptr<HotMemTable> hot = cfd_->hot_mem_shared();
+    if (hot != nullptr) {
+      *value += hot->ApproximateMemoryUsage();
+    }
+    *value += cfd_->imm()->ApproximateSealedHotTablesMemoryUsage();
+  }
   return true;
 }
 

@@ -386,7 +386,8 @@ class ColumnFamilyData {
   MemTable* mem() { return mem_; }
 
   bool IsEmpty() {
-    return mem()->GetFirstSequenceNumber() == 0 && imm()->NumNotFlushed() == 0;
+    return mem()->GetFirstSequenceNumber() == 0 &&
+           imm()->NumNotFlushed() == 0 && !ActiveHotTableHasData();
   }
 
   Version* dummy_versions() { return dummy_versions_; }
@@ -486,57 +487,48 @@ class ColumnFamilyData {
     last_hot_write_hits_ = hits;
     last_hot_write_misses_ = misses;
   }
-  void ExecuteVirtualFlush();
-  // If db_mutex is non-null, the expensive part of the rebuild (extracting
-  // the top-K candidates from space_saving_topk_ and reseeding up to
-  // hot_table_write_buffer_size / (32 + hot_table_max_value_size) entries
-  // into the router and a fresh/live HotMemTable -- an O(capacity) amount
-  // of in-memory work that can run into the hundreds of milliseconds to
-  // low seconds at large capacities) runs with db_mutex unlocked, so it
-  // does not block every other write/flush/compaction in the DB for its
-  // duration. REQUIRES: db_mutex held by the caller on entry (and held
-  // again on return); safe to omit (pass nullptr) only for callers that
-  // already know they hold no lock worth releasing here.
-  void RebuildHotTable(bool was_physically_flushed = true,
-                       uint64_t flush_log_number = 0,
-                       InstrumentedMutex* db_mutex = nullptr);
+  // HotTable lifecycle. A HotTable is active while hot_mem_ is non-null and
+  // spans any number of memtables; its key set is fixed while it is active.
+  // It is sealed only together with the memtable being switched out, after
+  // RequestHotTableSeal() (HotTable full, WAL limit, explicit flush, hot-key
+  // shift). The pair is flushed into one SST. After that the CF runs with
+  // plain memtables until RebuildHotTable() has staged a pending HotTable and
+  // the next memtable switch activates it.
 
-  // Set by the write path (cheap, relaxed) the moment it observes hot_mem_
-  // has become full; consumed by DBImpl's background-rebuild dispatcher to
-  // decide whether a physical HotTable flush needs to be scheduled. This
-  // exists because ColumnFamilyData has no reachable DBImpl* to call the
-  // dispatcher directly from the write path.
-  void MarkHotRebuildNeeded() {
-    hot_rebuild_needed_.store(true, std::memory_order_relaxed);
-  }
-  // Atomically consumes the flag (true->false); returns whether it was set.
-  bool ConsumeHotRebuildNeeded() {
-    return hot_rebuild_needed_.exchange(false, std::memory_order_relaxed);
-  }
+  // Sweeps the per-key hit counts of a HotTable that is being flushed and
+  // applies decay/penalties to the hot-key tracker. REQUIRES: DB mutex held.
+  void ExecuteVirtualFlush(HotMemTable* flushed_hot_mem);
+  // Builds a fresh HotTable into the pending slot when no HotTable is
+  // active. `previous_epoch_active` tells whether the flush that triggered
+  // this call included a sealed HotTable. The expensive reseed (O(capacity)
+  // top-K extraction and inserts) runs with `db_mutex` released.
+  // REQUIRES: db_mutex held on entry and held again on return.
+  void RebuildHotTable(bool previous_epoch_active, InstrumentedMutex* db_mutex);
 
-  // Incremented once per ExecuteVirtualFlush() call (i.e. once per decay
-  // cycle: every virtual_flush_interval_flushes-th cold flush). Used to
-  // throttle background physical rebuilds -- see GetHotRebuildDecayEpoch()/
-  // SetHotRebuildDecayEpoch() below and their use in
-  // DBImpl::MaybeScheduleHotTableRebuild().
-  uint32_t BumpAndGetHotDecayEpoch() {
-    return hot_decay_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  // Asks the next memtable switch of this CF to seal the active HotTable
+  // together with the memtable being switched out. Thread-safe.
+  void RequestHotTableSeal() {
+    hot_seal_requested_.store(true, std::memory_order_relaxed);
   }
-  uint32_t GetHotDecayEpoch() const {
-    return hot_decay_epoch_.load(std::memory_order_acquire);
+  bool HotTableSealRequested() const {
+    return hot_seal_requested_.load(std::memory_order_relaxed);
   }
-  // The hot decay epoch (see above) as of the last dispatched background
-  // physical rebuild for this CF.
-  uint32_t GetHotRebuildDecayEpoch() const {
-    return hot_rebuild_decay_epoch_.load(std::memory_order_acquire);
-  }
-  void SetHotRebuildDecayEpoch(uint32_t epoch) {
-    hot_rebuild_decay_epoch_.store(epoch, std::memory_order_release);
-  }
+  // True if an active HotTable holds unflushed data.
+  bool ActiveHotTableHasData() const;
+  // Called by DBImpl::SwitchMemtable() right before `sealed_mem` is added to
+  // the immutable list; `new_wal_number` is the WAL the next memtable writes
+  // to. Seals the active HotTable with `sealed_mem` if requested, or
+  // activates a pending HotTable if none is active.
+  // REQUIRES: DB mutex held.
+  void OnMemtableSwitch(ReadOnlyMemTable* sealed_mem, uint64_t new_wal_number);
+  // Earliest WAL number still holding unflushed HotTable data (the active
+  // HotTable plus HotTables sealed with immutable memtables not in
+  // `excluded`), or max uint64 if none. REQUIRES: DB mutex held.
+  uint64_t MinHotTableLogNumberToKeep(
+      const autovector<ReadOnlyMemTable*>* excluded);
 
-  // Single-flight guard against two concurrent background HotTable physical
-  // rebuilds racing for the same CF (the event-driven write-path trigger and
-  // the periodic fallback check can both fire for the same fill event).
+  // Single-flight guard for RebuildHotTable(), which releases the DB mutex
+  // while reseeding.
   bool TryBeginHotTableRebuild() {
     bool expected = false;
     return hot_rebuild_in_flight_.compare_exchange_strong(expected, true);
@@ -802,13 +794,14 @@ class ColumnFamilyData {
   std::shared_ptr<HotTableRouter> hot_router_;
   // See hot_mem()/hot_router() above for what this guards.
   mutable port::RWMutex hot_table_ptr_mutex_;
-  // See MarkHotRebuildNeeded()/ConsumeHotRebuildNeeded() above.
-  std::atomic<bool> hot_rebuild_needed_{false};
+  // Rebuilt HotTable waiting to be activated by the next memtable switch.
+  // Guarded by the DB mutex.
+  std::shared_ptr<HotMemTable> pending_hot_mem_;
+  std::shared_ptr<HotTableRouter> pending_hot_router_;
+  // See RequestHotTableSeal() above.
+  std::atomic<bool> hot_seal_requested_{false};
   // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
   std::atomic<bool> hot_rebuild_in_flight_{false};
-  // See BumpAndGetHotDecayEpoch()/GetHotRebuildDecayEpoch() above.
-  std::atomic<uint32_t> hot_decay_epoch_{0};
-  std::atomic<uint32_t> hot_rebuild_decay_epoch_{0};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};

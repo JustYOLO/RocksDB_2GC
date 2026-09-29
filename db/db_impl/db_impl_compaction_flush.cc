@@ -387,12 +387,6 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     InstallSuperVersionAndScheduleWork(cfd, superversion_context);
-    // Opportunistic, cheap check: this cold flush's own RebuildHotTable()
-    // call (inside flush_job.Run() -> WriteLevel0Table()) may have just
-    // reseeded HotTable's router/table over its byte budget. This catches
-    // that case immediately rather than waiting for the coarser periodic
-    // fallback (see MaybeScheduleHotTableRebuild()'s comment in db_impl.h).
-    MaybeScheduleHotTableRebuild(cfd);
     if (made_progress) {
       *made_progress = true;
     }
@@ -2688,8 +2682,12 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
     // `LastSequence()`.
     MaybeSyncLastSequenceWithAllocatedForRecovery(flush_reason);
 
-    if (!cfd->mem()->IsEmpty() || !cached_recoverable_state_empty_.load() ||
+    if (!cfd->mem()->IsEmpty() || cfd->ActiveHotTableHasData() ||
+        !cached_recoverable_state_empty_.load() ||
         IsRecoveryFlush(flush_reason)) {
+      // Every explicit flush persists the HotTable together with the
+      // memtable being switched out.
+      cfd->RequestHotTableSeal();
       s = SwitchMemtable(cfd, &context);
     }
     const uint64_t flush_memtable_id = std::numeric_limits<uint64_t>::max();
@@ -2893,11 +2891,15 @@ Status DBImpl::AtomicFlushMemTables(
     }
 
     for (auto cfd : cfds) {
-      if (cfd->mem()->IsEmpty() && cached_recoverable_state_empty_.load() &&
+      if (cfd->mem()->IsEmpty() && !cfd->ActiveHotTableHasData() &&
+          cached_recoverable_state_empty_.load() &&
           !IsRecoveryFlush(flush_reason)) {
         continue;
       }
       cfd->Ref();
+      // Every explicit flush persists the HotTable together with the
+      // memtable being switched out.
+      cfd->RequestHotTableSeal();
       s = SwitchMemtable(cfd, &context);
       cfd->UnrefAndTryDelete();
       if (!s.ok()) {

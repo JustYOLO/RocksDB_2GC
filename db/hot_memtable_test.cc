@@ -7,12 +7,72 @@
 #include "db/hot_memtable.h"
 #include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
+#include "rocksdb/write_buffer_manager.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class HotMemTableTest : public testing::Test {};
+
+TEST_F(HotMemTableTest, NoWriteBufferManagerIsANoOp) {
+  // The default (null) WriteBufferManager must not crash and must not charge
+  // anything anywhere -- most existing tests in this file rely on this.
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot_table(cmp, 1024 * 1024, 256);
+  ASSERT_TRUE(hot_table.Add("k", "v", kTypeValue, 1));
+  ASSERT_TRUE(hot_table.UpdateInPlace("k", std::string(300, 'x'), kTypeValue, 2));
+  hot_table.Close();
+}
+
+TEST_F(HotMemTableTest, ChargesWriteBufferManagerOnInsertAndResize) {
+  WriteBufferManager wbm(1024 * 1024 * 1024 /* buffer_size */);
+  InternalKeyComparator cmp(BytewiseComparator());
+  auto hot_table =
+      std::make_unique<HotMemTable>(cmp, 1024 * 1024, 256, &wbm);
+  ASSERT_EQ(wbm.memory_usage(), 0u);
+
+  ASSERT_TRUE(hot_table->Add("k1", "v1", kTypeValue, 1));
+  const uint64_t after_first_insert = wbm.memory_usage();
+  ASSERT_GT(after_first_insert, 0u);
+  ASSERT_EQ(wbm.mutable_memtable_memory_usage(), after_first_insert);
+
+  // A second key adds strictly more.
+  ASSERT_TRUE(hot_table->Add("k2", "v2", kTypeValue, 2));
+  const uint64_t after_second_insert = wbm.memory_usage();
+  ASSERT_GT(after_second_insert, after_first_insert);
+
+  // Growing an existing key's value past its slot (a resize) also charges
+  // the manager, but does not add a second per-key index charge.
+  ASSERT_TRUE(hot_table->UpdateInPlace("k1", std::string(300, 'x'),
+                                       kTypeValue, 3));
+  const uint64_t after_resize = wbm.memory_usage();
+  ASSERT_GT(after_resize, after_second_insert);
+
+  // Close() (sealing) moves the charge out of the "active" bucket but keeps
+  // it in "used", mirroring MemTable::MarkImmutable().
+  hot_table->Close();
+  ASSERT_EQ(wbm.memory_usage(), after_resize);
+  ASSERT_EQ(wbm.mutable_memtable_memory_usage(), 0u);
+
+  // Destroying the table fully releases the charge.
+  hot_table.reset();
+  ASSERT_EQ(wbm.memory_usage(), 0u);
+}
+
+TEST_F(HotMemTableTest, DiscardedPendingTableStillReleasesCharge) {
+  // A HotTable built by RebuildHotTable() but discarded before ever being
+  // sealed (e.g. superseded by another pending table) must still release
+  // its charge on destruction, without ever calling Close().
+  WriteBufferManager wbm(1024 * 1024 * 1024);
+  InternalKeyComparator cmp(BytewiseComparator());
+  {
+    HotMemTable hot_table(cmp, 1024 * 1024, 256, &wbm);
+    ASSERT_TRUE(hot_table.Add("k1", "v1", kTypeValue, 1));
+    ASSERT_GT(wbm.memory_usage(), 0u);
+  }
+  ASSERT_EQ(wbm.memory_usage(), 0u);
+}
 
 TEST_F(HotMemTableTest, BasicInPlaceUpdateAndGet) {
   InternalKeyComparator cmp(BytewiseComparator());

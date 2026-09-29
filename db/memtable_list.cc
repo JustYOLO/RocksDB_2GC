@@ -12,6 +12,8 @@
 #include <string>
 
 #include "db/db_impl/db_impl.h"
+#include "db/hot_memtable.h"
+#include "db/hot_table_router.h"
 #include "db/memtable.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_set.h"
@@ -172,6 +174,23 @@ int MemTableList::NumNotFlushed() const {
 
 int MemTableList::NumFlushed() const { return current_->NumFlushed(); }
 
+namespace {
+// Returns the HotTable sealed with `m` if it may contain `user_key`.
+HotMemTable* SealedHotTableFor(const ReadOnlyMemTable* m,
+                               const Slice& user_key) {
+  HotMemTable* hot = m->sealed_hot_mem().get();
+  if (hot == nullptr || hot->IsEmpty()) {
+    return nullptr;
+  }
+  const HotTableRouter* router = m->sealed_hot_router().get();
+  if (router != nullptr && router->IsActive() &&
+      !router->MayContain(user_key)) {
+    return nullptr;
+  }
+  return hot;
+}
+}  // namespace
+
 // Search all the memtables starting from the most recent one.
 // Return the most recent value found, if any.
 // Operands stores the list of merge operations to apply, so far.
@@ -194,6 +213,39 @@ void MemTableListVersion::MultiGet(const ReadOptions& read_options,
   for (auto memtable : memlist_) {
     memtable->MultiGet(read_options, range, callback,
                        true /* immutable_memtable */, blob_fetcher);
+    if (range->empty()) {
+      return;
+    }
+    if (memtable->sealed_hot_mem() == nullptr) {
+      continue;
+    }
+    // Keys of a memtable and its sealed HotTable are disjoint, so the
+    // HotTable holds the newest version of any key found there.
+    for (auto iter = range->begin(); iter != range->end(); ++iter) {
+      if (!iter->s->ok()) {
+        continue;  // merge in progress or error: leave to the normal path
+      }
+      HotMemTable* hot = SealedHotTableFor(memtable, iter->ukey_without_ts);
+      std::string hot_val;
+      Status hot_s;
+      SequenceNumber hot_seq = 0;
+      if (hot == nullptr ||
+          !hot->Get(iter->ukey_without_ts, &hot_val, &hot_s, &hot_seq)) {
+        continue;
+      }
+      if (hot_s.IsNotFound() || iter->max_covering_tombstone_seq > hot_seq) {
+        *iter->s = Status::NotFound();
+      } else {
+        *iter->s = Status::OK();
+        if (iter->value != nullptr) {
+          *iter->value->GetSelf() = std::move(hot_val);
+          iter->value->PinSelf();
+        } else if (iter->columns != nullptr) {
+          iter->columns->SetPlainValue(std::move(hot_val));
+        }
+      }
+      range->MarkKeyDone(iter);
+    }
     if (range->empty()) {
       return;
     }
@@ -263,6 +315,31 @@ bool MemTableListVersion::GetFromList(
     if (!s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
       return false;
     }
+    if (s->ok()) {
+      // Keys of a memtable and its sealed HotTable are disjoint, so the
+      // HotTable holds the newest version of any key found there.
+      HotMemTable* hot = SealedHotTableFor(memtable, key.user_key());
+      std::string hot_val;
+      Status hot_s;
+      SequenceNumber hot_seq = 0;
+      if (hot != nullptr &&
+          hot->Get(key.user_key(), &hot_val, &hot_s, &hot_seq)) {
+        if (*seq == kMaxSequenceNumber) {
+          *seq = hot_seq;
+        }
+        if (hot_s.IsNotFound() || *max_covering_tombstone_seq > hot_seq) {
+          *s = Status::NotFound();
+        } else {
+          *s = Status::OK();
+          if (value != nullptr) {
+            *value = std::move(hot_val);
+          } else if (columns != nullptr) {
+            columns->SetPlainValue(std::move(hot_val));
+          }
+        }
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -295,6 +372,9 @@ void MemTableListVersion::AddIterators(
     iterator_list->push_back(m->NewIterator(options, seqno_to_time_mapping,
                                             arena, prefix_extractor,
                                             /*for_flush=*/false));
+    if (m->sealed_hot_mem() != nullptr && !m->sealed_hot_mem()->IsEmpty()) {
+      iterator_list->push_back(m->sealed_hot_mem()->NewIterator(arena));
+    }
   }
 }
 
@@ -306,6 +386,12 @@ void MemTableListVersion::AddIterators(
     SequenceNumber read_seq, const MultiScanArgs* scan_opts,
     const Comparator* user_comparator) {
   for (auto& m : memlist_) {
+    // Added before the scan-range pruning below, which only knows the
+    // memtable's own contents.
+    if (m->sealed_hot_mem() != nullptr && !m->sealed_hot_mem()->IsEmpty()) {
+      merge_iter_builder->AddIterator(
+          m->sealed_hot_mem()->NewIterator(merge_iter_builder->GetArena()));
+    }
     const bool should_probe_scan_intersection =
         scan_opts != nullptr && scan_opts->HasBoundedScanRanges() &&
         m->NumRangeDeletion() == 0;
@@ -792,6 +878,17 @@ size_t MemTableList::ApproximateUnflushedMemTablesMemoryUsage() {
   return total_size;
 }
 
+size_t MemTableList::ApproximateSealedHotTablesMemoryUsage() const {
+  size_t total_size = 0;
+  for (ReadOnlyMemTable* m : current_->memlist_) {
+    const std::shared_ptr<HotMemTable>& hot = m->sealed_hot_mem();
+    if (hot != nullptr) {
+      total_size += hot->ApproximateMemoryUsage();
+    }
+  }
+  return total_size;
+}
+
 size_t MemTableList::ApproximateMemoryUsage() { return current_memory_usage_; }
 
 size_t MemTableList::MemoryAllocatedBytesExcludingLast() const {
@@ -935,6 +1032,23 @@ uint64_t MemTableList::PrecomputeMinLogContainingPrepSection(
     }
   }
 
+  return min_log;
+}
+
+uint64_t MemTableList::MinSealedHotTableLogNumber(
+    const autovector<ReadOnlyMemTable*>* excluded) const {
+  uint64_t min_log = std::numeric_limits<uint64_t>::max();
+  for (ReadOnlyMemTable* m : current_->memlist_) {
+    const std::shared_ptr<HotMemTable>& hot = m->sealed_hot_mem();
+    if (hot == nullptr || hot->IsEmpty()) {
+      continue;
+    }
+    if (excluded != nullptr &&
+        std::find(excluded->begin(), excluded->end(), m) != excluded->end()) {
+      continue;
+    }
+    min_log = std::min<uint64_t>(min_log, hot->GetEarliestLogNumber());
+  }
   return min_log;
 }
 

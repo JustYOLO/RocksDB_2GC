@@ -208,6 +208,46 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     // enough to be observed.
     cf_options_.hot_table_consecutive_threshold_windows = 1;
   }
+
+  // Builds an immutable memtable holding `key_counts` (key -> number of
+  // versions) and flushes it with a standalone FlushJob.
+  void FlushMemtableWithKeys(
+      ColumnFamilyData* cfd,
+      const std::vector<std::pair<std::string, int>>& key_counts) {
+    JobContext job_context(0);
+    auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
+                                             kMaxSequenceNumber);
+    new_mem->Ref();
+    SequenceNumber seq = 1;
+    for (const auto& kc : key_counts) {
+      for (int i = 0; i < kc.second; i++) {
+        ASSERT_OK(new_mem->Add(seq++, kTypeValue, kc.first, "v", nullptr));
+      }
+    }
+    new_mem->ConstructFragmentedRangeTombstones();
+    autovector<ReadOnlyMemTable*> to_delete;
+    cfd->imm()->Add(new_mem, &to_delete);
+    for (auto& m : to_delete) {
+      delete m;
+    }
+    EventLogger event_logger(db_options_.info_log.get());
+    job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
+    FlushJob flush_job(
+        dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
+        std::numeric_limits<uint64_t>::max() /* memtable_id */,
+        env_options_, versions_.get(), &mutex_, &shutting_down_,
+        &job_context, FlushReason::kTest, nullptr, nullptr, nullptr,
+        kNoCompression, db_options_.statistics.get(), &event_logger, true,
+        true /* sync_output_directory */, true /* write_manifest */,
+        Env::Priority::USER, nullptr /*IOTracer*/,
+        empty_seqno_to_time_mapping_);
+    FileMetaData file_meta;
+    mutex_.Lock();
+    flush_job.PickMemTable();
+    ASSERT_OK(flush_job.Run(nullptr, &file_meta));
+    mutex_.Unlock();
+    job_context.Clean();
+  }
 };
 
 TEST_F(FlushJobTest, Empty) {
@@ -388,151 +428,63 @@ TEST_F(FlushJobHotTableTest, DuplicateScanFusedMatchesManualCount) {
   ASSERT_EQ(cfd->space_saving_topk()->QualifiedHeavyHittersCount(2), 2u);
 }
 
-TEST_F(FlushJobHotTableTest, HotKeyRangeShiftDecisionLagsOneFlush) {
+// With no HotTable active, a skewed flush stages a pending HotTable; it is
+// only used once the next memtable switch activates it.
+TEST_F(FlushJobHotTableTest, SkewedFlushStagesHotTableForNextSwitch) {
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  ASSERT_TRUE(cfd->hot_mem() != nullptr);
+  ASSERT_EQ(cfd->hot_mem(), nullptr);
 
-  // Populate the HotTable with one key so KeyCount() > 0, satisfying the
-  // "hot key range shift" branch's precondition in
-  // FlushJob::WriteLevel0Table().
-  ASSERT_TRUE(cfd->hot_mem()->Add("hot_key", "v", kTypeValue, /*seq=*/1));
-  ASSERT_GT(cfd->hot_mem()->KeyCount(), 0u);
+  FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
+  // Staged, not active.
+  ASSERT_EQ(cfd->hot_mem(), nullptr);
 
-  Statistics* stats = db_options_.statistics.get();
-
-  auto run_flush = [&](std::vector<std::pair<std::string, int>> key_counts) {
-    JobContext job_context(0);
-    auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
-                                             kMaxSequenceNumber);
-    new_mem->Ref();
-    SequenceNumber seq = 1;
-    for (const auto& kc : key_counts) {
-      for (int i = 0; i < kc.second; i++) {
-        ASSERT_OK(new_mem->Add(seq++, kTypeValue, kc.first, "v", nullptr));
-      }
-    }
-    new_mem->ConstructFragmentedRangeTombstones();
-    autovector<ReadOnlyMemTable*> to_delete;
-    cfd->imm()->Add(new_mem, &to_delete);
-    for (auto& m : to_delete) {
-      delete m;
-    }
-    EventLogger event_logger(db_options_.info_log.get());
-    job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
-    FlushJob flush_job(
-        dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
-        std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
-        versions_.get(), &mutex_, &shutting_down_, &job_context,
-        FlushReason::kTest, nullptr, nullptr, nullptr, kNoCompression, stats,
-        &event_logger, true, true /* sync_output_directory */,
-        true /* write_manifest */, Env::Priority::USER, nullptr /*IOTracer*/,
-        empty_seqno_to_time_mapping_);
-    FileMetaData file_meta;
-    mutex_.Lock();
-    flush_job.PickMemTable();
-    ASSERT_OK(flush_job.Run(nullptr, &file_meta));
-    mutex_.Unlock();
-    job_context.Clean();
-  };
-
-  // HOT_TABLE_PHYSICAL_FLUSH_COUNT is no longer a usable signal here: a
-  // "hot key range shift" detection now defers the actual physical flush to
-  // DBImpl's background rebuild job (see ColumnFamilyData::
-  // MarkHotRebuildNeeded()/ConsumeHotRebuildNeeded(), and the
-  // hot_needs_background_rebuild flag in FlushJob::WriteLevel0Table()) rather
-  // than flushing inline within this same FlushJob::Run() call, and this test
-  // exercises FlushJob in isolation with no live DBImpl to run that job. What
-  // this test actually verifies -- that the shift decision lags by exactly
-  // one flush window -- is now observed via ConsumeHotRebuildNeeded() instead.
-  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
-
-  // Flush #1: this flush's OWN cold memtable is heavily duplicated (a key
-  // repeated 20 times out of 21 entries -> ~95% duplicate ratio) -- clearly
-  // enough to trigger a "hot key range shift" rebuild if that decision used
-  // this flush's own, freshly-computed ratio. But at the point the decision
-  // is made (before BuildTable()), nothing has been recorded yet for this
-  // flush -- the ratio is still whatever the *previous* flush window left it
-  // at (0, initially) -- so it must NOT mark a rebuild as needed.
-  run_flush({{"unique_a", 1}, {"heavy_dup_1", 20}});
-  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
-
-  // Flush #2: also heavily duplicated (a different key, same ~95% ratio).
-  // Its "hot key range shift" decision reads flush #1's now-recorded ratio
-  // -- one flush late, exactly as designed (see the comment at the "hot key
-  // range shift" check in FlushJob::WriteLevel0Table()) -- so it marks a
-  // rebuild as needed this time.
-  run_flush({{"unique_b", 1}, {"heavy_dup_2", 20}});
-  ASSERT_TRUE(cfd->ConsumeHotRebuildNeeded());
-  // ConsumeHotRebuildNeeded() clears the flag once read.
-  ASSERT_FALSE(cfd->ConsumeHotRebuildNeeded());
+  mutex_.Lock();
+  cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
+  mutex_.Unlock();
+  ASSERT_NE(cfd->hot_mem(), nullptr);
+  ASSERT_NE(cfd->hot_router(), nullptr);
+  ASSERT_TRUE(cfd->hot_router()->MayContain("heavy_dup_1"));
+  // Seeded keys carry no data yet.
+  ASSERT_TRUE(cfd->hot_mem()->IsEmpty());
 }
 
-TEST_F(FlushJobHotTableTest, BonusRetainedUntilHotMemFull) {
+// While a HotTable is active, a coldtable flush full of duplicates with no
+// HotTable absorption is a hot-key shift and requests a seal; the active
+// HotTable itself is left untouched.
+TEST_F(FlushJobHotTableTest, HotKeyShiftRequestsSealOfActiveHotTable) {
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  ASSERT_TRUE(cfd->hot_mem() != nullptr);
+  FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
+  mutex_.Lock();
+  cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
+  mutex_.Unlock();
+  HotMemTable* active = cfd->hot_mem();
+  ASSERT_NE(active, nullptr);
+  ASSERT_FALSE(cfd->HotTableSealRequested());
 
-  // Drive RebuildHotTable() directly (a public method, exactly as
-  // flush_job.cc calls it: cfd_->RebuildHotTable(flush_hot_table,
-  // GetLogNumber())) rather than through a real flush. This deliberately
-  // decouples "is the workload skewed" from flush_job.cc's own,
-  // *independent* decision of whether to physically flush HotTable
-  // (flush_job.cc:1020 sets flush_hot_table=true whenever hot_mem()->IsFull()
-  // is already true going into a flush) -- if this test instead filled
-  // hot_mem_ and then ran a real flush, that flush's own IsFull()-triggered
-  // physical flush would replace hot_mem_ with a fresh, empty instance
-  // *inside the very same RebuildHotTable() call*, before this fix's
-  // fill-level check ever ran, defeating the test. Calling
-  // RebuildHotTable(was_physically_flushed=false, ...) directly lets this
-  // test hold that constant while independently controlling hot_mem_'s fill
-  // level, which is what this fix's decision actually keys off of.
-  //
-  // Force a high duplicate ratio so IsWorkloadSkewed() reads "skewed" on
-  // both calls below (recent_absorption_ratio_ stays 0 throughout, since no
-  // real HOT_TABLE_WRITE_HIT/MISS traffic is generated by directly calling
-  // RebuildHotTable(); duplicate ratio is therefore the only lever needed
-  // here, matching cf_options_.hot_table_min_duplicate_ratio = 0.20 and
-  // hot_table_consecutive_threshold_windows = 1 from the fixture).
+  FlushMemtableWithKeys(cfd, {{"unique_b", 1}, {"heavy_dup_2", 20}});
+  ASSERT_TRUE(cfd->HotTableSealRequested());
+  ASSERT_EQ(cfd->hot_mem(), active);
+}
+
+// A rebuilt HotTable must not start out full, or its first hot write would
+// immediately request a seal.
+TEST_F(FlushJobHotTableTest, StagedHotTableLeavesHeadroom) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  // Far more candidate keys than fit into the 1MB HotTable budget.
+  for (int i = 0; i < 20000; i++) {
+    cfd->space_saving_topk()->Update("candidate_" + std::to_string(i), 10);
+  }
   cfd->space_saving_topk()->RecordFlushWindow(/*total_cold_entries=*/100,
                                               /*duplicate_cold_entries=*/50,
                                               /*hot_hits=*/0,
                                               /*hot_misses=*/0);
-
-  // Call #1: hot_mem_ is still empty (fresh from the CF constructor). Under
-  // the old code, is_skewed becoming true here unconditionally stripped the
-  // bonus memtable slot; under the fix, hot_mem_ has spare capacity, so the
-  // bonus must be retained.
   mutex_.Lock();
-  cfd->RebuildHotTable(/*was_physically_flushed=*/false,
-                       /*flush_log_number=*/0);
+  cfd->RebuildHotTable(/*previous_epoch_active=*/false, &mutex_);
+  cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
   mutex_.Unlock();
-  int max_after_call1 =
-      cfd->GetLatestMutableCFOptions().max_write_buffer_number;
-
-  // Directly fill hot_mem_ past its configured budget (the fixture's 1MB
-  // hot_table_write_buffer_size) to deterministically exercise the "full"
-  // branch.
-  while (!cfd->hot_mem()->IsFull()) {
-    ASSERT_TRUE(cfd->hot_mem()->Add(
-        "padding_key_" + std::to_string(cfd->hot_mem()->KeyCount()), "v",
-        kTypeValue, /*seq=*/1));
-  }
-  ASSERT_TRUE(cfd->hot_mem()->IsFull());
-
-  // Call #2: workload is still skewed (ratio unchanged) and
-  // was_physically_flushed is still false, so the fetch/replace block in
-  // RebuildHotTable() retains this same, now-full hot_mem_ instead of
-  // swapping in a fresh one. The bonus must be revoked.
-  mutex_.Lock();
-  cfd->RebuildHotTable(/*was_physically_flushed=*/false,
-                       /*flush_log_number=*/0);
-  mutex_.Unlock();
-  int max_after_call2 =
-      cfd->GetLatestMutableCFOptions().max_write_buffer_number;
-
-  ASSERT_LT(max_after_call2, max_after_call1)
-      << "bonus slot should be revoked once hot_mem_ is full, but was still "
-         "granted (call1="
-      << max_after_call1 << ", call2=" << max_after_call2 << ")";
+  ASSERT_NE(cfd->hot_mem(), nullptr);
+  ASSERT_FALSE(cfd->hot_mem()->IsFull());
+  ASSERT_GT(cfd->hot_mem()->ApproximateMemoryUsage(), 0u);
 }
 
 TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {

@@ -749,17 +749,11 @@ ColumnFamilyData::ColumnFamilyData(
   if (ioptions_.enable_hot_table) {
     base_write_buffer_size_ = mutable_cf_options_.write_buffer_size;
     base_max_write_buffer_number_ = mutable_cf_options_.max_write_buffer_number;
-    // No locking needed here: Initialize() runs before this CF is published
-    // to any other thread.
-    hot_mem_ = std::make_shared<HotMemTable>(
-        internal_comparator_, ioptions_.hot_table_write_buffer_size,
-        ioptions_.hot_table_max_value_size);
+    // No HotTable until a flush finds the workload skewed and
+    // RebuildHotTable() stages one for the next memtable switch.
     size_t initial_cap = ioptions_.hot_table_write_buffer_size /
                          (32 + ioptions_.hot_table_max_value_size);
     if (initial_cap == 0) initial_cap = 1024;
-    hot_router_ = std::make_shared<HotTableRouter>(initial_cap);
-    // Initially start disabled to avoid bloom filter overhead during uniform/cold start
-    hot_router_->Disable();
     // Dynamically grant extra memtable count to absorb unused HotTable memory
     int extra_memtables = static_cast<int>(
         ioptions_.hot_table_write_buffer_size / base_write_buffer_size_);
@@ -777,53 +771,104 @@ ColumnFamilyData::ColumnFamilyData(
   }
 }
 
-void ColumnFamilyData::ExecuteVirtualFlush() {
-  std::shared_ptr<HotMemTable> hot_mem;
-  {
-    ReadLock l(&hot_table_ptr_mutex_);
-    hot_mem = hot_mem_;
-  }
-  if (!ioptions_.enable_hot_table || !hot_mem || !space_saving_topk_) {
+void ColumnFamilyData::ExecuteVirtualFlush(HotMemTable* flushed_hot_mem) {
+  if (!ioptions_.enable_hot_table || flushed_hot_mem == nullptr ||
+      !space_saving_topk_) {
     return;
   }
   std::unordered_map<std::string, uint32_t> hit_map;
-  hot_mem->SweepHits(&hit_map);
+  flushed_hot_mem->SweepHits(&hit_map);
   space_saving_topk_->ApplyDecayAndPenalties(hit_map);
-  BumpAndGetHotDecayEpoch();
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 }
 
-void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
-                                       uint64_t flush_log_number,
+bool ColumnFamilyData::ActiveHotTableHasData() const {
+  std::shared_ptr<HotMemTable> hot = hot_mem_shared();
+  return hot != nullptr && !hot->IsEmpty();
+}
+
+void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
+                                        uint64_t new_wal_number) {
+  if (!ioptions_.enable_hot_table) {
+    return;
+  }
+  const bool seal_requested =
+      hot_seal_requested_.exchange(false, std::memory_order_relaxed);
+  std::shared_ptr<HotMemTable> active_hot;
+  std::shared_ptr<HotTableRouter> active_router;
+  {
+    ReadLock l(&hot_table_ptr_mutex_);
+    active_hot = hot_mem_;
+    active_router = hot_router_;
+  }
+  Statistics* stats = ioptions_.statistics.get();
+  if (active_hot != nullptr) {
+    if (!seal_requested) {
+      // Memtable-only switch: the HotTable keeps absorbing writes.
+      return;
+    }
+    // Close() waits for any in-flight in-place update, so the sealed pair is
+    // final. The router stays enabled: readers of the sealed pair use it.
+    active_hot->Close();
+    sealed_mem->SetSealedHotTable(active_hot, active_router);
+    {
+      WriteLock l(&hot_table_ptr_mutex_);
+      hot_mem_.reset();
+      hot_router_.reset();
+    }
+    // Anything staged during the epoch that just ended is stale; the flush
+    // of this pair stages the next HotTable.
+    pending_hot_mem_.reset();
+    pending_hot_router_.reset();
+    ROCKS_LOG_INFO(ioptions_.info_log,
+                   "[%s] [HotTable] Sealed HotTable with memtable %" PRIu64,
+                   GetName().c_str(), sealed_mem->GetID());
+    return;
+  }
+  // `sealed_mem` is a temporary memtable that ran without a HotTable.
+  RecordTick(stats, HOT_TABLE_TEMP_MEMTABLE_COUNT);
+  if (pending_hot_mem_ == nullptr) {
+    return;
+  }
+  // Every write the new HotTable absorbs goes to `new_wal_number` or later.
+  pending_hot_mem_->ResetEarliestLogNumber(new_wal_number);
+  {
+    WriteLock l(&hot_table_ptr_mutex_);
+    hot_mem_ = std::move(pending_hot_mem_);
+    hot_router_ = std::move(pending_hot_router_);
+  }
+  pending_hot_mem_.reset();
+  pending_hot_router_.reset();
+  RecordTick(stats, HOT_TABLE_PAIR_ACTIVATION_COUNT);
+  ROCKS_LOG_INFO(ioptions_.info_log,
+                 "[%s] [HotTable] Activated pending HotTable",
+                 GetName().c_str());
+}
+
+uint64_t ColumnFamilyData::MinHotTableLogNumberToKeep(
+    const autovector<ReadOnlyMemTable*>* excluded) {
+  uint64_t min_log = imm_.MinSealedHotTableLogNumber(excluded);
+  std::shared_ptr<HotMemTable> active = hot_mem_shared();
+  if (active != nullptr && !active->IsEmpty()) {
+    min_log = std::min<uint64_t>(min_log, active->GetEarliestLogNumber());
+  }
+  return min_log;
+}
+
+void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
                                        InstrumentedMutex* db_mutex) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
-  // Single-flight guard for this function's entire body, covering both the
-  // was_physically_flushed==true (background-rebuild) and ==false
-  // (routine virtual-flush) cases uniformly. This is required once the
-  // expensive section below can run with db_mutex unlocked (see the
-  // comment there): without it, two calls for the same CF -- e.g. this
-  // routine virtual-flush call racing a background physical rebuild that
-  // already Close()d hot_mem_ but hasn't swapped it out yet -- could
-  // interleave, reseeding new candidate keys into the router (whose Add()
-  // always succeeds) while the corresponding HotMemTable::Add() calls
-  // silently no-op against an already-closed hot_mem_. That desyncs the
-  // router from hot_mem_ and produces router matches that can never
-  // actually hit.
-  //
-  // DBImpl::BackgroundCallHotTableRebuild() already holds this same guard
-  // (acquired via TryBeginHotTableRebuild() before dispatch) across its
-  // whole job -- including this call -- and explicitly EndHotTableRebuild()s
-  // right before calling in here, handing off ownership so the
-  // TryBeginHotTableRebuild() below succeeds instead of seeing "already
-  // held by myself" and bailing. That hand-off happens without ever
-  // unlocking db_mutex, so no third party can observe the guard as free
-  // in between. The inline deliberate-flush path in
-  // FlushJob::WriteLevel0Table() (kWalFull/kShutDown/kManualFlush) holds no
-  // guard at all beforehand, so it relies on acquiring it here directly.
+  // A HotTable only changes at an epoch boundary: while one is active its key
+  // set stays fixed, which keeps it disjoint from the memtables it spans.
+  if (hot_mem_shared() != nullptr) {
+    return;
+  }
+  // Two flushes of this CF can finish concurrently, and the reseed below runs
+  // with db_mutex released.
   if (!TryBeginHotTableRebuild()) {
-    return;  // A rebuild for this CF is already in flight elsewhere.
+    return;
   }
   struct GuardRelease {
     ColumnFamilyData* cfd;
@@ -834,160 +879,81 @@ void ColumnFamilyData::RebuildHotTable(bool was_physically_flushed,
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
 
-  std::shared_ptr<HotTableRouter> hot_router;
-  {
-    ReadLock l(&hot_table_ptr_mutex_);
-    hot_router = hot_router_;
-  }
-  // For a physical-flush-triggered rebuild, HotTable was necessarily active
-  // and full just moments ago (that is the only way this call happens) --
-  // don't re-derive "was active" from hot_router's current IsActive(),
-  // which DBImpl::BackgroundCallHotTableRebuild() has already forced to
-  // false (via HotTableRouter::Disable()) as part of the write-redirection
-  // cutover, before this call ever runs. Feeding that artificially-false
-  // signal into IsWorkloadSkewed() below would incorrectly exercise its
-  // "currently inactive" hysteresis branch (which requires several
-  // consecutive skewed windows before re-activating, and otherwise takes
-  // the early-return path just below -- leaving hot_mem_/hot_router_
-  // permanently stuck in their closed/disabled state and clearing
-  // space_saving_topk_ -- even though the workload never actually stopped
-  // being skewed).
-  bool currently_active =
-      was_physically_flushed || (hot_router && hot_router->IsActive());
+  const bool currently_active =
+      previous_epoch_active || pending_hot_mem_ != nullptr;
   bool is_skewed = true;
   if (space_saving_topk_) {
     is_skewed = space_saving_topk_->IsWorkloadSkewed(
-        currently_active,
-        ioptions_.hot_table_min_duplicate_ratio,
+        currently_active, ioptions_.hot_table_min_duplicate_ratio,
         ioptions_.hot_table_min_absorption_ratio,
         ioptions_.hot_table_consecutive_threshold_windows);
   }
+  int extra_memtables = static_cast<int>(ioptions_.hot_table_write_buffer_size /
+                                         base_write_buffer_size_);
+  if (extra_memtables < 1) extra_memtables = 1;
 
   if (!is_skewed) {
-    if (hot_router) {
-      hot_router->Disable();
-    }
+    pending_hot_mem_.reset();
+    pending_hot_router_.reset();
     if (space_saving_topk_) {
       space_saving_topk_->Clear();
     }
-    // Grant extra memtable count to absorb unused HotTable memory
-    int extra_memtables = static_cast<int>(
-        ioptions_.hot_table_write_buffer_size / base_write_buffer_size_);
-    if (extra_memtables < 1) extra_memtables = 1;
+    // HotTable is fully disabled (no active table, and none staged below):
+    // grant the bonus memtable count to absorb the memory it would
+    // otherwise have used.
     mutable_cf_options_.max_write_buffer_number =
         base_max_write_buffer_number_ + extra_memtables;
     return;
   }
 
-  // Workload is skewed -> HotTable stays/becomes active. Whether the cold
-  // path keeps borrowing the bonus memtable slot is decided at the end of
-  // this function, once hot_mem_'s post-rebuild fill level is known.
-
-  // `flush_log_number`, when set by the flush that triggered this rebuild
-  // (see FlushJob::Run(), which calls RebuildHotTable() before its own
-  // VersionEdit is applied via LogAndApply), is the log number that flush's
-  // edit is about to commit. GetLogNumber() at this point still returns the
-  // *previous* flush's committed value, since this flush's own edit hasn't
-  // landed yet. Seeding earliest_log_num_ from the stale GetLogNumber()
-  // would let it fall behind the log number this flush is about to commit;
-  // the next flush's clamp in FlushJob::PickMemTable() would then regress
-  // its own target log number below cfd_->GetLogNumber(), tripping
-  // VersionSet::LogAndApplyHelper's "edit->GetLogNumber() >=
-  // cfd->GetLogNumber()" monotonicity assertion and aborting the process.
-  uint64_t seed_log_number =
-      flush_log_number > 0 ? flush_log_number : GetLogNumber();
-
-  std::shared_ptr<HotMemTable> hot_mem;
-  {
-    ReadLock l(&hot_table_ptr_mutex_);
-    hot_mem = hot_mem_;
-  }
-  if (was_physically_flushed || !hot_mem) {
-    hot_mem = std::make_shared<HotMemTable>(
-        internal_comparator_, ioptions_.hot_table_write_buffer_size,
-        ioptions_.hot_table_max_value_size);
-    hot_mem->SetEarliestLogNumber(seed_log_number);
-    {
-      WriteLock l(&hot_table_ptr_mutex_);
-      hot_mem_ = hot_mem;
-    }
-    if (was_physically_flushed) {
-      RecordTick(ioptions_.statistics.get(), HOT_TABLE_PHYSICAL_FLUSH_COUNT);
-    }
-  }
-
+  auto new_hot = std::make_shared<HotMemTable>(
+      internal_comparator_, ioptions_.hot_table_write_buffer_size,
+      ioptions_.hot_table_max_value_size, write_buffer_mgr());
   auto new_router = std::make_shared<HotTableRouter>(capacity);
-
+  size_t seeded = 0;
   if (space_saving_topk_) {
-    // The rest of this block is the expensive part of a rebuild: GetTopK()
-    // extracts (and, for a large capacity, partially sorts) up to `capacity`
-    // candidates out of up to 2*capacity tracked entries, and the loop below
-    // performs up to `capacity` HotTableRouter::Add() bloom-filter inserts
-    // and HotMemTable::Add() std::map inserts (each with its own malloc).
-    // At the ~800K-entry capacities this feature is tuned for, this is
-    // O(capacity) in-memory work that has been measured taking hundreds of
-    // milliseconds to a couple of seconds. None of it touches db_mutex_-
-    // protected state: GetTopK()/ApplyDecayAndPenalties() on
-    // space_saving_topk_ are protected by that object's own internal mutex;
-    // new_router is a not-yet-published local object; hot_mem is either a
-    // not-yet-published fresh instance (was_physically_flushed) or the
-    // live one, whose Add() is protected by its own index_rwlock_
-    // independent of db_mutex_. So unlock db_mutex_ (when the caller passed
-    // one) for this section instead of blocking every other write, flush,
-    // and compaction in the DB for the full duration -- the
-    // TryBeginHotTableRebuild() guard above already ensures no other
-    // RebuildHotTable() call for this CF can run concurrently and observe
-    // torn state while it's unlocked.
+    // O(capacity) in-memory work that touches only space_saving_topk_ (own
+    // mutex) and the two unpublished objects above, so release db_mutex.
     if (db_mutex) {
       db_mutex->Unlock();
     }
     auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
     for (const auto& entry : top_keys) {
-      new_router->Add(entry.key);
-      if (hot_mem) {
-        // Same seed_log_number as above: Add()'s CAS-min update to
-        // earliest_log_num_ would otherwise drag a correctly-seeded value
-        // back down to the stale GetLogNumber().
-        hot_mem->Add(entry.key, Slice(), kTypeValue, 0, seed_log_number);
+      // Leave headroom: a HotTable that is already full when it becomes
+      // active would request its own seal on the first hot write.
+      const size_t node_bytes = sizeof(HotNode) + entry.key.size() +
+                                new_hot->MaxValueSize() +
+                                kHotTableIndexOverheadBytes;
+      if (new_hot->ApproximateMemoryUsage() + node_bytes >=
+          new_hot->WriteBufferSize()) {
+        break;
       }
+      new_router->Add(entry.key);
+      new_hot->Add(entry.key, Slice(), kTypeValue, /*seq=*/0, /*log_num=*/0);
+      ++seeded;
     }
     if (db_mutex) {
       db_mutex->Lock();
     }
-    ROCKS_LOG_INFO(
-        ioptions_.info_log,
-        "[%s] [HotTable] Rebuilt hot table router with %zu hot keys (capacity: %zu)",
-        GetName().c_str(), top_keys.size(), capacity);
   }
-  {
-    WriteLock l(&hot_table_ptr_mutex_);
-    hot_router_ = std::move(new_router);
+  if (hot_mem_shared() != nullptr) {
+    // A memtable switch activated an older pending HotTable meanwhile.
+    return;
   }
-
-  // Only revoke the cold path's bonus memtable slot once the HotMemTable
-  // that will actually be live going forward (post fetch/replace above, and
-  // after this window's top-k keys have been (re-)seeded into it) has
-  // genuinely used up its own byte budget. hot_mem is non-null in the
-  // normal enable_hot_table path (Initialize() always constructs hot_mem_,
-  // and the fetch/replace block above replaces it if it was ever null);
-  // treat a defensive null as "no verified spare capacity" and revert.
-  bool hot_mem_has_spare_capacity = hot_mem && !hot_mem->IsFull();
-  int extra_memtables = static_cast<int>(ioptions_.hot_table_write_buffer_size /
-                                         base_write_buffer_size_);
-  if (extra_memtables < 1) extra_memtables = 1;
-  mutable_cf_options_.max_write_buffer_number =
-      hot_mem_has_spare_capacity
-          ? base_max_write_buffer_number_ + extra_memtables
-          : base_max_write_buffer_number_;
-
-  ROCKS_LOG_INFO(
-      ioptions_.info_log,
-      "[%s] [HotTable] max_write_buffer_number %s (hot_mem usage: %zu/%zu "
-      "bytes)",
-      GetName().c_str(),
-      hot_mem_has_spare_capacity ? "kept at bonus level" : "reverted to base",
-      hot_mem ? hot_mem->ApproximateMemoryUsage() : size_t{0},
-      hot_mem ? hot_mem->WriteBufferSize() : size_t{0});
+  pending_hot_mem_ = std::move(new_hot);
+  pending_hot_router_ = std::move(new_router);
+  // A HotTable now exists (staged, and about to become active): its own
+  // memory budget replaces the bonus memtable capacity rather than adding to
+  // it. Granting both at once double-counts memory versus a comparable run
+  // with HotTable disabled -- this was measured directly in an EDBT2027
+  // Zipfian benchmark, where the previous rule (bonus revoked only once the
+  // live table was literally full) kept the bonus granted for 621 of 640
+  // decay windows, i.e. for almost the table's entire active lifetime.
+  mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
+  ROCKS_LOG_INFO(ioptions_.info_log,
+                 "[%s] [HotTable] Staged pending HotTable with %zu hot keys "
+                 "(capacity: %zu)",
+                 GetName().c_str(), seeded, capacity);
 }
 
 void ColumnFamilyData::DecayAndEvaluateLevelUpSkew() {
@@ -1122,14 +1088,8 @@ uint64_t ColumnFamilyData::OldestLogToKeep() {
     }
   }
 
-  std::shared_ptr<HotMemTable> hot_mem_for_log;
-  {
-    ReadLock l(&hot_table_ptr_mutex_);
-    hot_mem_for_log = hot_mem_;
-  }
-  if (ioptions_.enable_hot_table && hot_mem_for_log &&
-      !hot_mem_for_log->IsEmpty()) {
-    auto hot_log = hot_mem_for_log->GetEarliestLogNumber();
+  if (ioptions_.enable_hot_table) {
+    uint64_t hot_log = MinHotTableLogNumberToKeep(nullptr);
     if (hot_log > 0 && hot_log < current_log) {
       current_log = hot_log;
     }

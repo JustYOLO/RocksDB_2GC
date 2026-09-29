@@ -2315,13 +2315,19 @@ class MemTableInserter : public WriteBatch::Handler {
       if (hot_router && hot_router->IsActive() && hot_mem) {
         if (hot_router->MayContain(key)) {
           RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
-          if (hot_mem->UpdateInPlace(key, value, value_type, sequence_,
-                                     cfd->GetLogNumber())) {
+          // The earliest WAL of an active HotTable is set when it becomes
+          // active (ColumnFamilyData::OnMemtableSwitch()), so no log number
+          // is passed here.
+          if (hot_mem->UpdateInPlace(key, value, value_type, sequence_)) {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
-            if (hot_mem->IsFull()) {
-              cfd->MarkHotRebuildNeeded();
+            if (UNLIKELY(hot_mem->IsFull())) {
+              // A full HotTable is sealed together with the current
+              // memtable: request the seal and a switch of that memtable.
+              cfd->RequestHotTableSeal();
+              mem->RequestFlush();
+              CheckMemtableFull();
             }
             MaybeAdvanceSeq(false /* batch_boundary */);
             return Status::OK();
@@ -2564,13 +2570,15 @@ class MemTableInserter : public WriteBatch::Handler {
       if (hot_router && hot_router->IsActive() && hot_mem) {
         if (hot_router->MayContain(key)) {
           RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_ROUTER_MATCH);
-          if (hot_mem->UpdateInPlace(key, Slice(), delete_type, sequence_,
-                                     cfd->GetLogNumber())) {
+          if (hot_mem->UpdateInPlace(key, Slice(), delete_type, sequence_)) {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
-            if (hot_mem->IsFull()) {
-              cfd->MarkHotRebuildNeeded();
+            if (UNLIKELY(hot_mem->IsFull())) {
+              // See PutCFImpl(): seal the full HotTable with this memtable.
+              cfd->RequestHotTableSeal();
+              mem->RequestFlush();
+              CheckMemtableFull();
             }
             MaybeAdvanceSeq();
             return Status::OK();

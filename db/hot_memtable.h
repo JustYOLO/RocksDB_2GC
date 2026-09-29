@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "memory/allocator.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -22,6 +23,14 @@
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// A HotNode's index_ entry (std::map red-black node, plus the heap-allocated
+// key string copy used as the map key) costs roughly this many bytes beyond
+// the node's own tracked allocation size. Measured empirically (16-byte
+// keys, several value-size budgets); used as a fixed per-key estimate rather
+// than tracked exactly, matching how MemTable estimates its own arena/map
+// overhead elsewhere.
+constexpr size_t kHotTableIndexOverheadBytes = 128;
 
 struct HotNode {
   SpinMutex write_lock;
@@ -46,8 +55,15 @@ struct HotNode {
 
 class HotMemTable {
  public:
+  // `write_buffer_manager`, when non-null, is charged for every byte this
+  // table allocates (mirroring MemTable's own AllocTracker use), so the
+  // table's memory is visible to and enforced by the same
+  // WriteBufferManager as ordinary memtables. May be null (e.g. in unit
+  // tests that construct a HotMemTable directly), in which case no charging
+  // happens.
   HotMemTable(const InternalKeyComparator& cmp, size_t write_buffer_size,
-              uint32_t max_val_size);
+              uint32_t max_val_size,
+              WriteBufferManager* write_buffer_manager = nullptr);
   ~HotMemTable();
 
   // In-place update for an existing hot key.
@@ -135,6 +151,12 @@ class HotMemTable {
   mutable std::shared_mutex index_rwlock_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;
   std::vector<void*> allocated_node_ptrs_;
+
+  // Charges this table's allocations to the DB's WriteBufferManager, exactly
+  // like MemTable's own mem_tracker_: Allocate() on every node/index byte
+  // this table adds, DoneAllocating() once Close() seals it, FreeMem() on
+  // destruction. Safe to use with write_buffer_manager == nullptr (no-op).
+  AllocTracker mem_tracker_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

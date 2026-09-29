@@ -454,6 +454,7 @@ struct AdvancedColumnFamilyOptions {
   bool enable_hot_table = false;
   size_t hot_table_write_buffer_size = 64 * 1024 * 1024;
   uint32_t hot_table_max_value_size = 1024;
+  // Unused: HotTable hit counts are swept once per flushed HotTable.
   uint32_t virtual_flush_interval_flushes = 1;
   double hot_table_decay_factor = 0.5;
   double hot_table_zero_hit_penalty = 0.25;

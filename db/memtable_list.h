@@ -380,6 +380,10 @@ class MemTableList {
   // the unflushed mem-tables.
   size_t ApproximateUnflushedMemTablesMemoryUsage();
 
+  // Returns an estimate of the number of bytes used by HotTables sealed
+  // with the not-yet-flushed immutable memtables in this list.
+  size_t ApproximateSealedHotTablesMemoryUsage() const;
+
   // Returns an estimate of the timestamp of the earliest key.
   uint64_t ApproximateOldestKeyTime() const;
 
@@ -430,6 +434,13 @@ class MemTableList {
   uint64_t PrecomputeMinLogContainingPrepSection(
       const std::unordered_set<ReadOnlyMemTable*>* memtables_to_flush =
           nullptr) const;
+
+  // Smallest earliest-WAL number among non-empty HotTables sealed with the
+  // immutable memtables in this list, skipping memtables in `excluded`
+  // (may be null). Returns max uint64 if there is none.
+  // REQUIRES: DB mutex held.
+  uint64_t MinSealedHotTableLogNumber(
+      const autovector<ReadOnlyMemTable*>* excluded) const;
 
   uint64_t GetEarliestMemTableID() const {
     auto& memlist = current_->memlist_;

@@ -228,10 +228,12 @@ void FlushJob::PickMemTable() {
   // SetLogNumber(log_num) indicates logs with number smaller than log_num
   // will no longer be picked up for recovery.
   uint64_t target_log_number = max_next_log_number;
-  if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem() &&
-      !cfd_->hot_mem()->IsEmpty()) {
-    target_log_number =
-        std::min(target_log_number, cfd_->hot_mem()->GetEarliestLogNumber());
+  if (cfd_->ioptions().enable_hot_table) {
+    // Unflushed HotTable data (the active HotTable, and HotTables sealed with
+    // memtables that are not part of this flush) lives in WALs this flush
+    // must not release.
+    target_log_number = std::min(target_log_number,
+                                 cfd_->MinHotTableLogNumberToKeep(&mems_));
   }
   // Defensive backstop: SetLogNumber() must be monotonically non-decreasing
   // across flushes (VersionSet::LogAndApplyHelper asserts
@@ -267,9 +269,6 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   AutoThreadOperationStageUpdater stage_run(ThreadStatus::STAGE_FLUSH_RUN);
   if (cfd_->ioptions().enable_hot_table) {
     cfd_->IncrementColdFlushCounter();
-    if (cfd_->cold_flush_counter() % cfd_->ioptions().virtual_flush_interval_flushes == 0) {
-      cfd_->ExecuteVirtualFlush();
-    }
   }
   if (mems_.empty()) {
     ROCKS_LOG_BUFFER(log_buffer_, "[%s] No memtable to flush",
@@ -298,7 +297,8 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   Status mempurge_s = Status::NotFound("No MemPurge.");
   if ((mempurge_threshold > 0.0) &&
       (flush_reason_ == FlushReason::kWriteBufferFull) && (!mems_.empty()) &&
-      MemPurgeDecider(mempurge_threshold) && !(db_options_.atomic_flush)) {
+      !MemtablesHaveSealedHotTable() && MemPurgeDecider(mempurge_threshold) &&
+      !(db_options_.atomic_flush)) {
     cfd_->SetMempurgeUsed();
     mempurge_s = MemPurge();
     if (!mempurge_s.ok()) {
@@ -1054,32 +1054,9 @@ Status FlushJob::WriteLevel0Table() {
   const uint64_t start_micros = clock_->NowMicros();
   const uint64_t start_cpu_micros = clock_->CPUMicros();
   Status s;
-  // flush_hot_table: HotTable is flushed INLINE, synchronously, as part of
-  // this same job -- reserved for the deliberate flush reasons below, where
-  // the caller needs a synchronous "everything is durable in SST now"
-  // guarantee (WAL-size-limit relief, shutdown, manual Flush()).
-  //
-  // hot_needs_background_rebuild: HotTable is merely full (or a hot-key-range
-  // shift was detected), independent of why *this* cold flush happened. This
-  // is the common, steady-state case, and is deferred to
-  // DBImpl::MaybeScheduleHotTableRebuild()'s background job instead of
-  // running inline -- see db/hot_table_flush_job.h and the design doc. That
-  // job redirects writes via HotMemTable::Close() (rather than blocking them
-  // via a DB-wide stop token, which is what this function used to do here)
-  // and performs the actual flush off this thread entirely.
-  bool flush_hot_table = false;
-  bool hot_needs_background_rebuild = false;
-  if (cfd_->ioptions().enable_hot_table && cfd_->hot_mem()) {
-    if (flush_reason_ == FlushReason::kWalFull ||
-        flush_reason_ == FlushReason::kShutDown ||
-        flush_reason_ == FlushReason::kManualFlush) {
-      flush_hot_table = true;
-    } else if (cfd_->hot_mem()->IsFull()) {
-      hot_needs_background_rebuild = true;
-    }
-  }
-
-  FileMetaData hot_meta_;
+  // HotTables sealed with the memtables of this flush, in mems_ order.
+  std::vector<HotMemTable*> flushed_hot_mems;
+  uint64_t total_num_hot_entries = 0;
 
   meta_.temperature = mutable_cf_options_.default_write_temperature;
   file_options_.temperature = meta_.temperature;
@@ -1198,81 +1175,18 @@ Status FlushJob::WriteLevel0Table() {
         total_data_size += m->GetDataSize();
         total_memory_usage += m->ApproximateMemoryUsage();
         total_num_range_deletes += m->NumRangeDeletion();
-      }
-    }
-
-    if (hot_table_scan_enabled) {
-      // Flush hot table if:
-      // 1) WAL size limit reached (kWalFull) and HotTable has active data
-      // 2) Hot key range shift: absorption dropped while duplicate/garbage
-      // ratio is high
-      //
-      // These ratios reflect the PREVIOUS flush window's duplicate scan, not
-      // this one: the duplicate count for THIS flush's cold memtable(s) is
-      // now computed as a side effect of BuildTable()'s own traversal below,
-      // so it isn't known yet at this point. This lags the "hot key range
-      // shift" trigger by exactly one flush -- negligible in practice, and
-      // RebuildHotTable()'s activate/deactivate decision (which runs after
-      // BuildTable(), once this flush's fresh ratio is available) is
-      // unaffected.
-      if (!flush_hot_table && !hot_needs_background_rebuild &&
-          cfd_->hot_mem() && !cfd_->hot_mem()->IsEmpty()) {
-        if (flush_reason_ == FlushReason::kWalFull) {
-          // Unreachable in practice: the initial decision above already sets
-          // flush_hot_table (not this flag) whenever flush_reason_ ==
-          // kWalFull, which would have skipped this whole block via the
-          // !flush_hot_table guard. Kept as-is (translated to the new flag)
-          // to avoid changing pre-existing behavior/structure here.
-          hot_needs_background_rebuild = true;
-          ROCKS_LOG_INFO(db_options_.info_log,
-                         "[%s] [HotTable] WAL size limit reached (kWalFull). "
-                         "Flushing HotTable.",
-                         cfd_->GetName().c_str());
-        } else if (!cfd_->hot_mem()->IsEmpty()) {
-          double cur_abs =
-              cfd_->space_saving_topk()->GetRecentAbsorptionRatio();
-          double cur_dup = cfd_->space_saving_topk()->GetRecentDuplicateRatio();
-          if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
-              cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
-            hot_needs_background_rebuild = true;
-            ROCKS_LOG_INFO(
-                db_options_.info_log,
-                "[%s] [HotTable] Detected hot key range shift: absorption "
-                "dropped to %.2f%% (< %.1f%%), "
-                "while memtable duplicate/garbage ratio is %.2f%% (>= %.1f%%). "
-                "Flushing stale hot table and rebuilding with new hot keys.",
-                cfd_->GetName().c_str(), cur_abs * 100.0,
-                cfd_->ioptions().hot_table_min_absorption_ratio * 100.0,
-                cur_dup * 100.0,
-                cfd_->ioptions().hot_table_min_duplicate_ratio * 100.0);
-          }
+        if (m->sealed_hot_mem() != nullptr) {
+          // Key sets of a memtable and its sealed HotTable are disjoint, so
+          // the HotTable is one more child of the merging iterator and ends
+          // up in the same SST.
+          size_t hot_key_count = 0;
+          memtables.push_back(
+              m->sealed_hot_mem()->NewIterator(&arena, &hot_key_count));
+          total_num_hot_entries += hot_key_count;
+          total_data_size += m->sealed_hot_mem()->ApproximateMemoryUsage();
+          total_memory_usage += m->sealed_hot_mem()->ApproximateMemoryUsage();
+          flushed_hot_mems.push_back(m->sealed_hot_mem().get());
         }
-      }
-      if (hot_needs_background_rebuild) {
-        cfd_->MarkHotRebuildNeeded();
-      }
-    }
-
-    // hot_mem_'s iterator is no longer pushed into the shared `memtables`
-    // vector -- it gets its own, separate BuildTable() call further down.
-    // total_num_input_entries stays cold-only from here on: it feeds the
-    // cold BuildTable() call's own input-count correctness check below, and
-    // must not include HotTable's entries.
-    uint64_t hot_key_count_for_logging = 0;
-    if (flush_hot_table) {
-      // Estimate rather than call KeyCount() (an O(n) scan under hot_mem_'s
-      // own shared lock, for logging purposes only): db_mutex_ is already
-      // unlocked at this point (see the unlock above, before this block),
-      // so a concurrent background rebuild for this same CF (which holds
-      // that same lock exclusively per-Add() call in its reseed loop) could
-      // otherwise be blocked behind this scan for its entire duration.
-      hot_key_count_for_logging =
-          cfd_->hot_mem()->ApproximateMemoryUsage() /
-          (32 + cfd_->ioptions().hot_table_max_value_size);
-      total_data_size += cfd_->hot_mem()->ApproximateMemoryUsage();
-      total_memory_usage += cfd_->hot_mem()->ApproximateMemoryUsage();
-      if (max_next_log_number_ > 0) {
-        edit_->SetLogNumber(max_next_log_number_);
       }
     }
 
@@ -1295,8 +1209,7 @@ Status FlushJob::WriteLevel0Table() {
                          << "flush_started"
                          << "num_memtables" << mems_.size()
                          << "total_num_input_entries"
-                         << (total_num_input_entries +
-                             hot_key_count_for_logging)
+                         << (total_num_input_entries + total_num_hot_entries)
                          << "num_deletes" << total_num_deletes
                          << "total_data_size" << total_data_size
                          << "memory_usage" << total_memory_usage
@@ -1419,9 +1332,11 @@ Status FlushJob::WriteLevel0Table() {
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
-      if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
+      if (s.ok() && total_num_input_entries + total_num_hot_entries !=
+                        flush_stats.num_input_records) {
         std::string msg = "Expected " +
-                          std::to_string(total_num_input_entries) +
+                          std::to_string(total_num_input_entries +
+                                         total_num_hot_entries) +
                           " entries in memtables, but read " +
                           std::to_string(flush_stats.num_input_records);
         ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
@@ -1475,135 +1390,6 @@ Status FlushJob::WriteLevel0Table() {
                          : "",
                      meta_.marked_for_compaction ? " (needs compaction)" : "");
 
-    Status hot_s;
-    if (s.ok() && flush_hot_table) {
-      // Redirect (rather than block) writes for the duration of this inline
-      // hot-table flush: disable routing to this generation, then Close()
-      // it as the actual no-lost-write barrier (see HotMemTable::Close()'s
-      // comment). This replaces the DB-wide WriteController stop token that
-      // used to be acquired here -- Close() gives the identical guarantee
-      // scoped to just this CF's HotTable, with zero write blocking.
-      if (cfd_->hot_router()) {
-        cfd_->hot_router()->Disable();
-      }
-      cfd_->hot_mem()->Close();
-
-      hot_meta_.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
-      hot_meta_.epoch_number = cfd_->NewEpochNumber();
-      hot_meta_.temperature = meta_.temperature;
-
-      size_t hot_key_count = 0;
-      ScopedArenaPtr<InternalIterator> hot_iter(
-          cfd_->hot_mem()->NewIterator(&arena, &hot_key_count));
-
-      TableProperties hot_table_properties;
-      uint64_t hot_memtable_payload_bytes = 0, hot_memtable_garbage_bytes = 0;
-      InternalStats::CompactionStats hot_flush_stats(CompactionReason::kFlush,
-                                                     1);
-      IOStatus hot_io_s;
-
-      int64_t hot_current_time_raw = 0;
-      auto hot_time_status = clock_->GetCurrentTime(&hot_current_time_raw);
-      if (!hot_time_status.ok()) {
-        ROCKS_LOG_WARN(
-            db_options_.info_log,
-            "Failed to get current time to populate creation_time property "
-            "for HotTable flush. Status: %s",
-            hot_time_status.ToString().c_str());
-      }
-      const uint64_t hot_current_time =
-          static_cast<uint64_t>(hot_current_time_raw);
-      hot_meta_.oldest_ancester_time =
-          std::min(hot_current_time, meta_.oldest_ancester_time);
-      hot_meta_.file_creation_time = hot_current_time;
-
-      const std::string* const hot_full_history_ts_low =
-          (full_history_ts_low_.empty()) ? nullptr : &full_history_ts_low_;
-      ReadOptions hot_read_options(Env::IOActivity::kFlush);
-      hot_read_options.rate_limiter_priority = io_priority;
-      const WriteOptions hot_write_options(io_priority,
-                                           Env::IOActivity::kFlush);
-      TableBuilderOptions hot_tboptions(
-          cfd_->ioptions(), mutable_cf_options_, hot_read_options,
-          hot_write_options, cfd_->internal_comparator(),
-          cfd_->internal_tbl_prop_coll_factories(), output_compression_,
-          mutable_cf_options_.compression_opts, cfd_->GetID(), cfd_->GetName(),
-          0 /* level */, hot_current_time, false,
-          TableFileCreationReason::kFlush,
-          static_cast<int64_t>(hot_meta_.oldest_ancester_time),
-          hot_current_time, db_id_, db_session_id_, 0 /* target_file_size */,
-          hot_meta_.fd.GetNumber(),
-          preclude_last_level_min_seqno_ == kMaxSequenceNumber
-              ? preclude_last_level_min_seqno_
-              : std::min(earliest_snapshot_, preclude_last_level_min_seqno_));
-
-      hot_s = BuildTable(
-          dbname_, versions_, db_options_, hot_tboptions, file_options_,
-          cfd_->table_cache(), hot_iter.get(),
-          std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>(),
-          &hot_meta_, &blob_file_additions, job_context_->snapshot_seqs,
-          earliest_snapshot_, job_context_->earliest_write_conflict_snapshot,
-          job_context_->GetJobSnapshotSequence(),
-          job_context_->snapshot_checker,
-          mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
-          &hot_io_s, io_tracer_, BlobFileCreationReason::kFlush,
-          seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
-          &hot_table_properties, write_hint, hot_full_history_ts_low,
-          blob_callback_, base_, &hot_memtable_payload_bytes,
-          &hot_memtable_garbage_bytes, &hot_flush_stats,
-          blob_file_garbages_for_filtering, fast_sst_open_,
-          /*compaction_iteration_stats=*/nullptr);
-
-      assert(!hot_s.ok() || hot_io_s.ok());
-      hot_io_s.PermitUncheckedError();
-      if (hot_s.ok() && hot_key_count != hot_flush_stats.num_input_records) {
-        std::string msg = "Expected " + std::to_string(hot_key_count) +
-                          " entries in HotTable, but read " +
-                          std::to_string(hot_flush_stats.num_input_records);
-        ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
-                       cfd_->GetName().c_str(), job_context_->job_id,
-                       msg.c_str());
-        if (db_options_.flush_verify_memtable_count) {
-          hot_s = Status::Corruption(msg);
-        }
-      }
-      if (hot_s.ok() &&
-          (mutable_cf_options_.table_factory->IsInstanceOf(
-               TableFactory::kBlockBasedTableName()) ||
-           mutable_cf_options_.table_factory->IsInstanceOf(
-               TableFactory::kPlainTableName())) &&
-          hot_flush_stats.num_output_records !=
-              hot_table_properties.num_entries) {
-        hot_s = Status::Corruption(
-            "Number of keys in HotTable flush output SST does not match "
-            "number of keys added to the table.");
-      }
-      RecordTick(stats_, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH,
-                 hot_memtable_payload_bytes);
-      RecordTick(stats_, MEMTABLE_GARBAGE_BYTES_AT_FLUSH,
-                 hot_memtable_garbage_bytes);
-      LogFlush(db_options_.info_log);
-
-      flush_input_records_ += hot_flush_stats.num_input_records;
-      flush_output_records_ += hot_flush_stats.num_output_records;
-      flush_dropped_records_ += hot_flush_stats.num_dropped_records;
-      flush_stats.num_input_records += hot_flush_stats.num_input_records;
-      flush_stats.num_dropped_records += hot_flush_stats.num_dropped_records;
-      flush_stats.num_output_records += hot_flush_stats.num_output_records;
-      flush_stats.bytes_written_pre_comp +=
-          hot_flush_stats.bytes_written_pre_comp;
-      flush_stats.cpu_micros += hot_flush_stats.cpu_micros;
-
-      ROCKS_LOG_BUFFER(log_buffer_,
-                       "[%s] [JOB %d] Level-0 flush table #%" PRIu64
-                       " (HotTable): %" PRIu64 " bytes %s",
-                       cfd_->GetName().c_str(), job_context_->job_id,
-                       hot_meta_.fd.GetNumber(), hot_meta_.fd.GetFileSize(),
-                       hot_s.ToString().c_str());
-
-      s = hot_s;
-    }
-
     if (s.ok() && output_file_directory_ != nullptr && sync_output_directory_) {
       s = output_file_directory_->FsyncWithDirOptions(
           IOOptions(), nullptr,
@@ -1618,7 +1404,6 @@ Status FlushJob::WriteLevel0Table() {
   // added to the manifest. Blob metadata updates may still need to be
   // committed for direct-write files or flush-time filtering.
   const bool has_output = meta_.fd.GetFileSize() > 0;
-  const bool has_hot_output = flush_hot_table && hot_meta_.fd.GetFileSize() > 0;
 
   if (s.ok()) {
     if (has_output) {
@@ -1630,9 +1415,6 @@ Status FlushJob::WriteLevel0Table() {
       // Add file to L0
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
-    }
-    if (has_hot_output) {
-      edit_->AddFile(0 /* level */, hot_meta_);
     }
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
@@ -1668,10 +1450,6 @@ Status FlushJob::WriteLevel0Table() {
     bytes_written += meta_.fd.GetFileSize();
     num_output_files += 1;
   }
-  if (has_hot_output) {
-    bytes_written += hot_meta_.fd.GetFileSize();
-    num_output_files += 1;
-  }
   flush_stats.bytes_written = bytes_written;
   flush_stats.num_output_files = num_output_files;
 
@@ -1692,8 +1470,8 @@ Status FlushJob::WriteLevel0Table() {
   RecordFlushIOStats();
 
   if (s.ok()) {
-    if (cfd_->ioptions().enable_hot_table && cfd_->hot_router()) {
-      cfd_->RebuildHotTable(flush_hot_table, GetLogNumber(), db_mutex_);
+    if (cfd_->ioptions().enable_hot_table) {
+      UpdateHotTableAfterFlush(flushed_hot_mems);
     }
     if (cfd_->ioptions().enable_level_up_compaction) {
       cfd_->DecayAndEvaluateLevelUpSkew();
@@ -1701,6 +1479,49 @@ Status FlushJob::WriteLevel0Table() {
   }
 
   return s;
+}
+
+bool FlushJob::MemtablesHaveSealedHotTable() const {
+  for (const ReadOnlyMemTable* m : mems_) {
+    if (m->sealed_hot_mem() != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void FlushJob::UpdateHotTableAfterFlush(
+    const std::vector<HotMemTable*>& flushed_hot_mems) {
+  db_mutex_->AssertHeld();
+  for (HotMemTable* hot : flushed_hot_mems) {
+    cfd_->ExecuteVirtualFlush(hot);
+    RecordTick(stats_, HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+  }
+  if (cfd_->hot_mem() == nullptr) {
+    // Between HotTable epochs: stage the next HotTable (or decide the
+    // workload is not skewed enough for one).
+    cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
+    return;
+  }
+  SpaceSavingTopK* tracker = cfd_->space_saving_topk();
+  if (tracker == nullptr || cfd_->HotTableSealRequested()) {
+    return;
+  }
+  // Hot-key shift: the active HotTable absorbs few writes while the memtable
+  // flushed just now is full of duplicate keys, so end this epoch and let the
+  // next HotTable be built from the current hot keys.
+  const double cur_abs = tracker->GetRecentAbsorptionRatio();
+  const double cur_dup = tracker->GetRecentDuplicateRatio();
+  if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
+      cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [HotTable] Hot key shift detected (absorption "
+                   "%.2f%%, duplicates %.2f%%): sealing HotTable with the "
+                   "current memtable",
+                   cfd_->GetName().c_str(), cur_abs * 100.0, cur_dup * 100.0);
+    cfd_->RequestHotTableSeal();
+    cfd_->mem()->RequestFlush();
+  }
 }
 
 Env::IOPriority FlushJob::GetRateLimiterPriority() {

@@ -42,6 +42,8 @@ namespace ROCKSDB_NAMESPACE {
 class BlobFetcher;
 class BlobFilePartitionManager;
 struct FlushJobInfo;
+class HotMemTable;
+class HotTableRouter;
 class Mutex;
 class MemTableIterator;
 class MergeContext;
@@ -405,6 +407,23 @@ class ReadOnlyMemTable {
 
   uint64_t GetID() const { return id_; }
 
+  // The HotTable that was sealed together with this memtable (see
+  // ColumnFamilyData::OnMemtableSwitch()), or null. Set at most once, under
+  // the DB mutex, before this memtable is published in an immutable memtable
+  // list, and never changed afterwards, so readers of the immutable list need
+  // no extra synchronization.
+  void SetSealedHotTable(std::shared_ptr<HotMemTable> hot_mem,
+                         std::shared_ptr<HotTableRouter> hot_router) {
+    sealed_hot_mem_ = std::move(hot_mem);
+    sealed_hot_router_ = std::move(hot_router);
+  }
+  const std::shared_ptr<HotMemTable>& sealed_hot_mem() const {
+    return sealed_hot_mem_;
+  }
+  const std::shared_ptr<HotTableRouter>& sealed_hot_router() const {
+    return sealed_hot_router_;
+  }
+
   void SetFlushCompleted(bool completed) { flush_completed_ = completed; }
 
   uint64_t GetFileNumber() const { return file_number_; }
@@ -574,6 +593,8 @@ class ReadOnlyMemTable {
 
   std::shared_ptr<BlobFilePartitionManager> protected_blob_file_manager_;
   std::vector<uint64_t> protected_blob_file_numbers_;
+  std::shared_ptr<HotMemTable> sealed_hot_mem_;
+  std::shared_ptr<HotTableRouter> sealed_hot_router_;
 };
 
 class MemTable final : public ReadOnlyMemTable {
@@ -645,6 +666,16 @@ class MemTable final : public ReadOnlyMemTable {
   // Returns true if a flush has already been scheduled for this memtable
   bool HasFlushScheduled() const {
     return flush_state_.load(std::memory_order_relaxed) == FLUSH_SCHEDULED;
+  }
+
+  // Requests that this memtable be switched out and flushed at the next
+  // opportunity regardless of its size. No-op if a flush is already requested
+  // or scheduled. Thread-safe.
+  void RequestFlush() {
+    auto before = FLUSH_NOT_REQUESTED;
+    flush_state_.compare_exchange_strong(before, FLUSH_REQUESTED,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed);
   }
 
   InternalIterator* NewIterator(

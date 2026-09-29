@@ -152,6 +152,10 @@ enum Tickers : uint32_t {
   HOT_TABLE_ROUTER_FALSE_POSITIVES,
   HOT_TABLE_VIRTUAL_FLUSH_COUNT,
   HOT_TABLE_PHYSICAL_FLUSH_COUNT,
+  // # of times a staged HotTable became active at a memtable switch.
+  HOT_TABLE_PAIR_ACTIVATION_COUNT,
+  // # of memtables sealed while no HotTable was active.
+  HOT_TABLE_TEMP_MEMTABLE_COUNT,
 
   // Level Up Compaction tickers
   LEVEL_UP_KEY_CHECKED,
