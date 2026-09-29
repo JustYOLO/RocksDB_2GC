@@ -3422,7 +3422,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
         RecordTick(stats_, MEMTABLE_HIT);
       }
-    } else {
+    } else if (!done) {
+      // A HotTable hit above already set `done` (and `s`); this branch is
+      // only for GetMergeOperands(), and must not re-read the memtables and
+      // overwrite `s` with an older entry (e.g. a tombstone).
+      //
       // Get Merge Operands associated with key, Merge Operands should not be
       // merged and raw values should be returned to the user.
       if (sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr,
