@@ -778,8 +778,32 @@ void ColumnFamilyData::ExecuteVirtualFlush(HotMemTable* flushed_hot_mem) {
   }
   std::unordered_map<std::string, uint32_t> hit_map;
   flushed_hot_mem->SweepHits(&hit_map);
-  space_saving_topk_->ApplyDecayAndPenalties(hit_map);
+  // A table sealed before it served even one whole memtable (e.g. an
+  // explicit flush right after activation) has mostly-zero hit counts that
+  // say nothing about which keys went cold. Penalizing them would shrink the
+  // next HotTable's key set for no reason, so only merge the hits it did see.
+  // A table that filled up did serve plenty of writes, whatever the count.
+  const bool hits_are_meaningful =
+      flushed_hot_mem->ObservedFlushes() > 0 || flushed_hot_mem->IsFull();
+  space_saving_topk_->ApplyDecayAndPenalties(hit_map, hits_are_meaningful);
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
+}
+
+bool ColumnFamilyData::AddHotShiftObservation(const HotShiftWindow& flush,
+                                              uint32_t window_flushes,
+                                              HotShiftWindow* out) {
+  ++active_hot_observed_flushes_;
+  hot_shift_window_.flushes += 1;
+  hot_shift_window_.probed_entries += flush.probed_entries;
+  hot_shift_window_.duplicate_entries += flush.duplicate_entries;
+  hot_shift_window_.hits += flush.hits;
+  hot_shift_window_.misses += flush.misses;
+  if (hot_shift_window_.flushes < std::max<uint32_t>(window_flushes, 1)) {
+    return false;
+  }
+  *out = hot_shift_window_;
+  hot_shift_window_ = HotShiftWindow();
+  return true;
 }
 
 bool ColumnFamilyData::ActiveHotTableHasData() const {
@@ -810,6 +834,7 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
     // Close() waits for any in-flight in-place update, so the sealed pair is
     // final. The router stays enabled: readers of the sealed pair use it.
     active_hot->Close();
+    active_hot->SetObservedFlushes(active_hot_observed_flushes_);
     sealed_mem->SetSealedHotTable(active_hot, active_router);
     {
       WriteLock l(&hot_table_ptr_mutex_);
@@ -839,6 +864,11 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
   }
   pending_hot_mem_.reset();
   pending_hot_router_.reset();
+  // `sealed_mem` and everything older was written without this HotTable;
+  // the hot-key-shift check must only judge it on memtables after that.
+  hot_activation_boundary_id_ = sealed_mem->GetID();
+  hot_shift_window_ = HotShiftWindow();
+  active_hot_observed_flushes_ = 0;
   RecordTick(stats, HOT_TABLE_PAIR_ACTIVATION_COUNT);
   ROCKS_LOG_INFO(ioptions_.info_log,
                  "[%s] [HotTable] Activated pending HotTable",

@@ -1800,7 +1800,8 @@ DEFINE_uint64(hot_table_write_buffer_size, 64 * 1024 * 1024,
 DEFINE_uint32(hot_table_max_value_size, 1024,
               "Max value padding for in-place Hot Table nodes in bytes");
 DEFINE_uint32(virtual_flush_interval_flushes, 1,
-              "Cold flushes per Virtual Flush sweep");
+              "Flushes of HotTable-era memtables observed together before "
+              "deciding whether a hot-key shift should end the HotTable");
 DEFINE_double(hot_table_decay_factor, 0.5,
               "Aging decay factor for History Tracker");
 DEFINE_double(hot_table_zero_hit_penalty, 0.25,

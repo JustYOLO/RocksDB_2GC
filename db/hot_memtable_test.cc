@@ -217,6 +217,28 @@ TEST_F(HotMemTableTest, SpaceSavingTopKDecayAndPenalties) {
   }
 }
 
+// A sweep from a HotTable that was active too briefly only adds its hits:
+// no global decay, and no zero-hit penalty for keys it never got to see.
+TEST_F(HotMemTableTest, SpaceSavingTopKSweepWithoutDecayOrPenalties) {
+  SpaceSavingTopK tracker(10, 0.5 /* decay_factor */,
+                          0.25 /* zero_hit_penalty */);
+  tracker.Update("key_hot", 100);
+  tracker.Update("key_warm", 40);
+
+  std::unordered_map<std::string, uint32_t> sweep_hits;
+  sweep_hits["key_hot"] = 5;
+  sweep_hits["key_warm"] = 0;
+  tracker.ApplyDecayAndPenalties(sweep_hits,
+                                 /*apply_decay_and_penalties=*/false);
+
+  auto top = tracker.GetTopK(2);
+  ASSERT_EQ(top.size(), 2);
+  ASSERT_EQ(top[0].key, "key_hot");
+  ASSERT_EQ(top[0].count, 105);
+  ASSERT_EQ(top[1].key, "key_warm");
+  ASSERT_EQ(top[1].count, 40);
+}
+
 TEST_F(HotMemTableTest, IteratorSeekAndSortedOrder) {
   InternalKeyComparator cmp(BytewiseComparator());
   HotMemTable hot_table(cmp, 1024 * 1024, 256);

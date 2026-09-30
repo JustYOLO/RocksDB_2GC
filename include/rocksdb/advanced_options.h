@@ -454,7 +454,13 @@ struct AdvancedColumnFamilyOptions {
   bool enable_hot_table = false;
   size_t hot_table_write_buffer_size = 64 * 1024 * 1024;
   uint32_t hot_table_max_value_size = 1024;
-  // Unused: HotTable hit counts are swept once per flushed HotTable.
+  // Number of flushes, of memtables written while the current HotTable was
+  // active, that the hot-key-shift check looks at together before deciding
+  // whether to keep that HotTable or seal it and build a new one. Larger
+  // values make the decision less sensitive to a single unrepresentative
+  // memtable, at the cost of reacting more slowly to a real shift. Values
+  // below 1 are treated as 1. HotTable hit counts are swept once per flushed
+  // HotTable regardless of this option.
   uint32_t virtual_flush_interval_flushes = 1;
   double hot_table_decay_factor = 0.5;
   double hot_table_zero_hit_penalty = 0.25;

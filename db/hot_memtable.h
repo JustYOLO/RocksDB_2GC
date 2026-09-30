@@ -129,6 +129,14 @@ class HotMemTable {
     earliest_log_num_.store(log_num, std::memory_order_relaxed);
   }
 
+  // Number of flushes of memtables written while this table was active,
+  // recorded when it is sealed. Zero means it was sealed before serving even
+  // one whole memtable, so its per-key hit counts are too sparse to tell a
+  // cold key from one that simply had no chance to be written yet.
+  // REQUIRES: DB mutex held (set and read only by ColumnFamilyData).
+  void SetObservedFlushes(uint32_t n) { observed_flushes_ = n; }
+  uint32_t ObservedFlushes() const { return observed_flushes_; }
+
  private:
   friend class HotMemTableIterator;
 
@@ -147,6 +155,7 @@ class HotMemTable {
   std::atomic<SequenceNumber> earliest_seq_{kMaxSequenceNumber};
   std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
   std::atomic<bool> closed_{false};
+  uint32_t observed_flushes_{0};
 
   mutable std::shared_mutex index_rwlock_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;

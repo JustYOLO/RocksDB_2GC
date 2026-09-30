@@ -252,6 +252,11 @@ class FlushJob {
   // Memtables to be flushed by this job.
   // Ordered by increasing memtable id, i.e., oldest memtable first.
   autovector<ReadOnlyMemTable*> mems_;
+  // This flush's duplicate and HotTable-routing counts, set by
+  // WriteLevel0Table() when HotTable is enabled; fed to the hot-key-shift
+  // window by UpdateHotTableAfterFlush().
+  ColumnFamilyData::HotShiftWindow hot_flush_observation_;
+  bool hot_flush_observed_ = false;
   VersionEdit* edit_;
   Version* base_;
   uint64_t max_next_log_number_{0};

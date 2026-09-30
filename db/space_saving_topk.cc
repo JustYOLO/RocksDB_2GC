@@ -37,7 +37,8 @@ void SpaceSavingTopK::Update(const Slice& key, uint64_t count) {
 }
 
 void SpaceSavingTopK::ApplyDecayAndPenalties(
-    const std::unordered_map<std::string, uint32_t>& hot_key_hits) {
+    const std::unordered_map<std::string, uint32_t>& hot_key_hits,
+    bool apply_decay_and_penalties) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   // Apply hit updates from sweep first
@@ -52,6 +53,16 @@ void SpaceSavingTopK::ApplyDecayAndPenalties(
         }
       }
     }
+  }
+
+  if (!apply_decay_and_penalties) {
+    // Hit counts above may have raised existing entries: keep count_set_ in
+    // sync with them.
+    count_set_.clear();
+    for (const auto& kv : entries_) {
+      count_set_.insert({kv.second.count, kv.first});
+    }
+    return;
   }
 
   // Apply global aging decay to all entries and zero-hit penalty

@@ -26,8 +26,13 @@ class SpaceSavingTopK {
   // Record an observation/hit for a key
   void Update(const Slice& key, uint64_t count = 1);
 
-  // Apply decay to all existing keys and zero-hit penalty to inactive hot keys
-  void ApplyDecayAndPenalties(const std::unordered_map<std::string, uint32_t>& hot_key_hits);
+  // Apply decay to all existing keys and zero-hit penalty to inactive hot keys.
+  // With apply_decay_and_penalties == false, only the hit counts are added:
+  // used when the swept HotTable was active too briefly for "zero hits" to
+  // mean the key has gone cold.
+  void ApplyDecayAndPenalties(
+      const std::unordered_map<std::string, uint32_t>& hot_key_hits,
+      bool apply_decay_and_penalties = true);
 
   // Return the top keys sorted by estimated frequency with minimum appearance threshold
   std::vector<SpaceSavingEntry> GetTopK(size_t k, uint64_t min_count = 2) const;

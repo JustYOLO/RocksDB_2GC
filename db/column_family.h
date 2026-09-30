@@ -527,6 +527,32 @@ class ColumnFamilyData {
   uint64_t MinHotTableLogNumberToKeep(
       const autovector<ReadOnlyMemTable*>* excluded);
 
+  // Memtables with an ID at or below this one were sealed before the active
+  // HotTable became active, so they were written (at least partly) without
+  // it and say nothing about how well it absorbs writes. REQUIRES: DB mutex
+  // held.
+  uint64_t hot_activation_boundary_id() const {
+    return hot_activation_boundary_id_;
+  }
+
+  // Aggregate of the flushes the hot-key-shift check looks at together.
+  struct HotShiftWindow {
+    uint32_t flushes = 0;
+    // Entries of the flushes whose duplicates were counted, and those
+    // duplicates.
+    uint64_t probed_entries = 0;
+    uint64_t duplicate_entries = 0;
+    // Writes routed to the active HotTable (hits) or rejected by it (misses).
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+  };
+  // Adds one flush of memtables written while the active HotTable was
+  // active. Once `window_flushes` such flushes have been added, returns true
+  // with their sum in `*out` and starts a new window. REQUIRES: DB mutex
+  // held.
+  bool AddHotShiftObservation(const HotShiftWindow& flush,
+                              uint32_t window_flushes, HotShiftWindow* out);
+
   // Single-flight guard for RebuildHotTable(), which releases the DB mutex
   // while reseeding.
   bool TryBeginHotTableRebuild() {
@@ -800,6 +826,12 @@ class ColumnFamilyData {
   std::shared_ptr<HotTableRouter> pending_hot_router_;
   // See RequestHotTableSeal() above.
   std::atomic<bool> hot_seal_requested_{false};
+  // See hot_activation_boundary_id() above. Guarded by the DB mutex.
+  uint64_t hot_activation_boundary_id_{0};
+  // Hot-key-shift window in progress, and the number of flushes observed
+  // over the active HotTable's whole life. Guarded by the DB mutex.
+  HotShiftWindow hot_shift_window_;
+  uint32_t active_hot_observed_flushes_{0};
   // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
   std::atomic<bool> hot_rebuild_in_flight_{false};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;

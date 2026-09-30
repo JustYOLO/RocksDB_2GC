@@ -1327,6 +1327,16 @@ Status FlushJob::WriteLevel0Table() {
         cfd_->space_saving_topk()->RecordFlushWindow(total_num_input_entries,
                                                      total_duplicate_entries,
                                                      delta_hits, delta_misses);
+        // Kept for the hot-key-shift window (UpdateHotTableAfterFlush()).
+        // Entries only count toward the duplicate ratio when their
+        // duplicates were actually counted.
+        hot_flush_observation_.flushes = 1;
+        hot_flush_observation_.probed_entries =
+            should_probe ? total_num_input_entries : 0;
+        hot_flush_observation_.duplicate_entries = total_duplicate_entries;
+        hot_flush_observation_.hits = delta_hits;
+        hot_flush_observation_.misses = delta_misses;
+        hot_flush_observed_ = true;
       }
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
@@ -1503,22 +1513,46 @@ void FlushJob::UpdateHotTableAfterFlush(
     cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
     return;
   }
-  SpaceSavingTopK* tracker = cfd_->space_saving_topk();
-  if (tracker == nullptr || cfd_->HotTableSealRequested()) {
+  if (!hot_flush_observed_ || cfd_->HotTableSealRequested()) {
     return;
   }
-  // Hot-key shift: the active HotTable absorbs few writes while the memtable
-  // flushed just now is full of duplicate keys, so end this epoch and let the
-  // next HotTable be built from the current hot keys.
-  const double cur_abs = tracker->GetRecentAbsorptionRatio();
-  const double cur_dup = tracker->GetRecentDuplicateRatio();
+  // Only memtables written entirely while the active HotTable was active say
+  // anything about how well it absorbs. In particular, the temporary memtable
+  // flushed right after a HotTable is activated is full of duplicates by
+  // construction (nothing absorbed them), and judging the new table by it
+  // would seal it within moments of activation.
+  for (const ReadOnlyMemTable* m : mems_) {
+    if (m->GetID() <= cfd_->hot_activation_boundary_id()) {
+      return;
+    }
+  }
+  // Decide over virtual_flush_interval_flushes such flushes rather than one,
+  // so a single unrepresentative memtable does not end the epoch.
+  ColumnFamilyData::HotShiftWindow window;
+  if (!cfd_->AddHotShiftObservation(
+          hot_flush_observation_,
+          cfd_->ioptions().virtual_flush_interval_flushes, &window)) {
+    return;
+  }
+  const uint64_t routed = window.hits + window.misses;
+  const double cur_abs =
+      routed > 0 ? static_cast<double>(window.hits) / routed : 0.0;
+  const double cur_dup =
+      window.probed_entries > 0
+          ? static_cast<double>(window.duplicate_entries) /
+                window.probed_entries
+          : 0.0;
+  // Hot-key shift: the active HotTable absorbs few writes while its
+  // memtables are still full of duplicate keys, so end this epoch and let
+  // the next HotTable be built from the current hot keys.
   if (cur_abs < cfd_->ioptions().hot_table_min_absorption_ratio &&
       cur_dup >= cfd_->ioptions().hot_table_min_duplicate_ratio) {
     ROCKS_LOG_INFO(db_options_.info_log,
-                   "[%s] [HotTable] Hot key shift detected (absorption "
-                   "%.2f%%, duplicates %.2f%%): sealing HotTable with the "
-                   "current memtable",
-                   cfd_->GetName().c_str(), cur_abs * 100.0, cur_dup * 100.0);
+                   "[%s] [HotTable] Hot key shift detected over %u flushes "
+                   "(absorption %.2f%%, duplicates %.2f%%): sealing HotTable "
+                   "with the current memtable",
+                   cfd_->GetName().c_str(), window.flushes, cur_abs * 100.0,
+                   cur_dup * 100.0);
     cfd_->RequestHotTableSeal();
     cfd_->mem()->RequestFlush();
   }

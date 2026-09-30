@@ -4571,6 +4571,38 @@ TEST_F(DBFlushHotTableTest, MemoryPropertiesIncludeSealedUnflushedHotTable) {
   ASSERT_GE(all, hot_bytes);
 }
 
+// Regression test for the mixgraph benchmark collapse: while no HotTable is
+// active, hot keys pile up as duplicates in the temporary memtable. The flush
+// of that memtable completes right after the next HotTable is activated and
+// used to be read as a hot-key shift, sealing each new HotTable within a
+// second of activation. It must not end the HotTable.
+TEST_F(DBFlushHotTableTest, TemporaryMemtableFlushDoesNotSealNewHotTable) {
+  Options options = HotTableOptions();
+  DestroyAndReopen(options);
+  for (int i = 0; i < 20; i++) {
+    ASSERT_OK(Put("hot_a", "a" + std::to_string(i)));
+  }
+  ASSERT_OK(Put("seed_cold", "s"));
+  // Stages a HotTable for hot_a; no HotTable is active yet.
+  ASSERT_OK(Flush());
+  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+
+  // The temporary memtable collects hot_a's duplicates, nothing absorbs them.
+  for (int i = 0; i < 30; i++) {
+    ASSERT_OK(Put("hot_a", "t" + std::to_string(i)));
+  }
+  // Seals the temporary memtable, activates the HotTable, and flushes the
+  // temporary memtable.
+  ASSERT_OK(Flush());
+  ASSERT_NE(cfd()->hot_mem(), nullptr);
+  ASSERT_FALSE(cfd()->HotTableSealRequested());
+
+  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
+  ASSERT_OK(Put("hot_a", "absorbed"));
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
+  ASSERT_EQ(Get("hot_a"), "absorbed");
+}
+
 // Recovery (DB close + reopen, which drives BuildTable() via the WAL replay
 // path in db_impl_open.cc) must stay unaffected: it never passes
 // phase_timings, so none of the new histograms should move, even with

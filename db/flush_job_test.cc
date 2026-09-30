@@ -210,18 +210,20 @@ class FlushJobHotTableTest : public FlushJobTestBase {
   }
 
   // Builds an immutable memtable holding `key_counts` (key -> number of
-  // versions) and flushes it with a standalone FlushJob.
-  void FlushMemtableWithKeys(
+  // versions), with a fresh memtable ID, and adds it to the immutable list.
+  MemTable* AddImmutableMemtable(
       ColumnFamilyData* cfd,
       const std::vector<std::pair<std::string, int>>& key_counts) {
-    JobContext job_context(0);
     auto new_mem = cfd->ConstructNewMemtable(cfd->GetLatestMutableCFOptions(),
                                              kMaxSequenceNumber);
     new_mem->Ref();
+    mutex_.Lock();
+    cfd->AssignMemtableID(new_mem);
+    mutex_.Unlock();
     SequenceNumber seq = 1;
     for (const auto& kc : key_counts) {
       for (int i = 0; i < kc.second; i++) {
-        ASSERT_OK(new_mem->Add(seq++, kTypeValue, kc.first, "v", nullptr));
+        EXPECT_OK(new_mem->Add(seq++, kTypeValue, kc.first, "v", nullptr));
       }
     }
     new_mem->ConstructFragmentedRangeTombstones();
@@ -230,6 +232,12 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     for (auto& m : to_delete) {
       delete m;
     }
+    return new_mem;
+  }
+
+  // Flushes every immutable memtable of `cfd` with a standalone FlushJob.
+  void FlushImmutableMemtables(ColumnFamilyData* cfd) {
+    JobContext job_context(0);
     EventLogger event_logger(db_options_.info_log.get());
     job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
     FlushJob flush_job(
@@ -247,6 +255,29 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     ASSERT_OK(flush_job.Run(nullptr, &file_meta));
     mutex_.Unlock();
     job_context.Clean();
+  }
+
+  void FlushMemtableWithKeys(
+      ColumnFamilyData* cfd,
+      const std::vector<std::pair<std::string, int>>& key_counts) {
+    AddImmutableMemtable(cfd, key_counts);
+    FlushImmutableMemtables(cfd);
+  }
+
+  // Stages a pending HotTable from one skewed flush.
+  void StageHotTable(ColumnFamilyData* cfd) {
+    FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
+    ASSERT_EQ(cfd->hot_mem(), nullptr);
+  }
+
+  // Activates the staged HotTable at a memtable switch that seals
+  // `sealed_mem`: `sealed_mem` and everything older was written without it.
+  void ActivateStagedHotTable(ColumnFamilyData* cfd,
+                              ReadOnlyMemTable* sealed_mem) {
+    mutex_.Lock();
+    cfd->OnMemtableSwitch(sealed_mem, /*new_wal_number=*/1);
+    mutex_.Unlock();
+    ASSERT_NE(cfd->hot_mem(), nullptr);
   }
 };
 
@@ -448,22 +479,57 @@ TEST_F(FlushJobHotTableTest, SkewedFlushStagesHotTableForNextSwitch) {
   ASSERT_TRUE(cfd->hot_mem()->IsEmpty());
 }
 
-// While a HotTable is active, a coldtable flush full of duplicates with no
-// HotTable absorption is a hot-key shift and requests a seal; the active
-// HotTable itself is left untouched.
+// While a HotTable is active, a flush of a memtable written during its
+// lifetime that is still full of duplicates, with no HotTable absorption, is
+// a hot-key shift and requests a seal; the active HotTable itself is left
+// untouched.
 TEST_F(FlushJobHotTableTest, HotKeyShiftRequestsSealOfActiveHotTable) {
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
-  mutex_.Lock();
-  cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
-  mutex_.Unlock();
+  StageHotTable(cfd);
+  ActivateStagedHotTable(cfd, cfd->mem());
   HotMemTable* active = cfd->hot_mem();
-  ASSERT_NE(active, nullptr);
   ASSERT_FALSE(cfd->HotTableSealRequested());
 
   FlushMemtableWithKeys(cfd, {{"unique_b", 1}, {"heavy_dup_2", 20}});
   ASSERT_TRUE(cfd->HotTableSealRequested());
   ASSERT_EQ(cfd->hot_mem(), active);
+}
+
+// Regression test: the temporary memtable sealed at activation was written
+// without any HotTable, so it is full of duplicates by construction. Its
+// flush, which completes right after activation, must not be read as a
+// hot-key shift -- doing so sealed every new HotTable within a second of
+// activation.
+TEST_F(FlushJobHotTableTest, ShiftCheckIgnoresMemtableWrittenBeforeActivation) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  StageHotTable(cfd);
+  MemTable* temporary =
+      AddImmutableMemtable(cfd, {{"unique_b", 1}, {"heavy_dup_2", 20}});
+  ActivateStagedHotTable(cfd, temporary);
+
+  FlushImmutableMemtables(cfd);
+  ASSERT_NE(cfd->hot_mem(), nullptr);
+  ASSERT_FALSE(cfd->HotTableSealRequested());
+}
+
+class FlushJobHotTableWindowTest : public FlushJobHotTableTest {
+ public:
+  FlushJobHotTableWindowTest() {
+    cf_options_.virtual_flush_interval_flushes = 2;
+  }
+};
+
+// With virtual_flush_interval_flushes = 2, the shift decision waits for two
+// flushes of memtables written while the HotTable was active.
+TEST_F(FlushJobHotTableWindowTest, ShiftCheckWaitsForWindowOfFlushes) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  StageHotTable(cfd);
+  ActivateStagedHotTable(cfd, cfd->mem());
+
+  FlushMemtableWithKeys(cfd, {{"unique_b", 1}, {"heavy_dup_2", 20}});
+  ASSERT_FALSE(cfd->HotTableSealRequested());
+  FlushMemtableWithKeys(cfd, {{"unique_c", 1}, {"heavy_dup_3", 20}});
+  ASSERT_TRUE(cfd->HotTableSealRequested());
 }
 
 // A rebuilt HotTable must not start out full, or its first hot write would
