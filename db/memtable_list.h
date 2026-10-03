@@ -384,6 +384,10 @@ class MemTableList {
   // with the not-yet-flushed immutable memtables in this list.
   size_t ApproximateSealedHotTablesMemoryUsage() const;
 
+  // Number of HotTables sealed with the not-yet-flushed immutable memtables
+  // in this list. Each one takes a memtable slot. REQUIRES: DB mutex held.
+  int NumSealedHotTables() const;
+
   // Returns an estimate of the timestamp of the earliest key.
   uint64_t ApproximateOldestKeyTime() const;
 

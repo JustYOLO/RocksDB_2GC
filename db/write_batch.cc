@@ -2322,11 +2322,13 @@ class MemTableInserter : public WriteBatch::Handler {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
-            if (UNLIKELY(hot_mem->IsFull())) {
+            if (UNLIKELY(hot_mem->IsFull()) && !cfd->HotTableSealRequested()) {
               // A full HotTable is sealed together with the current
-              // memtable: request the seal and a switch of that memtable.
+              // memtable: request the seal and a switch of that memtable. If
+              // the seal is deferred for lack of room, a later flush re-arms
+              // it (ColumnFamilyData::MaybeArmDeferredHotTableSeal()).
               cfd->RequestHotTableSeal();
-              mem->RequestFlush();
+              mem->RequestFlushForHotTableSeal();
               CheckMemtableFull();
             }
             MaybeAdvanceSeq(false /* batch_boundary */);
@@ -2574,10 +2576,10 @@ class MemTableInserter : public WriteBatch::Handler {
             RecordTick(cfd->ioptions().statistics.get(), HOT_TABLE_HIT_COUNT);
             RecordTick(cfd->ioptions().statistics.get(),
                        HOT_TABLE_WRITE_HIT_COUNT);
-            if (UNLIKELY(hot_mem->IsFull())) {
+            if (UNLIKELY(hot_mem->IsFull()) && !cfd->HotTableSealRequested()) {
               // See PutCFImpl(): seal the full HotTable with this memtable.
               cfd->RequestHotTableSeal();
-              mem->RequestFlush();
+              mem->RequestFlushForHotTableSeal();
               CheckMemtableFull();
             }
             MaybeAdvanceSeq();

@@ -489,30 +489,60 @@ class ColumnFamilyData {
   }
   // HotTable lifecycle. A HotTable is active while hot_mem_ is non-null and
   // spans any number of memtables; its key set is fixed while it is active.
-  // It is sealed only together with the memtable being switched out, after
-  // RequestHotTableSeal() (HotTable full, WAL limit, explicit flush, hot-key
-  // shift). The pair is flushed into one SST. After that the CF runs with
-  // plain memtables until RebuildHotTable() has staged a pending HotTable and
-  // the next memtable switch activates it.
+  // Every successful flush (re)stages the next HotTable in pending_hot_mem_.
+  // After RequestHotTableSeal(), the next memtable switch that has room seals
+  // the active HotTable with the memtable being switched out and promotes the
+  // staged one in the same switch, so the new (empty) memtable pairs with
+  // the new HotTable. The pair is flushed into one SST. Each HotTable takes
+  // one max_write_buffer_number slot.
 
   // Sweeps the per-key hit counts of a HotTable that is being flushed and
   // applies decay/penalties to the hot-key tracker. REQUIRES: DB mutex held.
   void ExecuteVirtualFlush(HotMemTable* flushed_hot_mem);
-  // Builds a fresh HotTable into the pending slot when no HotTable is
-  // active. `previous_epoch_active` tells whether the flush that triggered
-  // this call included a sealed HotTable. The expensive reseed (O(capacity)
-  // top-K extraction and inserts) runs with `db_mutex` released.
+  // (Re)builds the staged HotTable that the next seal promotes, replacing
+  // any older staged one; drops it if the workload is no longer skewed.
+  // `previous_epoch_active` tells whether the flush that triggered this call
+  // included a sealed HotTable. The expensive reseed (O(capacity) top-K
+  // extraction and inserts) runs with `db_mutex` released.
   // REQUIRES: db_mutex held on entry and held again on return.
   void RebuildHotTable(bool previous_epoch_active, InstrumentedMutex* db_mutex);
 
   // Asks the next memtable switch of this CF to seal the active HotTable
-  // together with the memtable being switched out. Thread-safe.
-  void RequestHotTableSeal() {
-    hot_seal_requested_.store(true, std::memory_order_relaxed);
+  // together with the memtable being switched out. An optional seal
+  // (`force` false: HotTable full, hot-key shift, WAL limit) is deferred
+  // while sealing would stop writes (see CanSealHotTableNow()). A forced seal
+  // (explicit flush, WriteBufferManager, shutdown) happens at the next switch
+  // regardless. A request is only ever raised, never lowered, until a seal
+  // consumes it. Thread-safe.
+  void RequestHotTableSeal(bool force = false) {
+    const uint8_t desired = force ? kHotSealForced : kHotSealIfRoom;
+    uint8_t cur = hot_seal_request_.load(std::memory_order_relaxed);
+    while (cur < desired && !hot_seal_request_.compare_exchange_weak(
+                                cur, desired, std::memory_order_relaxed)) {
+    }
   }
   bool HotTableSealRequested() const {
-    return hot_seal_requested_.load(std::memory_order_relaxed);
+    return hot_seal_request_.load(std::memory_order_relaxed) != kHotSealNone;
   }
+  bool HotTableSealForced() const {
+    return hot_seal_request_.load(std::memory_order_relaxed) == kHotSealForced;
+  }
+
+  // Memtable slots held by HotTables outside the flush backlog: the active
+  // HotTable and the staged one. REQUIRES: DB mutex held.
+  int NumActiveHotTableSlots() const;
+  // True if a staged HotTable is waiting for the next seal. REQUIRES: DB
+  // mutex held.
+  bool HasStagedHotTable() const { return pending_hot_mem_ != nullptr; }
+  // True if sealing the active pair at the next memtable switch would not
+  // stop writes: afterwards the flush backlog grows by the switched-out
+  // memtable and its HotTable, and the staged HotTable (promoted or not)
+  // still takes a slot. REQUIRES: DB mutex held, called before the switch.
+  bool CanSealHotTableNow() const;
+  // After a flush: if an optional seal was deferred and now fits, requests
+  // the memtable switch that performs it (the next write schedules it).
+  // REQUIRES: DB mutex held.
+  void MaybeArmDeferredHotTableSeal();
   // True if an active HotTable holds unflushed data.
   bool ActiveHotTableHasData() const;
   // Called by DBImpl::SwitchMemtable() right before `sealed_mem` is added to
@@ -658,12 +688,17 @@ class ColumnFamilyData {
   bool queued_for_flush() { return queued_for_flush_; }
   bool queued_for_compaction() { return queued_for_compaction_; }
 
+  // `num_unflushed_memtables` is the flush backlog (with HotTable, it
+  // includes HotTables sealed with unflushed memtables).
+  // `num_active_hot_table_slots` counts the active and staged HotTables:
+  // they take slots toward the stop limit but are not flush backlog, so they
+  // do not count toward the delay limit.
   static std::pair<WriteStallCondition, WriteStallCause>
-  GetWriteStallConditionAndCause(
-      int num_unflushed_memtables, int num_l0_files,
-      uint64_t num_compaction_needed_bytes,
-      const MutableCFOptions& mutable_cf_options,
-      const ImmutableCFOptions& immutable_cf_options);
+  GetWriteStallConditionAndCause(int num_unflushed_memtables, int num_l0_files,
+                                 uint64_t num_compaction_needed_bytes,
+                                 const MutableCFOptions& mutable_cf_options,
+                                 const ImmutableCFOptions& immutable_cf_options,
+                                 int num_active_hot_table_slots = 0);
 
   // Recalculate some stall conditions, which are changed only during
   // compaction, adding new memtable and/or recalculation of compaction score.
@@ -748,8 +783,25 @@ class ColumnFamilyData {
   // of its files (if missing)
   void RecoverEpochNumbers();
 
+  // Flush backlog right after this CF's memtable is switched out for a flush.
+  // With HotTable, that switch also seals the active HotTable (explicit
+  // flushes force the seal), so it joins the backlog as well. Pass
+  // GetActiveHotTableSlotsAfterFlushSwitch() alongside it.
   int GetUnflushedMemTableCountForWriteStallCheck() const {
-    return (mem_->IsEmpty() ? 0 : 1) + imm_.NumNotFlushed();
+    int n = imm_.NumNotFlushed();
+    if (ioptions_.enable_hot_table) {
+      const bool has_active_hot = hot_mem() != nullptr;
+      n += imm_.NumSealedHotTables();
+      n += (!mem_->IsEmpty() || has_active_hot) ? 1 : 0;
+      n += has_active_hot ? 1 : 0;
+      return n;
+    }
+    return n + (mem_->IsEmpty() ? 0 : 1);
+  }
+  // Active HotTable slots right after such a switch: only the staged
+  // HotTable, which the seal promotes. REQUIRES: DB mutex held.
+  int GetActiveHotTableSlotsAfterFlushSwitch() const {
+    return (ioptions_.enable_hot_table && pending_hot_mem_ != nullptr) ? 1 : 0;
   }
 
   // thread-safe, DB mutex not needed.
@@ -825,7 +877,10 @@ class ColumnFamilyData {
   std::shared_ptr<HotMemTable> pending_hot_mem_;
   std::shared_ptr<HotTableRouter> pending_hot_router_;
   // See RequestHotTableSeal() above.
-  std::atomic<bool> hot_seal_requested_{false};
+  static constexpr uint8_t kHotSealNone = 0;
+  static constexpr uint8_t kHotSealIfRoom = 1;
+  static constexpr uint8_t kHotSealForced = 2;
+  std::atomic<uint8_t> hot_seal_request_{kHotSealNone};
   // See hot_activation_boundary_id() above. Guarded by the DB mutex.
   uint64_t hot_activation_boundary_id_{0};
   // Hot-key-shift window in progress, and the number of flushes observed
@@ -837,8 +892,6 @@ class ColumnFamilyData {
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};
-  size_t base_write_buffer_size_{67108864};
-  int base_max_write_buffer_number_{2};
   uint32_t cold_flush_counter_{0};
   uint64_t last_hot_write_hits_{0};
   uint64_t last_hot_write_misses_{0};

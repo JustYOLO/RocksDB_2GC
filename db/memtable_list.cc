@@ -889,6 +889,16 @@ size_t MemTableList::ApproximateSealedHotTablesMemoryUsage() const {
   return total_size;
 }
 
+int MemTableList::NumSealedHotTables() const {
+  int n = 0;
+  for (ReadOnlyMemTable* m : current_->memlist_) {
+    if (m->sealed_hot_mem() != nullptr) {
+      ++n;
+    }
+  }
+  return n;
+}
+
 size_t MemTableList::ApproximateMemoryUsage() { return current_memory_usage_; }
 
 size_t MemTableList::MemoryAllocatedBytesExcludingLast() const {

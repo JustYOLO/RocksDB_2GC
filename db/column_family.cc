@@ -747,19 +747,12 @@ ColumnFamilyData::ColumnFamilyData(
   }
 
   if (ioptions_.enable_hot_table) {
-    base_write_buffer_size_ = mutable_cf_options_.write_buffer_size;
-    base_max_write_buffer_number_ = mutable_cf_options_.max_write_buffer_number;
     // No HotTable until a flush finds the workload skewed and
-    // RebuildHotTable() stages one for the next memtable switch.
+    // RebuildHotTable() stages one. HotTables take memtable slots (see
+    // NumActiveHotTableSlots()), so max_write_buffer_number is used as set.
     size_t initial_cap = ioptions_.hot_table_write_buffer_size /
                          (32 + ioptions_.hot_table_max_value_size);
     if (initial_cap == 0) initial_cap = 1024;
-    // Dynamically grant extra memtable count to absorb unused HotTable memory
-    int extra_memtables = static_cast<int>(
-        ioptions_.hot_table_write_buffer_size / base_write_buffer_size_);
-    if (extra_memtables < 1) extra_memtables = 1;
-    mutable_cf_options_.max_write_buffer_number =
-        base_max_write_buffer_number_ + extra_memtables;
     space_saving_topk_ = std::make_shared<SpaceSavingTopK>(
         initial_cap * 2, ioptions_.hot_table_decay_factor,
         ioptions_.hot_table_zero_hit_penalty);
@@ -811,13 +804,34 @@ bool ColumnFamilyData::ActiveHotTableHasData() const {
   return hot != nullptr && !hot->IsEmpty();
 }
 
+int ColumnFamilyData::NumActiveHotTableSlots() const {
+  if (!ioptions_.enable_hot_table) {
+    return 0;
+  }
+  return (hot_mem() != nullptr ? 1 : 0) + (pending_hot_mem_ != nullptr ? 1 : 0);
+}
+
+bool ColumnFamilyData::CanSealHotTableNow() const {
+  const int backlog_after =
+      imm_.NumNotFlushed() + imm_.NumSealedHotTables() + 2;
+  const int active_after = pending_hot_mem_ != nullptr ? 1 : 0;
+  return backlog_after + active_after <
+         mutable_cf_options_.max_write_buffer_number;
+}
+
+void ColumnFamilyData::MaybeArmDeferredHotTableSeal() {
+  if (!ioptions_.enable_hot_table || !HotTableSealRequested() ||
+      !ActiveHotTableHasData() || !CanSealHotTableNow()) {
+    return;
+  }
+  mem_->RequestFlushForHotTableSeal();
+}
+
 void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
                                         uint64_t new_wal_number) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
-  const bool seal_requested =
-      hot_seal_requested_.exchange(false, std::memory_order_relaxed);
   std::shared_ptr<HotMemTable> active_hot;
   std::shared_ptr<HotTableRouter> active_router;
   {
@@ -827,10 +841,17 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
   }
   Statistics* stats = ioptions_.statistics.get();
   if (active_hot != nullptr) {
-    if (!seal_requested) {
+    const uint8_t request = hot_seal_request_.load(std::memory_order_relaxed);
+    if (request == kHotSealNone) {
       // Memtable-only switch: the HotTable keeps absorbing writes.
       return;
     }
+    if (request == kHotSealIfRoom && !CanSealHotTableNow()) {
+      // Sealing now would stop writes. Keep the request; a later flush
+      // re-arms it (MaybeArmDeferredHotTableSeal()).
+      return;
+    }
+    hot_seal_request_.store(kHotSealNone, std::memory_order_relaxed);
     // Close() waits for any in-flight in-place update, so the sealed pair is
     // final. The router stays enabled: readers of the sealed pair use it.
     active_hot->Close();
@@ -841,21 +862,21 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
       hot_mem_.reset();
       hot_router_.reset();
     }
-    // Anything staged during the epoch that just ended is stale; the flush
-    // of this pair stages the next HotTable.
-    pending_hot_mem_.reset();
-    pending_hot_router_.reset();
     ROCKS_LOG_INFO(ioptions_.info_log,
                    "[%s] [HotTable] Sealed HotTable with memtable %" PRIu64,
                    GetName().c_str(), sealed_mem->GetID());
-    return;
+  } else {
+    // `sealed_mem` is a temporary memtable that ran without a HotTable. A
+    // seal request has nothing to seal.
+    hot_seal_request_.store(kHotSealNone, std::memory_order_relaxed);
+    RecordTick(stats, HOT_TABLE_TEMP_MEMTABLE_COUNT);
   }
-  // `sealed_mem` is a temporary memtable that ran without a HotTable.
-  RecordTick(stats, HOT_TABLE_TEMP_MEMTABLE_COUNT);
   if (pending_hot_mem_ == nullptr) {
     return;
   }
-  // Every write the new HotTable absorbs goes to `new_wal_number` or later.
+  // The new memtable starts empty, so the promoted HotTable's keys cannot
+  // also be in its paired memtable. Every write it absorbs goes to
+  // `new_wal_number` or later.
   pending_hot_mem_->ResetEarliestLogNumber(new_wal_number);
   {
     WriteLock l(&hot_table_ptr_mutex_);
@@ -890,11 +911,6 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
   if (!ioptions_.enable_hot_table) {
     return;
   }
-  // A HotTable only changes at an epoch boundary: while one is active its key
-  // set stays fixed, which keeps it disjoint from the memtables it spans.
-  if (hot_mem_shared() != nullptr) {
-    return;
-  }
   // Two flushes of this CF can finish concurrently, and the reseed below runs
   // with db_mutex released.
   if (!TryBeginHotTableRebuild()) {
@@ -909,8 +925,9 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
 
+  const bool hot_table_active = hot_mem_shared() != nullptr;
   const bool currently_active =
-      previous_epoch_active || pending_hot_mem_ != nullptr;
+      hot_table_active || previous_epoch_active || pending_hot_mem_ != nullptr;
   bool is_skewed = true;
   if (space_saving_topk_) {
     is_skewed = space_saving_topk_->IsWorkloadSkewed(
@@ -918,21 +935,15 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
         ioptions_.hot_table_min_absorption_ratio,
         ioptions_.hot_table_consecutive_threshold_windows);
   }
-  int extra_memtables = static_cast<int>(ioptions_.hot_table_write_buffer_size /
-                                         base_write_buffer_size_);
-  if (extra_memtables < 1) extra_memtables = 1;
 
   if (!is_skewed) {
+    // No next HotTable. An active one keeps its key set until it is sealed;
+    // only a CF with no HotTable at all forgets the hot-key history.
     pending_hot_mem_.reset();
     pending_hot_router_.reset();
-    if (space_saving_topk_) {
+    if (!hot_table_active && space_saving_topk_) {
       space_saving_topk_->Clear();
     }
-    // HotTable is fully disabled (no active table, and none staged below):
-    // grant the bonus memtable count to absorb the memory it would
-    // otherwise have used.
-    mutable_cf_options_.max_write_buffer_number =
-        base_max_write_buffer_number_ + extra_memtables;
     return;
   }
 
@@ -966,20 +977,10 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
       db_mutex->Lock();
     }
   }
-  if (hot_mem_shared() != nullptr) {
-    // A memtable switch activated an older pending HotTable meanwhile.
-    return;
-  }
+  // Replaces any older staged table. A seal may have promoted that one while
+  // db_mutex was released; this one is then staged for the epoch after it.
   pending_hot_mem_ = std::move(new_hot);
   pending_hot_router_ = std::move(new_router);
-  // A HotTable now exists (staged, and about to become active): its own
-  // memory budget replaces the bonus memtable capacity rather than adding to
-  // it. Granting both at once double-counts memory versus a comparable run
-  // with HotTable disabled -- this was measured directly in an EDBT2027
-  // Zipfian benchmark, where the previous rule (bonus revoked only once the
-  // live table was literally full) kept the bonus granted for 621 of 640
-  // decay windows, i.e. for almost the table's entire active lifetime.
-  mutable_cf_options_.max_write_buffer_number = base_max_write_buffer_number_;
   ROCKS_LOG_INFO(ioptions_.info_log,
                  "[%s] [HotTable] Staged pending HotTable with %zu hot keys "
                  "(capacity: %zu)",
@@ -1277,8 +1278,10 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files,
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
-    const ImmutableCFOptions& immutable_cf_options) {
-  if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
+    const ImmutableCFOptions& immutable_cf_options,
+    int num_active_hot_table_slots) {
+  if (num_unflushed_memtables + num_active_hot_table_slots >=
+      mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
   } else if (!mutable_cf_options.disable_auto_compactions &&
              num_l0_files >= mutable_cf_options.level0_stop_writes_trigger) {
@@ -1319,10 +1322,14 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     uint64_t compaction_needed_bytes =
         vstorage->estimated_compaction_needed_bytes();
 
+    const int num_unflushed =
+        imm()->NumNotFlushed() +
+        (ioptions_.enable_hot_table ? imm()->NumSealedHotTables() : 0);
+    const int num_active_hot_slots = NumActiveHotTableSlots();
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
-        imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
+        num_unflushed, vstorage->l0_delay_trigger_count(),
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-        ioptions());
+        ioptions(), num_active_hot_slots);
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -1336,8 +1343,9 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
       ROCKS_LOG_WARN(
           ioptions_.logger,
           "[%s] Stopping writes because we have %d immutable memtables "
-          "(waiting for flush), max_write_buffer_number is set to %d",
-          name_.c_str(), imm()->NumNotFlushed(),
+          "(waiting for flush) and %d HotTable slots, "
+          "max_write_buffer_number is set to %d",
+          name_.c_str(), num_unflushed, num_active_hot_slots,
           mutable_cf_options.max_write_buffer_number);
     } else if (write_stall_condition == WriteStallCondition::kStopped &&
                write_stall_cause == WriteStallCause::kL0FileCountLimit) {
@@ -1373,7 +1381,7 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
           "[%s] Stalling writes because we have %d immutable memtables "
           "(waiting for flush), max_write_buffer_number is set to %d "
           "rate %" PRIu64,
-          name_.c_str(), imm()->NumNotFlushed(),
+          name_.c_str(), num_unflushed,
           mutable_cf_options.max_write_buffer_number,
           write_controller->delayed_write_rate());
     } else if (write_stall_condition == WriteStallCondition::kDelayed &&
@@ -1785,6 +1793,14 @@ Status ColumnFamilyData::ValidateOptions(
   }
   if (!s.ok()) {
     return s;
+  }
+
+  if (cf_options.enable_hot_table && cf_options.max_write_buffer_number < 4) {
+    // Each HotTable takes one memtable slot. Sealing a pair while the next
+    // pair (empty memtable + staged HotTable) takes writes needs four.
+    return Status::InvalidArgument(
+        "enable_hot_table requires max_write_buffer_number >= 4, got " +
+        std::to_string(cf_options.max_write_buffer_number));
   }
 
   if (cf_options.ttl > 0 && cf_options.ttl != kDefaultTtl) {

@@ -2622,6 +2622,25 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
     return status;
   }
 
+  if (!immutable_db_options_.atomic_flush) {
+    // The WAL limit seals HotTables, but only when that would not stop
+    // writes. Return before marking the WAL as getting flushed, so this check
+    // runs again on later writes; a finished flush also re-arms the seal.
+    const uint64_t oldest_wal = alive_wal_files_.begin()->number;
+    for (auto cfd : *versions_->GetColumnFamilySet()) {
+      if (cfd->IsDropped() || !cfd->ioptions().enable_hot_table ||
+          !cfd->ActiveHotTableHasData() ||
+          cfd->OldestLogToKeep() > oldest_wal || cfd->CanSealHotTableNow()) {
+        continue;
+      }
+      if (!cfd->HotTableSealRequested()) {
+        RecordTick(stats_, HOT_TABLE_SEAL_DEFERRED_COUNT);
+      }
+      cfd->RequestHotTableSeal();
+      return status;
+    }
+  }
+
   auto oldest_alive_log = alive_wal_files_.begin()->number;
   bool flush_wont_release_oldest_log = false;
   if (allow_2pc()) {
@@ -2684,7 +2703,9 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
   for (const auto cfd : cfds) {
     cfd->Ref();
     // The WAL limit also seals the HotTable, so its WALs can be released.
-    cfd->RequestHotTableSeal();
+    // There is room for it (checked above), except under atomic flush, which
+    // keeps sealing unconditionally.
+    cfd->RequestHotTableSeal(immutable_db_options_.atomic_flush);
     status = SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
@@ -2784,7 +2805,7 @@ Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
     // HotMemTable's AllocTracker use), so a flush triggered to relieve its
     // pressure must also seal the HotTable, or that memory has no way to be
     // released.
-    cfd->RequestHotTableSeal();
+    cfd->RequestHotTableSeal(/*force=*/true);
     status = SwitchMemtable(cfd, write_context);
     cfd->UnrefAndTryDelete();
     if (!status.ok()) {
@@ -3086,9 +3107,20 @@ Status DBImpl::ScheduleFlushes(WriteContext* context) {
   for (auto& cfd : cfds) {
     FlushReason flush_reason = FlushReason::kWriteBufferFull;
     // A requested HotTable seal switches the memtable even when it is empty.
-    if (status.ok() &&
-        (!cfd->mem()->IsEmpty() || (cfd->HotTableSealRequested() &&
-                                    cfd->ActiveHotTableHasData()))) {
+    bool switch_memtable =
+        status.ok() &&
+        (!cfd->mem()->IsEmpty() ||
+         (cfd->HotTableSealRequested() && cfd->ActiveHotTableHasData()));
+    if (switch_memtable && cfd->ioptions().enable_hot_table &&
+        cfd->HotTableSealRequested() && !cfd->HotTableSealForced() &&
+        !cfd->CanSealHotTableNow() && cfd->mem()->CancelHotTableSealFlush()) {
+      // The switch was requested only to seal the HotTable, and sealing now
+      // would stop writes. Keep the pair taking writes; a later flush
+      // re-arms the seal (ColumnFamilyData::MaybeArmDeferredHotTableSeal()).
+      RecordTick(stats_, HOT_TABLE_SEAL_DEFERRED_COUNT);
+      switch_memtable = false;
+    }
+    if (switch_memtable) {
       flush_reason = cfd->mem()->GetFlushReason();
       status = SwitchMemtable(cfd, context);
     }

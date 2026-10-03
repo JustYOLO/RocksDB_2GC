@@ -197,6 +197,8 @@ class FlushJobHotTableTest : public FlushJobTestBase {
       : FlushJobTestBase(test::PerThreadDBPath("flush_job_hot_table_test"),
                          BytewiseComparator()) {
     cf_options_.enable_hot_table = true;
+    // HotTables take memtable slots; see ColumnFamilyData::ValidateOptions().
+    cf_options_.max_write_buffer_number = 4;
     cf_options_.hot_table_write_buffer_size = 1024 * 1024;
     cf_options_.hot_table_max_value_size = 256;
     cf_options_.hot_table_min_duplicate_ratio = 0.20;

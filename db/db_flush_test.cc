@@ -4188,6 +4188,7 @@ TEST_F(DBFlushTest, FlushTimeBreakdownHotKeyDetection) {
   options.create_if_missing = true;
   options.report_flush_time_breakdown = true;
   options.enable_hot_table = true;
+  options.max_write_buffer_number = 4;
   options.hot_table_write_buffer_size = 4096;
   options.hot_table_max_value_size = 64;
   ASSERT_OK(TryReopen(options));
@@ -4253,6 +4254,51 @@ class DBFlushHotTableTest : public DBTestBase {
     ASSERT_OK(Flush());
     ASSERT_NE(cfd()->hot_mem(), nullptr);
   }
+
+  bool HasStagedHotTable() {
+    dbfull()->TEST_LockMutex();
+    const bool staged = cfd()->HasStagedHotTable();
+    dbfull()->TEST_UnlockMutex();
+    return staged;
+  }
+
+  // With a HotTable active, absorbs hot writes and fills cold memtables
+  // until a memtable-only flush has staged the next HotTable. Requires a
+  // small write_buffer_size.
+  void StageNextHotTable() {
+    ASSERT_NE(cfd()->hot_mem(), nullptr);
+    for (int round = 0; round < 50 && !HasStagedHotTable(); round++) {
+      for (int i = 0; i < 40; i++) {
+        ASSERT_OK(Put("hot_a", "s" + std::to_string(i)));
+        ASSERT_OK(Put("hot_b", "s" + std::to_string(i)));
+      }
+      for (int i = 0; i < 20; i++) {
+        ASSERT_OK(
+            Put("cold_r" + std::to_string(round) + "_" + std::to_string(i),
+                std::string(1000, 'c')));
+      }
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    }
+    ASSERT_TRUE(HasStagedHotTable());
+  }
+
+  // Writes cold keys until the memtable fills up and a memtable-only switch
+  // adds an immutable memtable (whose flush is then scheduled as usual).
+  void FillColdMemtable(const std::string& prefix) {
+    uint64_t imm_before = 0;
+    ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumImmutableMemTable,
+                                    &imm_before));
+    for (int i = 0; i < 1000; i++) {
+      ASSERT_OK(Put(prefix + std::to_string(i), std::string(1000, 'c')));
+      uint64_t imm = 0;
+      ASSERT_TRUE(
+          db_->GetIntProperty(DB::Properties::kNumImmutableMemTable, &imm));
+      if (imm > imm_before) {
+        return;
+      }
+    }
+    FAIL() << "memtable never switched";
+  }
 };
 
 TEST_F(DBFlushHotTableTest, PairFlushWritesOneSst) {
@@ -4266,12 +4312,13 @@ TEST_F(DBFlushHotTableTest, PairFlushWritesOneSst) {
   ASSERT_OK(Put("cold_1", "c1"));
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 2);
 
+  HotMemTable* hot_before_flush = cfd()->hot_mem();
   const int l0_before = NumTableFilesAtLevel(0);
   ASSERT_OK(Flush());
   ASSERT_EQ(NumTableFilesAtLevel(0), l0_before + 1);
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_PHYSICAL_FLUSH_COUNT), 1);
-  // Between epochs: no HotTable until the next memtable switch.
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  // The pair's HotTable is gone. A staged one may have been promoted.
+  ASSERT_NE(cfd()->hot_mem(), hot_before_flush);
 
   // The pair's single SST holds one version of hot_a (absorbed in place) and
   // cold_1; the coldtable never saw hot_a.
@@ -4306,37 +4353,53 @@ TEST_F(DBFlushHotTableTest, MemtableOnlySwitchKeepsHotTable) {
   ASSERT_EQ(Get("hot_a"), "v2");
 
   ASSERT_OK(Flush());
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  ASSERT_NE(cfd()->hot_mem(), active);
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_PHYSICAL_FLUSH_COUNT), 1);
   ASSERT_EQ(Get("hot_a"), "v2");
   ASSERT_EQ(Get("cold_1"), "c1");
 }
 
-TEST_F(DBFlushHotTableTest, StagedHotTableActivatedOnlyAtNextSwitch) {
+// A seal promotes the staged HotTable in the same switch: no temporary
+// memtable runs between the two epochs.
+TEST_F(DBFlushHotTableTest, SealPromotesStagedHotTable) {
   Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
   DestroyAndReopen(options);
   ActivateHotTable();
-  ASSERT_OK(Put("hot_a", "v1"));
-  ASSERT_OK(Flush());
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  StageNextHotTable();
+  HotMemTable* old_hot = cfd()->hot_mem();
 
-  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
-  const uint64_t activations =
-      TestGetTickerCount(options, HOT_TABLE_PAIR_ACTIVATION_COUNT);
   const uint64_t temps =
       TestGetTickerCount(options, HOT_TABLE_TEMP_MEMTABLE_COUNT);
-  // The temporary memtable takes hot keys like any other key.
-  ASSERT_OK(Put("hot_a", "temp1"));
-  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits);
-  ASSERT_EQ(Get("hot_a"), "temp1");
-
-  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  const uint64_t activations =
+      TestGetTickerCount(options, HOT_TABLE_PAIR_ACTIVATION_COUNT);
+  ASSERT_OK(Put("hot_a", "sealed"));
+  ASSERT_OK(Flush());
   ASSERT_NE(cfd()->hot_mem(), nullptr);
+  ASSERT_NE(cfd()->hot_mem(), old_hot);
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_TEMP_MEMTABLE_COUNT), temps);
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_PAIR_ACTIVATION_COUNT),
             activations + 1);
-  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_TEMP_MEMTABLE_COUNT),
-            temps + 1);
 
+  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
+  ASSERT_OK(Put("hot_a", "after_seal"));
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
+  ASSERT_EQ(Get("hot_a"), "after_seal");
+}
+
+// Without a staged HotTable (first activation), the CF still falls back to
+// a temporary memtable and activates at the following switch.
+TEST_F(DBFlushHotTableTest, FirstActivationUsesTemporaryMemtable) {
+  Options options = HotTableOptions();
+  DestroyAndReopen(options);
+  const uint64_t temps =
+      TestGetTickerCount(options, HOT_TABLE_TEMP_MEMTABLE_COUNT);
+  ActivateHotTable();
+  // Both switches in ActivateHotTable() ran without a HotTable: the one
+  // whose flush staged it, and the one that activated it.
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_TEMP_MEMTABLE_COUNT),
+            temps + 2);
+  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
   ASSERT_OK(Put("hot_a", "hot1"));
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
   ASSERT_EQ(Get("hot_a"), "hot1");
@@ -4352,9 +4415,10 @@ TEST_F(DBFlushHotTableTest, ReadsSeeSealedPairBeforeAndAfterFlush) {
   ASSERT_OK(Delete("hot_c"));
   ASSERT_OK(Put("cold_1", "c1"));
   // Seal the pair without flushing it.
+  HotMemTable* sealed = cfd()->hot_mem();
   cfd()->RequestHotTableSeal();
   ASSERT_OK(dbfull()->TEST_SwitchMemtable());
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  ASSERT_NE(cfd()->hot_mem(), sealed);
   // Newer than the sealed pair.
   ASSERT_OK(Put("hot_a", "newer_a"));
 
@@ -4405,6 +4469,92 @@ TEST_F(DBFlushHotTableTest, FullHotTableSealsPair) {
   ASSERT_EQ(Get("cold_1"), "c1");
 }
 
+// A full HotTable is not sealed while that would stop writes (one cold
+// memtable still unflushed with max_write_buffer_number = 4); it is sealed
+// after that flush finishes.
+TEST_F(DBFlushHotTableTest, FullHotTableSealDeferredUntilRoom) {
+  Options options = HotTableOptions();
+  options.max_write_buffer_number = 4;
+  options.write_buffer_size = 64 << 10;
+  options.hot_table_write_buffer_size = 16 << 10;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  StageNextHotTable();
+  HotMemTable* old_hot = cfd()->hot_mem();
+
+  env_->SetBackgroundThreads(1, Env::HIGH);
+  test::SleepingBackgroundTask sleeping_task_high;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                 &sleeping_task_high, Env::Priority::HIGH);
+  sleeping_task_high.WaitUntilSleeping();
+
+  // One unflushed cold memtable: backlog 1 + 2 (pair) + 1 (staged) = 4.
+  FillColdMemtable("cold_a_");
+  ASSERT_EQ(cfd()->hot_mem(), old_hot);
+  const uint64_t deferred =
+      TestGetTickerCount(options, HOT_TABLE_SEAL_DEFERRED_COUNT);
+
+  const std::string big(20 << 10, 'x');
+  ASSERT_OK(Put("hot_a", big));
+  ASSERT_TRUE(cfd()->hot_mem()->IsFull());
+  ASSERT_OK(Put("cold_2", "c2"));  // drives ScheduleFlushes()
+  ASSERT_EQ(cfd()->hot_mem(), old_hot);
+  ASSERT_TRUE(cfd()->HotTableSealRequested());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_SEAL_DEFERRED_COUNT),
+            deferred + 1);
+
+  sleeping_task_high.WakeUp();
+  sleeping_task_high.WaitUntilDone();
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  // The flush re-armed the seal: the next write schedules the switch and the
+  // one after performs it.
+  ASSERT_OK(Put("cold_3", "c3"));
+  ASSERT_OK(Put("cold_4", "c4"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_NE(cfd()->hot_mem(), old_hot);
+  ASSERT_FALSE(cfd()->HotTableSealRequested());
+  ASSERT_EQ(Get("hot_a"), big);
+  ASSERT_EQ(Get("cold_2"), "c2");
+  ASSERT_EQ(Get("cold_4"), "c4");
+}
+
+// The stop rule counts the active and staged HotTables: with both present,
+// two unflushed cold memtables stop writes at max_write_buffer_number = 4.
+TEST_F(DBFlushHotTableTest, HotTablesCountTowardStopLimit) {
+  Options options = HotTableOptions();
+  options.max_write_buffer_number = 4;
+  options.write_buffer_size = 64 << 10;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  StageNextHotTable();
+
+  env_->SetBackgroundThreads(1, Env::HIGH);
+  test::SleepingBackgroundTask sleeping_task_high;
+  env_->Schedule(&test::SleepingBackgroundTask::DoSleepTask,
+                 &sleeping_task_high, Env::Priority::HIGH);
+  sleeping_task_high.WaitUntilSleeping();
+
+  FillColdMemtable("cold_a_");
+  ASSERT_FALSE(dbfull()->TEST_write_controler().IsStopped());
+
+  // The second unflushed memtable stops writes; with no_slowdown the write
+  // that hits the stop fails instead of blocking this thread.
+  WriteOptions no_slowdown;
+  no_slowdown.no_slowdown = true;
+  Status s;
+  for (int i = 0; i < 1000 && s.ok(); i++) {
+    s = db_->Put(no_slowdown, "cold_b_" + std::to_string(i),
+                 std::string(1000, 'c'));
+  }
+  ASSERT_TRUE(s.IsIncomplete()) << s.ToString();
+  ASSERT_TRUE(dbfull()->TEST_write_controler().IsStopped());
+
+  sleeping_task_high.WakeUp();
+  sleeping_task_high.WaitUntilDone();
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_FALSE(dbfull()->TEST_write_controler().IsStopped());
+}
+
 TEST_F(DBFlushHotTableTest, WalLimitSealsPair) {
   Options options = HotTableOptions();
   options.max_total_wal_size = 64 << 10;
@@ -4443,47 +4593,17 @@ TEST_F(DBFlushHotTableTest, HotTableDataSurvivesMemtableOnlyFlush) {
   ASSERT_EQ(Get("cold_199"), std::string(1000, 'c'));
 }
 
-// The bonus memtable slots exist to absorb the memory a HotTable would
-// otherwise have used. Granting them while a HotTable is also active (or
-// staged and about to become active) double-counts that memory -- this was
-// found to happen for the overwhelming majority of a HotTable's lifetime in
-// an EDBT2027 Zipfian benchmark, because the previous rule only revoked the
-// bonus once the live table was completely full.
-TEST_F(DBFlushHotTableTest, BonusMemtableOnlyWhileFullyDisabled) {
+TEST_F(DBFlushHotTableTest, RequiresFourWriteBufferSlots) {
   Options options = HotTableOptions();
+  options.max_write_buffer_number = 3;
+  ASSERT_TRUE(TryReopen(options).IsInvalidArgument());
+
+  options.max_write_buffer_number = 4;
   DestroyAndReopen(options);
-  const int base = options.max_write_buffer_number;
-
-  // Before any HotTable has ever formed, the CF is fully disabled and gets
-  // the bonus.
-  ASSERT_GT(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, base);
-
-  ActivateHotTable();
-  ASSERT_NE(cfd()->hot_mem(), nullptr);
-  // Active, and nowhere near full: the bonus must not be granted here, even
-  // though the old rule (revoke only once literally full) would have kept
-  // it.
-  ASSERT_FALSE(cfd()->hot_mem()->IsFull());
-  ASSERT_EQ(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, base);
-
-  // Keep absorbing hot writes so the workload still reads as skewed once the
-  // pair below is sealed and flushed.
-  for (int i = 0; i < 20; i++) {
-    ASSERT_OK(Put("hot_a", "v" + std::to_string(i)));
-  }
-  // Flush() itself requests the HotTable seal (see FlushMemTable()), and
-  // actually schedules and waits for the resulting flush -- unlike the raw
-  // TEST_SwitchMemtable() hook, which does not request a flush at all.
-  ASSERT_OK(Flush());
-  // Between epochs, but the pair's own flush already staged a new pending
-  // HotTable (still skewed): still no bonus.
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);
-  ASSERT_EQ(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, base);
-
-  // Once the pending table is activated, still no bonus.
-  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
-  ASSERT_NE(cfd()->hot_mem(), nullptr);
-  ASSERT_EQ(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, base);
+  ASSERT_EQ(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, 4);
+  ASSERT_NOK(db_->SetOptions(db_->DefaultColumnFamily(),
+                             {{"max_write_buffer_number", "3"}}));
+  ASSERT_EQ(cfd()->GetLatestMutableCFOptions().max_write_buffer_number, 4);
 }
 
 // Once a HotTable's own memory is charged to the shared WriteBufferManager
@@ -4562,9 +4682,10 @@ TEST_F(DBFlushHotTableTest, MemoryPropertiesIncludeSealedUnflushedHotTable) {
   const size_t hot_bytes = cfd()->hot_mem()->ApproximateMemoryUsage();
   ASSERT_GT(hot_bytes, 0u);
 
+  HotMemTable* sealed = cfd()->hot_mem();
   cfd()->RequestHotTableSeal();
   ASSERT_OK(dbfull()->TEST_SwitchMemtable());
-  ASSERT_EQ(cfd()->hot_mem(), nullptr);  // sealed, not active
+  ASSERT_NE(cfd()->hot_mem(), sealed);  // sealed, not active
 
   uint64_t all = 0;
   ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kCurSizeAllMemTables, &all));

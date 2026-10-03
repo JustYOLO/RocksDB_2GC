@@ -359,6 +359,7 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {HOT_TABLE_PAIR_ACTIVATION_COUNT,
      "rocksdb.hot.table.pair.activation.count"},
     {HOT_TABLE_TEMP_MEMTABLE_COUNT, "rocksdb.hot.table.temp.memtable.count"},
+    {HOT_TABLE_SEAL_DEFERRED_COUNT, "rocksdb.hot.table.seal.deferred.count"},
     {LEVEL_UP_KEY_CHECKED, "rocksdb.level.up.key.checked"},
     {LEVEL_UP_KEY_RETAINED, "rocksdb.level.up.key.retained"},
     {LEVEL_UP_BOUNDARY_CLIPPED, "rocksdb.level.up.boundary.clipped"},

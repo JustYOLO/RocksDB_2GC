@@ -668,14 +668,33 @@ class MemTable final : public ReadOnlyMemTable {
     return flush_state_.load(std::memory_order_relaxed) == FLUSH_SCHEDULED;
   }
 
-  // Requests that this memtable be switched out and flushed at the next
-  // opportunity regardless of its size. No-op if a flush is already requested
-  // or scheduled. Thread-safe.
-  void RequestFlush() {
+  // Requests that this memtable be switched out at the next opportunity
+  // regardless of its size, only so that its HotTable can be sealed with it.
+  // No-op if a flush is already requested or scheduled. Thread-safe.
+  void RequestFlushForHotTableSeal() {
+    flush_requested_for_hot_seal_.store(true, std::memory_order_relaxed);
     auto before = FLUSH_NOT_REQUESTED;
-    flush_state_.compare_exchange_strong(before, FLUSH_REQUESTED,
-                                         std::memory_order_relaxed,
-                                         std::memory_order_relaxed);
+    if (!flush_state_.compare_exchange_strong(before, FLUSH_REQUESTED,
+                                              std::memory_order_relaxed,
+                                              std::memory_order_relaxed)) {
+      // Already requested (e.g. full) or scheduled: not a seal-only request.
+      flush_requested_for_hot_seal_.store(false, std::memory_order_relaxed);
+    }
+  }
+
+  // Withdraws a switch requested only by RequestFlushForHotTableSeal() and
+  // already claimed by MarkFlushScheduled(), returning this memtable to
+  // FLUSH_NOT_REQUESTED. Returns false and changes nothing if there was no
+  // such request or if the memtable is now due for a flush by its own size.
+  // REQUIRES: called from the write thread that claimed the flush.
+  bool CancelHotTableSealFlush() {
+    if (!flush_requested_for_hot_seal_.load(std::memory_order_relaxed) ||
+        ShouldFlushNow()) {
+      return false;
+    }
+    flush_requested_for_hot_seal_.store(false, std::memory_order_relaxed);
+    flush_state_.store(FLUSH_NOT_REQUESTED, std::memory_order_relaxed);
+    return true;
   }
 
   InternalIterator* NewIterator(
@@ -991,6 +1010,8 @@ class MemTable final : public ReadOnlyMemTable {
   std::unique_ptr<DynamicBloom> bloom_filter_;
 
   std::atomic<FlushStateEnum> flush_state_;
+  // See RequestFlushForHotTableSeal().
+  std::atomic<bool> flush_requested_for_hot_seal_{false};
 
   SystemClock* clock_;
 

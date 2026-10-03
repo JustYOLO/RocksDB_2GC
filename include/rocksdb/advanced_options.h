@@ -451,6 +451,13 @@ struct AdvancedColumnFamilyOptions {
   bool memtable_whole_key_filtering = false;
 
   // Adaptive In-Place Hot Table options
+  //
+  // Each HotTable counts as one memtable slot toward max_write_buffer_number:
+  // the active one, the staged one waiting for the next seal, and each one
+  // sealed with a not-yet-flushed memtable. Requires
+  // max_write_buffer_number >= 4. hot_table_write_buffer_size should equal
+  // write_buffer_size so that a slot means the same memory either way (both
+  // default to 64MB).
   bool enable_hot_table = false;
   size_t hot_table_write_buffer_size = 64 * 1024 * 1024;
   uint32_t hot_table_max_value_size = 1024;

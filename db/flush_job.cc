@@ -1507,10 +1507,10 @@ void FlushJob::UpdateHotTableAfterFlush(
     cfd_->ExecuteVirtualFlush(hot);
     RecordTick(stats_, HOT_TABLE_PHYSICAL_FLUSH_COUNT);
   }
+  // Keep the next HotTable staged, so a seal can promote it in the same
+  // memtable switch (ColumnFamilyData::OnMemtableSwitch()).
+  cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
   if (cfd_->hot_mem() == nullptr) {
-    // Between HotTable epochs: stage the next HotTable (or decide the
-    // workload is not skewed enough for one).
-    cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
     return;
   }
   if (!hot_flush_observed_ || cfd_->HotTableSealRequested()) {
@@ -1554,7 +1554,12 @@ void FlushJob::UpdateHotTableAfterFlush(
                    cfd_->GetName().c_str(), window.flushes, cur_abs * 100.0,
                    cur_dup * 100.0);
     cfd_->RequestHotTableSeal();
-    cfd_->mem()->RequestFlush();
+    if (cfd_->CanSealHotTableNow()) {
+      cfd_->mem()->RequestFlushForHotTableSeal();
+    } else {
+      // Re-armed by DBImpl after a later flush makes room.
+      RecordTick(stats_, HOT_TABLE_SEAL_DEFERRED_COUNT);
+    }
   }
 }
 

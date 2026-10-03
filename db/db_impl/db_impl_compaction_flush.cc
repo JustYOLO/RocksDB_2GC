@@ -146,7 +146,7 @@ bool DBImpl::ShouldRescheduleFlushRequestToRetainUDT(
           cfd->GetUnflushedMemTableCountForWriteStallCheck(),
           /*num_l0_files=*/0,
           /*num_compaction_needed_bytes=*/0, mutable_cf_options,
-          cfd->ioptions())
+          cfd->ioptions(), cfd->GetActiveHotTableSlotsAfterFlushSwitch())
           .first;
   if (write_stall != WriteStallCondition::kNormal) {
     return false;
@@ -387,6 +387,9 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     InstallSuperVersionAndScheduleWork(cfd, superversion_context);
+    // This flush freed slots: perform an optional HotTable seal that was
+    // deferred for lack of room.
+    cfd->MaybeArmDeferredHotTableSeal();
     if (made_progress) {
       *made_progress = true;
     }
@@ -2687,7 +2690,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
         IsRecoveryFlush(flush_reason)) {
       // Every explicit flush persists the HotTable together with the
       // memtable being switched out.
-      cfd->RequestHotTableSeal();
+      cfd->RequestHotTableSeal(/*force=*/true);
       s = SwitchMemtable(cfd, &context);
     }
     const uint64_t flush_memtable_id = std::numeric_limits<uint64_t>::max();
@@ -2899,7 +2902,7 @@ Status DBImpl::AtomicFlushMemTables(
       cfd->Ref();
       // Every explicit flush persists the HotTable together with the
       // memtable being switched out.
-      cfd->RequestHotTableSeal();
+      cfd->RequestHotTableSeal(/*force=*/true);
       s = SwitchMemtable(cfd, &context);
       cfd->UnrefAndTryDelete();
       if (!s.ok()) {
@@ -3088,7 +3091,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
               cfd->GetUnflushedMemTableCountForWriteStallCheck(),
               vstorage->l0_delay_trigger_count() + 1,
               vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-              cfd->ioptions())
+              cfd->ioptions(), cfd->GetActiveHotTableSlotsAfterFlushSwitch())
               .first;
     } while (write_stall_condition != WriteStallCondition::kNormal);
   }

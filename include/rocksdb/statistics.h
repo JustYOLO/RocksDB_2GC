@@ -156,6 +156,9 @@ enum Tickers : uint32_t {
   HOT_TABLE_PAIR_ACTIVATION_COUNT,
   // # of memtables sealed while no HotTable was active.
   HOT_TABLE_TEMP_MEMTABLE_COUNT,
+  // # of times a HotTable seal was put off because it would have stopped
+  // writes (counted once per deferral, not per retry).
+  HOT_TABLE_SEAL_DEFERRED_COUNT,
 
   // Level Up Compaction tickers
   LEVEL_UP_KEY_CHECKED,
