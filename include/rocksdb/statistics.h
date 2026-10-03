@@ -159,6 +159,8 @@ enum Tickers : uint32_t {
   // # of times a HotTable seal was put off because it would have stopped
   // writes (counted once per deferral, not per retry).
   HOT_TABLE_SEAL_DEFERRED_COUNT,
+  // # of times a next HotTable was built (staged) for a coming seal.
+  HOT_TABLE_STAGE_COUNT,
 
   // Level Up Compaction tickers
   LEVEL_UP_KEY_CHECKED,

@@ -474,6 +474,17 @@ struct AdvancedColumnFamilyOptions {
   double hot_table_min_duplicate_ratio = 0.20;
   double hot_table_min_absorption_ratio = 0.20;
   uint32_t hot_table_consecutive_threshold_windows = 2;
+  // The next HotTable is built (staged) only once the active one is close to
+  // being sealed: when the total WAL size reaches this fraction of
+  // max_total_wal_size, when the active HotTable reaches this fraction of
+  // hot_table_write_buffer_size, or when a seal has been requested. It is
+  // built at most once per HotTable epoch. A staged HotTable takes a memtable
+  // slot and its memory, so staging late keeps both free for most of the
+  // epoch; staging too late makes a seal find nothing staged and fall back to
+  // a temporary memtable (see rocksdb.hot.table.temp.memtable.count). Leave
+  // room for at least one memtable flush between this point and the limit.
+  // 0 stages right after the active HotTable is activated.
+  double hot_table_stage_ahead_ratio = 0.75;
   // Once the cold memtable has looked non-skewed (no significant duplicate
   // keys) for more than hot_table_consecutive_threshold_windows flushes in a
   // row, the per-flush duplicate-key detection is only re-probed once every

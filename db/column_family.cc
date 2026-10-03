@@ -819,6 +819,26 @@ bool ColumnFamilyData::CanSealHotTableNow() const {
          mutable_cf_options_.max_write_buffer_number;
 }
 
+void ColumnFamilyData::MaybeStageNextHotTable(bool wal_near_limit,
+                                              InstrumentedMutex* db_mutex) {
+  if (!ioptions_.enable_hot_table || pending_hot_mem_ != nullptr) {
+    return;
+  }
+  std::shared_ptr<HotMemTable> active = hot_mem_shared();
+  if (active == nullptr) {
+    // Between epochs the flush job stages the next HotTable itself.
+    return;
+  }
+  const bool hot_near_limit =
+      static_cast<double>(active->ApproximateMemoryUsage()) >=
+      ioptions_.hot_table_stage_ahead_ratio *
+          static_cast<double>(active->WriteBufferSize());
+  if (!wal_near_limit && !hot_near_limit && !HotTableSealRequested()) {
+    return;
+  }
+  RebuildHotTable(/*previous_epoch_active=*/true, db_mutex);
+}
+
 void ColumnFamilyData::MaybeArmDeferredHotTableSeal() {
   if (!ioptions_.enable_hot_table || !HotTableSealRequested() ||
       !ActiveHotTableHasData() || !CanSealHotTableNow()) {
@@ -981,6 +1001,7 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
   // db_mutex was released; this one is then staged for the epoch after it.
   pending_hot_mem_ = std::move(new_hot);
   pending_hot_router_ = std::move(new_router);
+  RecordTick(ioptions_.statistics.get(), HOT_TABLE_STAGE_COUNT);
   ROCKS_LOG_INFO(ioptions_.info_log,
                  "[%s] [HotTable] Staged pending HotTable with %zu hot keys "
                  "(capacity: %zu)",

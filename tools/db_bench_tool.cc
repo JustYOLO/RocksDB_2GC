@@ -1810,6 +1810,9 @@ DEFINE_double(hot_table_min_duplicate_ratio, 0.20,
               "Minimum duplicate ratio in cold memtable to consider workload skewed");
 DEFINE_double(hot_table_min_absorption_ratio, 0.20,
               "Minimum write absorption ratio in HotTable to consider workload skewed");
+DEFINE_double(hot_table_stage_ahead_ratio, 0.75,
+              "Stage the next HotTable once the WAL or the active HotTable "
+              "reaches this fraction of its limit");
 DEFINE_uint32(hot_table_consecutive_threshold_windows, 2,
               "Number of consecutive flush windows required to switch HotTable state");
 
@@ -5917,6 +5920,7 @@ class Benchmark {
     options.hot_table_zero_hit_penalty = FLAGS_hot_table_zero_hit_penalty;
     options.hot_table_min_duplicate_ratio = FLAGS_hot_table_min_duplicate_ratio;
     options.hot_table_min_absorption_ratio = FLAGS_hot_table_min_absorption_ratio;
+    options.hot_table_stage_ahead_ratio = FLAGS_hot_table_stage_ahead_ratio;
     options.hot_table_consecutive_threshold_windows =
         FLAGS_hot_table_consecutive_threshold_windows;
     options.enable_level_up_compaction = FLAGS_enable_level_up_compaction;

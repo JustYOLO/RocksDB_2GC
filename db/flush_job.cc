@@ -1507,10 +1507,12 @@ void FlushJob::UpdateHotTableAfterFlush(
     cfd_->ExecuteVirtualFlush(hot);
     RecordTick(stats_, HOT_TABLE_PHYSICAL_FLUSH_COUNT);
   }
-  // Keep the next HotTable staged, so a seal can promote it in the same
-  // memtable switch (ColumnFamilyData::OnMemtableSwitch()).
-  cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
   if (cfd_->hot_mem() == nullptr) {
+    // Between HotTable epochs: stage the next HotTable (or decide the
+    // workload is not skewed enough for one). While one is active, DBImpl
+    // stages its successor once it nears its seal
+    // (ColumnFamilyData::MaybeStageNextHotTable()).
+    cfd_->RebuildHotTable(!flushed_hot_mems.empty(), db_mutex_);
     return;
   }
   if (!hot_flush_observed_ || cfd_->HotTableSealRequested()) {
@@ -1553,11 +1555,11 @@ void FlushJob::UpdateHotTableAfterFlush(
                    "with the current memtable",
                    cfd_->GetName().c_str(), window.flushes, cur_abs * 100.0,
                    cur_dup * 100.0);
+    // DBImpl stages the next HotTable and then arms the seal right after
+    // this flush (DBImpl::FlushMemTableToOutputFile()), so the seal can
+    // promote it.
     cfd_->RequestHotTableSeal();
-    if (cfd_->CanSealHotTableNow()) {
-      cfd_->mem()->RequestFlushForHotTableSeal();
-    } else {
-      // Re-armed by DBImpl after a later flush makes room.
+    if (!cfd_->CanSealHotTableNow()) {
       RecordTick(stats_, HOT_TABLE_SEAL_DEFERRED_COUNT);
     }
   }

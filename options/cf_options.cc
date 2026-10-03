@@ -1159,6 +1159,7 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       hot_table_zero_hit_penalty(cf_options.hot_table_zero_hit_penalty),
       hot_table_min_duplicate_ratio(cf_options.hot_table_min_duplicate_ratio),
       hot_table_min_absorption_ratio(cf_options.hot_table_min_absorption_ratio),
+      hot_table_stage_ahead_ratio(cf_options.hot_table_stage_ahead_ratio),
       hot_table_consecutive_threshold_windows(
           cf_options.hot_table_consecutive_threshold_windows),
       hot_table_max_scan_backoff_flushes(

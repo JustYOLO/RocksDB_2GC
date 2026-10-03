@@ -387,9 +387,17 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     InstallSuperVersionAndScheduleWork(cfd, superversion_context);
-    // This flush freed slots: perform an optional HotTable seal that was
-    // deferred for lack of room.
-    cfd->MaybeArmDeferredHotTableSeal();
+    if (cfd->ioptions().enable_hot_table) {
+      // Build the next HotTable once the active one nears its seal, then
+      // perform a requested seal if this flush made room for it.
+      const uint64_t max_wal = GetMaxTotalWalSize();
+      const bool wal_near_limit =
+          max_wal > 0 && static_cast<double>(wals_total_size_.LoadRelaxed()) >=
+                             cfd->ioptions().hot_table_stage_ahead_ratio *
+                                 static_cast<double>(max_wal);
+      cfd->MaybeStageNextHotTable(wal_near_limit, &mutex_);
+      cfd->MaybeArmDeferredHotTableSeal();
+    }
     if (made_progress) {
       *made_progress = true;
     }

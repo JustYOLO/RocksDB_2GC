@@ -489,7 +489,8 @@ class ColumnFamilyData {
   }
   // HotTable lifecycle. A HotTable is active while hot_mem_ is non-null and
   // spans any number of memtables; its key set is fixed while it is active.
-  // Every successful flush (re)stages the next HotTable in pending_hot_mem_.
+  // Once the active HotTable nears its seal (MaybeStageNextHotTable()), the
+  // next HotTable is built once into pending_hot_mem_.
   // After RequestHotTableSeal(), the next memtable switch that has room seals
   // the active HotTable with the memtable being switched out and promotes the
   // staged one in the same switch, so the new (empty) memtable pairs with
@@ -506,6 +507,15 @@ class ColumnFamilyData {
   // extraction and inserts) runs with `db_mutex` released.
   // REQUIRES: db_mutex held on entry and held again on return.
   void RebuildHotTable(bool previous_epoch_active, InstrumentedMutex* db_mutex);
+
+  // While a HotTable is active and nothing is staged yet, builds the next
+  // HotTable once the active one nears its seal: `wal_near_limit` (the
+  // caller compares the total WAL size with max_total_wal_size), the active
+  // HotTable reaching hot_table_stage_ahead_ratio of its size limit, or a
+  // requested seal. Does nothing otherwise, so the staged table is built at
+  // most once per epoch. REQUIRES: db_mutex held on entry and held again on
+  // return (it is released while building).
+  void MaybeStageNextHotTable(bool wal_near_limit, InstrumentedMutex* db_mutex);
 
   // Asks the next memtable switch of this CF to seal the active HotTable
   // together with the memtable being switched out. An optional seal

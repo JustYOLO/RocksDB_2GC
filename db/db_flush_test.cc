@@ -4229,6 +4229,10 @@ class DBFlushHotTableTest : public DBTestBase {
     options.hot_table_min_duplicate_ratio = 0.2;
     options.hot_table_min_absorption_ratio = 0.2;
     options.hot_table_consecutive_threshold_windows = 1;
+    // Stage the next HotTable at the first flush after activation, so tests
+    // that seal a pair find one staged. Staging thresholds are tested
+    // separately below.
+    options.hot_table_stage_ahead_ratio = 0.0;
     return options;
   }
 
@@ -4403,6 +4407,78 @@ TEST_F(DBFlushHotTableTest, FirstActivationUsesTemporaryMemtable) {
   ASSERT_OK(Put("hot_a", "hot1"));
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
   ASSERT_EQ(Get("hot_a"), "hot1");
+}
+
+// The next HotTable is built only once the active one nears its size limit,
+// and only once per epoch, not after every flush.
+TEST_F(DBFlushHotTableTest, StagesOnceNearHotTableLimit) {
+  Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
+  options.hot_table_stage_ahead_ratio = 0.5;
+  // These tests write mostly cold keys; keep the workload judged skewed so
+  // staging is decided by the thresholds alone.
+  options.hot_table_min_absorption_ratio = 0.0;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  HotMemTable* old_hot = cfd()->hot_mem();
+  const uint64_t stages = TestGetTickerCount(options, HOT_TABLE_STAGE_COUNT);
+
+  // Far from the limit: memtable-only flushes stage nothing.
+  FillColdMemtable("cold_a_");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  FillColdMemtable("cold_b_");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_FALSE(HasStagedHotTable());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_STAGE_COUNT), stages);
+
+  // Past half of the 64KB budget, but not full.
+  ASSERT_OK(Put("hot_a", std::string(40 << 10, 'x')));
+  ASSERT_FALSE(cfd()->hot_mem()->IsFull());
+  FillColdMemtable("cold_c_");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_TRUE(HasStagedHotTable());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_STAGE_COUNT), stages + 1);
+
+  // Later flushes keep the staged table instead of rebuilding it.
+  FillColdMemtable("cold_d_");
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_STAGE_COUNT), stages + 1);
+  ASSERT_EQ(cfd()->hot_mem(), old_hot);
+
+  // The seal promotes it; the new epoch starts with nothing staged.
+  ASSERT_OK(Flush());
+  ASSERT_NE(cfd()->hot_mem(), nullptr);
+  ASSERT_NE(cfd()->hot_mem(), old_hot);
+  ASSERT_FALSE(HasStagedHotTable());
+  ASSERT_EQ(Get("hot_a"), std::string(40 << 10, 'x'));
+}
+
+// Near the WAL size limit, the next HotTable is staged before the WAL limit
+// seals the active one.
+TEST_F(DBFlushHotTableTest, StagesNearWalLimit) {
+  Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
+  options.max_total_wal_size = 512 << 10;
+  options.hot_table_stage_ahead_ratio = 0.25;
+  // These tests write mostly cold keys; keep the workload judged skewed so
+  // staging is decided by the thresholds alone.
+  options.hot_table_min_absorption_ratio = 0.0;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  ASSERT_FALSE(HasStagedHotTable());
+  const uint64_t physical =
+      TestGetTickerCount(options, HOT_TABLE_PHYSICAL_FLUSH_COUNT);
+
+  // Once the active HotTable holds data it pins the WAL, so the total grows
+  // with every write.
+  ASSERT_OK(Put("hot_a", "pin"));
+  for (int i = 0; i < 4 && !HasStagedHotTable(); i++) {
+    FillColdMemtable("cold_" + std::to_string(i) + "_");
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  }
+  ASSERT_TRUE(HasStagedHotTable());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_PHYSICAL_FLUSH_COUNT),
+            physical);
 }
 
 TEST_F(DBFlushHotTableTest, ReadsSeeSealedPairBeforeAndAfterFlush) {

@@ -380,6 +380,7 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->hot_table_zero_hit_penalty = ioptions.hot_table_zero_hit_penalty;
   cf_opts->hot_table_min_duplicate_ratio = ioptions.hot_table_min_duplicate_ratio;
   cf_opts->hot_table_min_absorption_ratio = ioptions.hot_table_min_absorption_ratio;
+  cf_opts->hot_table_stage_ahead_ratio = ioptions.hot_table_stage_ahead_ratio;
   cf_opts->hot_table_consecutive_threshold_windows =
       ioptions.hot_table_consecutive_threshold_windows;
   cf_opts->hot_table_max_scan_backoff_flushes =
