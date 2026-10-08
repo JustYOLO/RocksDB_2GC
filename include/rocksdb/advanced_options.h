@@ -461,19 +461,18 @@ struct AdvancedColumnFamilyOptions {
   bool enable_hot_table = false;
   size_t hot_table_write_buffer_size = 64 * 1024 * 1024;
   uint32_t hot_table_max_value_size = 1024;
-  // Number of flushes, of memtables written while the current HotTable was
-  // active, that the hot-key-shift check looks at together before deciding
-  // whether to keep that HotTable or seal it and build a new one. Larger
-  // values make the decision less sensitive to a single unrepresentative
-  // memtable, at the cost of reacting more slowly to a real shift. Values
-  // below 1 are treated as 1. HotTable hit counts are swept once per flushed
-  // HotTable regardless of this option.
-  uint32_t virtual_flush_interval_flushes = 1;
+  // E: length of a HotTable decision window, in memtable flushes. At the end
+  // of each window the cost model decides whether to enable, rebuild,
+  // disable or keep the HotTable (see db/hot_table_policy.h). While HotTable
+  // is disabled, only flushes whose duplicate keys were counted (probed)
+  // count toward a window. Values below 1 are treated as 1.
+  uint32_t virtual_flush_interval_flushes = 5;
   double hot_table_decay_factor = 0.5;
   double hot_table_zero_hit_penalty = 0.25;
-  double hot_table_min_duplicate_ratio = 0.20;
-  double hot_table_min_absorption_ratio = 0.20;
-  uint32_t hot_table_consecutive_threshold_windows = 2;
+  // kappa: cost of sealing and flushing one HotTable, in memtable flushes.
+  // The enable threshold is kappa / (E + kappa) and the disable threshold
+  // kappa * write_buffer_size / W, where W is the effective WAL limit.
+  double hot_table_rebuild_cost = 1.0;
   // The next HotTable is built (staged) only once the active one is close to
   // being sealed: when the total WAL size reaches this fraction of
   // max_total_wal_size, when the active HotTable reaches this fraction of
@@ -485,11 +484,10 @@ struct AdvancedColumnFamilyOptions {
   // room for at least one memtable flush between this point and the limit.
   // 0 stages right after the active HotTable is activated.
   double hot_table_stage_ahead_ratio = 0.75;
-  // Once the cold memtable has looked non-skewed (no significant duplicate
-  // keys) for more than hot_table_consecutive_threshold_windows flushes in a
-  // row, the per-flush duplicate-key detection is only re-probed once every
-  // N flushes instead of every flush, where N grows with how long the
-  // workload has stayed flat, up to this cap. Sized this way because
+  // Once the cost model has decided to stay disabled for consecutive
+  // windows, the per-flush duplicate-key detection is only re-probed once
+  // every N flushes, where N grows with the number of such windows, up to
+  // this cap. Sized this way because
   // re-probing on every flush costs nothing extra once the scan is fused
   // into the flush's own traversal (see FlushJob::WriteLevel0Table), but the
   // per-key bookkeeping itself is still worth skipping once the workload has

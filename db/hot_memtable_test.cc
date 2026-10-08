@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "db/hot_memtable.h"
+#include "db/hot_table_policy.h"
 #include "db/hot_table_router.h"
 #include "db/space_saving_topk.h"
 #include "rocksdb/write_buffer_manager.h"
@@ -196,7 +197,8 @@ TEST_F(HotMemTableTest, SpaceSavingTopKDecayAndPenalties) {
   sweep_hits["key_hot"] = 50;
   sweep_hits["key_warm"] = 0;
 
-  tracker.ApplyDecayAndPenalties(sweep_hits);
+  tracker.AddHits(sweep_hits, /*in_window=*/true);
+  tracker.Age(&sweep_hits);
 
   // key_hot: (100 + 50) * 0.5 = 75
   // key_warm: 40 * 0.25 = 10
@@ -217,8 +219,8 @@ TEST_F(HotMemTableTest, SpaceSavingTopKDecayAndPenalties) {
   }
 }
 
-// A sweep from a HotTable that was active too briefly only adds its hits:
-// no global decay, and no zero-hit penalty for keys it never got to see.
+// Adding swept hits alone (as at a HotTable's physical flush) neither decays
+// nor penalizes: aging happens once per decision window.
 TEST_F(HotMemTableTest, SpaceSavingTopKSweepWithoutDecayOrPenalties) {
   SpaceSavingTopK tracker(10, 0.5 /* decay_factor */,
                           0.25 /* zero_hit_penalty */);
@@ -228,8 +230,7 @@ TEST_F(HotMemTableTest, SpaceSavingTopKSweepWithoutDecayOrPenalties) {
   std::unordered_map<std::string, uint32_t> sweep_hits;
   sweep_hits["key_hot"] = 5;
   sweep_hits["key_warm"] = 0;
-  tracker.ApplyDecayAndPenalties(sweep_hits,
-                                 /*apply_decay_and_penalties=*/false);
+  tracker.AddHits(sweep_hits, /*in_window=*/false);
 
   auto top = tracker.GetTopK(2);
   ASSERT_EQ(top.size(), 2);
@@ -272,37 +273,6 @@ TEST_F(HotMemTableTest, IteratorSeekAndSortedOrder) {
   ASSERT_FALSE(iter->Valid());
 }
 
-TEST_F(HotMemTableTest, ConsecutiveWindowSkewnessTracking) {
-  SpaceSavingTopK tracker(1024);
-
-  // Initial state: HotTable active
-  bool active = true;
-
-  // Window 1: Flat flush (0.1% cold duplicates, 0.1% hot absorption)
-  tracker.RecordFlushWindow(/*total_cold=*/1000, /*dup_cold=*/1, /*hot_hits=*/1, /*hot_misses=*/1000);
-  bool skewed = tracker.IsWorkloadSkewed(active, /*min_dup=*/0.20, /*min_abs=*/0.20, /*consecutive_windows=*/2);
-  ASSERT_TRUE(skewed); // 1st flat window: stays active
-
-  // Window 2: Second flat flush
-  tracker.RecordFlushWindow(1000, 1, 0, 1000);
-  skewed = tracker.IsWorkloadSkewed(active, 0.20, 0.20, 2);
-  ASSERT_FALSE(skewed); // 2nd flat window: transitions to disabled!
-
-  // Now HotTable is disabled
-  active = false;
-  tracker.Clear();
-
-  // Window 3: 1st skewed flush (30% cold duplicates)
-  tracker.RecordFlushWindow(1000, 300, 0, 1000);
-  skewed = tracker.IsWorkloadSkewed(active, 0.20, 0.20, 2);
-  ASSERT_FALSE(skewed); // 1st skewed window: stays disabled
-
-  // Window 4: 2nd skewed flush (40% cold duplicates)
-  tracker.RecordFlushWindow(1000, 400, 0, 1000);
-  skewed = tracker.IsWorkloadSkewed(active, 0.20, 0.20, 2);
-  ASSERT_TRUE(skewed); // 2nd skewed window: transitions to enabled!
-}
-
 TEST_F(HotMemTableTest, RouterDisableAndAdaptiveRebuild) {
   HotTableRouter router(1024);
   ASSERT_TRUE(router.IsActive());
@@ -320,33 +290,122 @@ TEST_F(HotMemTableTest, RouterDisableAndAdaptiveRebuild) {
   ASSERT_TRUE(router.IsActive());
   router.Add("test_key2");
   ASSERT_TRUE(router.MayContain("test_key2"));
+}
 
-  // Test tracker duplicate ratio and heavy hitter counts
-  SpaceSavingTopK tracker(1024);
-  tracker.RecordFlushWindow(1000, 2); // 0.2% duplicate ratio (uniform)
-  ASSERT_LT(tracker.GetRecentDuplicateRatio(), 0.005);
-  ASSERT_EQ(tracker.QualifiedHeavyHittersCount(2), 0);
+TEST_F(HotMemTableTest, CostModelThresholds) {
+  HotTableCostModel m;
+  m.epoch_flushes = 5;
+  m.rebuild_cost = 1.0;
+  m.memtable_bytes = 64ull << 20;
+  m.wal_limit_bytes = 1ull << 30;
+  ASSERT_NEAR(m.EnableThreshold(), 1.0 / 6.0, 1e-9);
+  ASSERT_NEAR(m.DisableThreshold(), 0.0625, 1e-9);
+  ASSERT_FALSE(m.DisableThresholdClamped());
 
-  tracker.Update("hot_key1", 10);
-  tracker.Update("hot_key2", 5);
-  tracker.RecordFlushWindow(100, 15); // 15% duplicate ratio (skewed)
-  ASSERT_GE(tracker.GetRecentDuplicateRatio(), 0.005);
-  ASSERT_EQ(tracker.QualifiedHeavyHittersCount(2), 2);
+  struct Case {
+    const char* name;
+    bool enabled;
+    double a;
+    double a_hat;
+    HotTableDecision expected;
+  };
+  const Case cases[] = {
+      {"enable", false, 0.0, 0.20, HotTableDecision::kEnable},
+      {"stay_disabled", false, 0.0, 0.10, HotTableDecision::kStayDisabled},
+      // Hysteresis: between a_off and a_on, an active HotTable stays.
+      {"hysteresis_keeps_active", true, 0.10, 0.10,
+       HotTableDecision::kContinue},
+      {"shift_rebuilds", true, 0.03, 0.45, HotTableDecision::kRebuild},
+      {"small_drift_continues", true, 0.40, 0.45, HotTableDecision::kContinue},
+      {"low_absorption_disables", true, 0.03, 0.03, HotTableDecision::kDisable},
+      // Fully absorbed: nothing to gain from rebuilding.
+      {"fully_absorbed_continues", true, 1.0, 1.0, HotTableDecision::kContinue},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    ASSERT_EQ(DecideHotTable(m, c.enabled, c.a, c.a_hat), c.expected);
+  }
+}
+
+TEST_F(HotMemTableTest, CostModelWalLimitEdgeCases) {
+  HotTableCostModel m;
+  m.epoch_flushes = 5;
+  m.rebuild_cost = 1.0;
+  m.memtable_bytes = 64ull << 20;
+  // W unknown: never disables.
+  m.wal_limit_bytes = 0;
+  ASSERT_EQ(m.DisableThreshold(), 0.0);
+  ASSERT_EQ(DecideHotTable(m, true, 0.0, 0.0), HotTableDecision::kContinue);
+  // C * (E + kappa) >= W: the disable threshold is clamped to the enable one.
+  m.wal_limit_bytes = 128ull << 20;
+  ASSERT_TRUE(m.DisableThresholdClamped());
+  ASSERT_NEAR(m.DisableThreshold(), m.EnableThreshold(), 1e-12);
+}
+
+TEST_F(HotMemTableTest, OnlyAppliedWritesCountAsHits) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot(cmp, 1 << 20, 64);
+  ASSERT_TRUE(hot.Add("k", Slice(), kTypeValue, 0, 0));
+  std::string v;
+  Status s;
+  hot.Get("k", &v, &s);
+  std::unordered_map<std::string, uint32_t> hits;
+  hot.SweepHits(&hits);
+  ASSERT_EQ(hits["k"], 0u);
+
+  ASSERT_TRUE(hot.UpdateInPlace("k", "v1", kTypeValue, 5));
+  ASSERT_TRUE(hot.Get("k", &v, &s));
+  // Stale: older than the stored version, so not applied.
+  ASSERT_TRUE(hot.UpdateInPlace("k", "old", kTypeValue, 3));
+  hits.clear();
+  hot.SweepHits(&hits);
+  ASSERT_EQ(hits["k"], 1u);
+}
+
+TEST_F(HotMemTableTest, TrackerWindowCounts) {
+  SpaceSavingTopK t(/*max_capacity=*/2);
+  t.Update("a", 5, /*in_window=*/true);
+  t.Update("b", 3, /*in_window=*/false);
+  // Evicts "b" (minimum 3): "c" inherits 3 as count, not as window activity.
+  t.Update("c", 2, /*in_window=*/true);
+  auto top = t.GetTopK(2);
+  ASSERT_EQ(top.size(), 2u);
+  ASSERT_EQ(top[0].key, "c");
+  ASSERT_EQ(top[0].count, 5u);
+  ASSERT_EQ(top[0].window_count, 2u);
+  ASSERT_EQ(top[1].key, "a");
+  ASSERT_EQ(top[1].window_count, 5u);
+  // Both keys are covered: (5 + 2) / 10.
+  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.7, 1e-9);
+  // The prediction reset the window.
+  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.0);
+  // Memory cutoff: with 12 bytes and 10 + 1 bytes per key, only the top key
+  // ("a", now count 9) fits.
+  t.Update("a", 4, true);
+  t.Update("c", 1, true);
+  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, /*budget_bytes=*/12,
+                                                /*per_key_bytes=*/10, 10),
+              0.4, 1e-9);
+  // Hits outside a window rank keys but are not window activity.
+  std::unordered_map<std::string, uint32_t> hits{{"a", 7}};
+  t.AddHits(hits, /*in_window=*/false);
+  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.0);
 }
 
 TEST_F(HotMemTableTest, ScanProbeIntervalBacksOffOnceConfidentlyFlat) {
   struct TestCase {
     std::string name;
-    uint32_t flat_windows;
+    uint32_t stay_disabled_windows;
     uint32_t threshold_windows;
     uint32_t max_backoff_flushes;
     uint32_t expected_interval;
   };
   TestCase cases[] = {
       // Still within (or at) the threshold: probe every flush.
-      {"zero_flat_windows", 0, 2, 16, 1},
+      {"zero_stay_disabled_windows", 0, 2, 16, 1},
       {"at_threshold", 2, 2, 16, 1},
-      // Past the threshold: interval grows with flat_windows, capped by
+      // Past the threshold: interval grows with stay_disabled_windows, capped
+      // by
       // max_backoff_flushes.
       {"just_past_threshold", 3, 2, 16, 3},
       {"grows_with_flatness", 10, 2, 16, 10},
@@ -357,10 +416,10 @@ TEST_F(HotMemTableTest, ScanProbeIntervalBacksOffOnceConfidentlyFlat) {
   };
   for (const auto& tc : cases) {
     SCOPED_TRACE(tc.name);
-    ASSERT_EQ(
-        SpaceSavingTopK::ComputeScanProbeInterval(
-            tc.flat_windows, tc.threshold_windows, tc.max_backoff_flushes),
-        tc.expected_interval);
+    ASSERT_EQ(SpaceSavingTopK::ComputeScanProbeInterval(
+                  tc.stay_disabled_windows, tc.threshold_windows,
+                  tc.max_backoff_flushes),
+              tc.expected_interval);
   }
 }
 

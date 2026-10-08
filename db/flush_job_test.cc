@@ -201,14 +201,8 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     cf_options_.max_write_buffer_number = 4;
     cf_options_.hot_table_write_buffer_size = 1024 * 1024;
     cf_options_.hot_table_max_value_size = 256;
-    cf_options_.hot_table_min_duplicate_ratio = 0.20;
-    cf_options_.hot_table_min_absorption_ratio = 0.20;
-    // A single skewed (or flat) flush window is enough to flip
-    // IsWorkloadSkewed()'s decision, so SpaceSavingTopK::Clear() (which
-    // fires on a losing decision) never fires on the very first flush these
-    // tests exercise, and the just-recorded duplicate ratio survives long
-    // enough to be observed.
-    cf_options_.hot_table_consecutive_threshold_windows = 1;
+    // One-flush decision windows, so one skewed flush enables HotTable.
+    cf_options_.virtual_flush_interval_flushes = 1;
   }
 
   // Builds an immutable memtable holding `key_counts` (key -> number of
@@ -237,19 +231,24 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     return new_mem;
   }
 
-  // Flushes every immutable memtable of `cfd` with a standalone FlushJob.
+  // Flushes every immutable memtable of `cfd` with a standalone FlushJob
+  // that reports to the DB's statistics.
   void FlushImmutableMemtables(ColumnFamilyData* cfd) {
+    FlushImmutableMemtables(cfd, db_options_.statistics.get());
+  }
+
+  // Same, reporting to `stats` (may be null).
+  void FlushImmutableMemtables(ColumnFamilyData* cfd, Statistics* stats) {
     JobContext job_context(0);
     EventLogger event_logger(db_options_.info_log.get());
     job_context.InitSnapshotContext(nullptr, nullptr, kMaxSequenceNumber, {});
     FlushJob flush_job(
         dbname_, cfd, db_options_, cfd->GetLatestMutableCFOptions(),
-        std::numeric_limits<uint64_t>::max() /* memtable_id */,
-        env_options_, versions_.get(), &mutex_, &shutting_down_,
-        &job_context, FlushReason::kTest, nullptr, nullptr, nullptr,
-        kNoCompression, db_options_.statistics.get(), &event_logger, true,
-        true /* sync_output_directory */, true /* write_manifest */,
-        Env::Priority::USER, nullptr /*IOTracer*/,
+        std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
+        versions_.get(), &mutex_, &shutting_down_, &job_context,
+        FlushReason::kTest, nullptr, nullptr, nullptr, kNoCompression, stats,
+        &event_logger, true, true /* sync_output_directory */,
+        true /* write_manifest */, Env::Priority::USER, nullptr /*IOTracer*/,
         empty_seqno_to_time_mapping_);
     FileMetaData file_meta;
     mutex_.Lock();
@@ -266,10 +265,22 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     FlushImmutableMemtables(cfd);
   }
 
-  // Stages a pending HotTable from one skewed flush.
+  // Stages a pending HotTable from skewed flushes (one decision window).
   void StageHotTable(ColumnFamilyData* cfd) {
-    FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
+    for (uint32_t i = 0;
+         i < cf_options_.virtual_flush_interval_flushes && !HasStaged(cfd);
+         i++) {
+      FlushMemtableWithKeys(cfd, {{"unique_a", 1}, {"heavy_dup_1", 20}});
+    }
+    ASSERT_TRUE(HasStaged(cfd));
     ASSERT_EQ(cfd->hot_mem(), nullptr);
+  }
+
+  bool HasStaged(ColumnFamilyData* cfd) {
+    mutex_.Lock();
+    const bool staged = cfd->HasStagedHotTable();
+    mutex_.Unlock();
+    return staged;
   }
 
   // Activates the staged HotTable at a memtable switch that seals
@@ -457,8 +468,16 @@ TEST_F(FlushJobHotTableTest, DuplicateScanFusedMatchesManualCount) {
   // HotTableDupCountingIterator in flush_job.cc) instead of a second,
   // separate scan -- this test asserts the fused result matches what the
   // old standalone scan would have computed.
-  ASSERT_NEAR(cfd->space_saving_topk()->GetRecentDuplicateRatio(), 0.5, 1e-9);
-  ASSERT_EQ(cfd->space_saving_topk()->QualifiedHeavyHittersCount(2), 2u);
+  // The tracker got both runs (3 and 2 versions); this flush also ended a
+  // one-flush decision window, which aged them once (x0.5, rounded down).
+  auto top = cfd->space_saving_topk()->GetTopK(10, /*min_count=*/1);
+  ASSERT_EQ(top.size(), 2u);
+  std::map<std::string, uint64_t> counts;
+  for (const auto& e : top) {
+    counts[e.key] = e.count;
+  }
+  ASSERT_EQ(counts["dup_b"], 1u);
+  ASSERT_EQ(counts["dup_a"], 1u);
 }
 
 // With no HotTable active, a skewed flush stages a pending HotTable; it is
@@ -534,6 +553,33 @@ TEST_F(FlushJobHotTableWindowTest, ShiftCheckWaitsForWindowOfFlushes) {
   ASSERT_TRUE(cfd->HotTableSealRequested());
 }
 
+// The absorption ratio a is measured from swept hits and flushed entries,
+// so it does not depend on Statistics.
+TEST_F(FlushJobHotTableTest, WindowMeasuredWithoutStatistics) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  StageHotTable(cfd);
+  ActivateStagedHotTable(cfd, cfd->mem());
+  for (SequenceNumber seq = 1; seq <= 30; seq++) {
+    ASSERT_TRUE(
+        cfd->hot_mem()->UpdateInPlace("heavy_dup_1", "v", kTypeValue, seq));
+  }
+  double measured = -1.0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "ColumnFamilyData::EndHotTableWindow:a",
+      [&](void* arg) { measured = *static_cast<double*>(arg); });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::vector<std::pair<std::string, int>> unique_keys;
+  for (int i = 0; i < 10; i++) {
+    unique_keys.emplace_back("cold_" + std::to_string(i), 1);
+  }
+  AddImmutableMemtable(cfd, unique_keys);
+  FlushImmutableMemtables(cfd, /*stats=*/nullptr);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // 30 absorbed writes, 10 appended: a = 30 / 40.
+  ASSERT_NEAR(measured, 0.75, 1e-9);
+}
+
 // A rebuilt HotTable must not start out full, or its first hot write would
 // immediately request a seal.
 TEST_F(FlushJobHotTableTest, StagedHotTableLeavesHeadroom) {
@@ -542,12 +588,8 @@ TEST_F(FlushJobHotTableTest, StagedHotTableLeavesHeadroom) {
   for (int i = 0; i < 20000; i++) {
     cfd->space_saving_topk()->Update("candidate_" + std::to_string(i), 10);
   }
-  cfd->space_saving_topk()->RecordFlushWindow(/*total_cold_entries=*/100,
-                                              /*duplicate_cold_entries=*/50,
-                                              /*hot_hits=*/0,
-                                              /*hot_misses=*/0);
   mutex_.Lock();
-  cfd->RebuildHotTable(/*previous_epoch_active=*/false, &mutex_);
+  cfd->RebuildHotTable(&mutex_);
   cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
   mutex_.Unlock();
   ASSERT_NE(cfd->hot_mem(), nullptr);

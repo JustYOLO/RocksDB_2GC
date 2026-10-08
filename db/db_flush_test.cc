@@ -4226,9 +4226,8 @@ class DBFlushHotTableTest : public DBTestBase {
     options.enable_hot_table = true;
     options.hot_table_write_buffer_size = 64 << 10;
     options.hot_table_max_value_size = 64;
-    options.hot_table_min_duplicate_ratio = 0.2;
-    options.hot_table_min_absorption_ratio = 0.2;
-    options.hot_table_consecutive_threshold_windows = 1;
+    // One-flush decision windows, so one skewed flush enables HotTable.
+    options.virtual_flush_interval_flushes = 1;
     // Stage the next HotTable at the first flush after activation, so tests
     // that seal a pair find one staged. Staging thresholds are tested
     // separately below.
@@ -4288,11 +4287,14 @@ class DBFlushHotTableTest : public DBTestBase {
 
   // Writes cold keys until the memtable fills up and a memtable-only switch
   // adds an immutable memtable (whose flush is then scheduled as usual).
+  // Each cold write is paired with an absorbed write to hot_b, so the active
+  // HotTable keeps absorbing and the cost model keeps it.
   void FillColdMemtable(const std::string& prefix) {
     uint64_t imm_before = 0;
     ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumImmutableMemTable,
                                     &imm_before));
     for (int i = 0; i < 1000; i++) {
+      ASSERT_OK(Put("hot_b", "fill" + std::to_string(i)));
       ASSERT_OK(Put(prefix + std::to_string(i), std::string(1000, 'c')));
       uint64_t imm = 0;
       ASSERT_TRUE(
@@ -4415,9 +4417,6 @@ TEST_F(DBFlushHotTableTest, StagesOnceNearHotTableLimit) {
   Options options = HotTableOptions();
   options.write_buffer_size = 64 << 10;
   options.hot_table_stage_ahead_ratio = 0.5;
-  // These tests write mostly cold keys; keep the workload judged skewed so
-  // staging is decided by the thresholds alone.
-  options.hot_table_min_absorption_ratio = 0.0;
   DestroyAndReopen(options);
   ActivateHotTable();
   HotMemTable* old_hot = cfd()->hot_mem();
@@ -4460,9 +4459,6 @@ TEST_F(DBFlushHotTableTest, StagesNearWalLimit) {
   options.write_buffer_size = 64 << 10;
   options.max_total_wal_size = 512 << 10;
   options.hot_table_stage_ahead_ratio = 0.25;
-  // These tests write mostly cold keys; keep the workload judged skewed so
-  // staging is decided by the thresholds alone.
-  options.hot_table_min_absorption_ratio = 0.0;
   DestroyAndReopen(options);
   ActivateHotTable();
   ASSERT_FALSE(HasStagedHotTable());
@@ -4658,6 +4654,8 @@ TEST_F(DBFlushHotTableTest, HotTableDataSurvivesMemtableOnlyFlush) {
 
   ASSERT_OK(Put("hot_a", "survivor"));
   for (int i = 0; i < 200; i++) {
+    // Absorbed writes keep the HotTable worth keeping.
+    ASSERT_OK(Put("hot_b", "b" + std::to_string(i)));
     ASSERT_OK(Put("cold_" + std::to_string(i), std::string(1000, 'c')));
   }
   ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
@@ -4667,6 +4665,135 @@ TEST_F(DBFlushHotTableTest, HotTableDataSurvivesMemtableOnlyFlush) {
   Reopen(options);
   ASSERT_EQ(Get("hot_a"), "survivor");
   ASSERT_EQ(Get("cold_199"), std::string(1000, 'c'));
+}
+
+// Cost model, end to end (E = 1, kappa = 1: a_on = 0.5).
+
+TEST_F(DBFlushHotTableTest, UniformStaysDisabled) {
+  Options options = HotTableOptions();
+  DestroyAndReopen(options);
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 60; i++) {
+      ASSERT_OK(
+          Put("u" + std::to_string(round) + "_" + std::to_string(i), "v"));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  ASSERT_FALSE(HasStagedHotTable());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_DECISION_ENABLE), 0u);
+}
+
+TEST_F(DBFlushHotTableTest, ZipfianEnablesWithinOneWindow) {
+  Options options = HotTableOptions();
+  DestroyAndReopen(options);
+  for (int i = 0; i < 20; i++) {
+    ASSERT_OK(Put("hot_a", "a" + std::to_string(i)));
+    ASSERT_OK(Put("hot_b", "b" + std::to_string(i)));
+    ASSERT_OK(Put("hot_c", "c" + std::to_string(i)));
+  }
+  ASSERT_OK(Put("cold", "c"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_DECISION_ENABLE), 1u);
+  ASSERT_TRUE(HasStagedHotTable());
+  ASSERT_OK(Put("activate", "x"));
+  ASSERT_OK(Flush());
+  ASSERT_NE(cfd()->hot_mem(), nullptr);
+}
+
+// Keys outside the active HotTable become hot: the window predicts a much
+// better HotTable, so the active one is sealed and rebuilt around them.
+TEST_F(DBFlushHotTableTest, HotSetShiftRebuilds) {
+  Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  HotMemTable* old_hot = cfd()->hot_mem();
+
+  // Fill a memtable with versions of two new keys only.
+  for (int i = 0; i < 40; i++) {
+    ASSERT_OK(Put("shift_a", std::string(1000, 'a')));
+    ASSERT_OK(Put("shift_b", std::string(1000, 'b')));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_GE(TestGetTickerCount(options, HOT_TABLE_DECISION_REBUILD), 1u);
+  // The seal is armed after that flush: the next write schedules the switch
+  // and the one after performs it.
+  ASSERT_OK(Put("x1", "1"));
+  ASSERT_OK(Put("x2", "2"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_NE(cfd()->hot_mem(), nullptr);
+  ASSERT_NE(cfd()->hot_mem(), old_hot);
+
+  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
+  ASSERT_OK(Put("shift_a", "new"));
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
+  ASSERT_EQ(Get("shift_a"), "new");
+}
+
+// A HotTable that absorbs (almost) nothing, with nothing better predicted,
+// is sealed with no successor.
+TEST_F(DBFlushHotTableTest, LowAbsorptionDisables) {
+  Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
+  options.max_total_wal_size = 1 << 20;  // a_off = 64KB / 1MB = 0.0625
+  DestroyAndReopen(options);
+  ActivateHotTable();
+
+  for (int i = 0;
+       i < 200 && TestGetTickerCount(options, HOT_TABLE_DECISION_DISABLE) == 0;
+       i++) {
+    ASSERT_OK(Put("cold_" + std::to_string(i), std::string(1000, 'c')));
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  }
+  ASSERT_GE(TestGetTickerCount(options, HOT_TABLE_DECISION_DISABLE), 1u);
+  ASSERT_FALSE(HasStagedHotTable());
+  // The seal is armed after the deciding flush.
+  ASSERT_OK(Put("x1", "1"));
+  ASSERT_OK(Put("x2", "2"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_EQ(cfd()->hot_mem(), nullptr);
+  ASSERT_FALSE(HasStagedHotTable());
+  ASSERT_EQ(Get("hot_a"), "a19");
+}
+
+// An explicit flush seals the HotTable but is not a decision: with nothing
+// staged, the CF stays enabled and stages a successor right away.
+TEST_F(DBFlushHotTableTest, ExplicitFlushKeepsEnabledState) {
+  Options options = HotTableOptions();
+  options.hot_table_stage_ahead_ratio = 1.0;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  ASSERT_FALSE(HasStagedHotTable());
+  auto decisions = [&]() {
+    return TestGetTickerCount(options, HOT_TABLE_DECISION_ENABLE) +
+           TestGetTickerCount(options, HOT_TABLE_DECISION_REBUILD) +
+           TestGetTickerCount(options, HOT_TABLE_DECISION_DISABLE) +
+           TestGetTickerCount(options, HOT_TABLE_DECISION_CONTINUE);
+  };
+  const uint64_t before = decisions();
+
+  ASSERT_OK(Put("hot_a", "flushed"));
+  ASSERT_OK(Flush());
+  ASSERT_TRUE(HasStagedHotTable() || cfd()->hot_mem() != nullptr);
+  ASSERT_EQ(decisions(), before);
+  ASSERT_EQ(Get("hot_a"), "flushed");
+}
+
+// An explicit flush persists the HotTable's values to an SST and releases
+// the WAL that held them.
+TEST_F(DBFlushHotTableTest, FlushPersistsHotTableAndReleasesWal) {
+  Options options = HotTableOptions();
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put("hot_a", "persisted" + std::to_string(i)));
+  }
+  const uint64_t wal_before = dbfull()->TEST_wals_total_size();
+  ASSERT_OK(Flush());
+  ASSERT_LT(dbfull()->TEST_wals_total_size(), wal_before);
+  Reopen(options);
+  ASSERT_EQ(Get("hot_a"), "persisted99");
 }
 
 TEST_F(DBFlushHotTableTest, RequiresFourWriteBufferSlots) {

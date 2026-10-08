@@ -1799,22 +1799,17 @@ DEFINE_uint64(hot_table_write_buffer_size, 64 * 1024 * 1024,
               "Size of Hot Table in bytes");
 DEFINE_uint32(hot_table_max_value_size, 1024,
               "Max value padding for in-place Hot Table nodes in bytes");
-DEFINE_uint32(virtual_flush_interval_flushes, 1,
-              "Flushes of HotTable-era memtables observed together before "
-              "deciding whether a hot-key shift should end the HotTable");
+DEFINE_uint32(virtual_flush_interval_flushes, 5,
+              "E: HotTable decision window, in memtable flushes");
 DEFINE_double(hot_table_decay_factor, 0.5,
               "Aging decay factor for History Tracker");
 DEFINE_double(hot_table_zero_hit_penalty, 0.25,
               "0-hit penalty factor for History Tracker");
-DEFINE_double(hot_table_min_duplicate_ratio, 0.20,
-              "Minimum duplicate ratio in cold memtable to consider workload skewed");
-DEFINE_double(hot_table_min_absorption_ratio, 0.20,
-              "Minimum write absorption ratio in HotTable to consider workload skewed");
+DEFINE_double(hot_table_rebuild_cost, 1.0,
+              "kappa: cost of one HotTable seal, in memtable flushes");
 DEFINE_double(hot_table_stage_ahead_ratio, 0.75,
               "Stage the next HotTable once the WAL or the active HotTable "
               "reaches this fraction of its limit");
-DEFINE_uint32(hot_table_consecutive_threshold_windows, 2,
-              "Number of consecutive flush windows required to switch HotTable state");
 
 DEFINE_bool(enable_level_up_compaction, false,
             "Enable Level Up Compaction for read-hot ranges");
@@ -5918,11 +5913,8 @@ class Benchmark {
     options.virtual_flush_interval_flushes = FLAGS_virtual_flush_interval_flushes;
     options.hot_table_decay_factor = FLAGS_hot_table_decay_factor;
     options.hot_table_zero_hit_penalty = FLAGS_hot_table_zero_hit_penalty;
-    options.hot_table_min_duplicate_ratio = FLAGS_hot_table_min_duplicate_ratio;
-    options.hot_table_min_absorption_ratio = FLAGS_hot_table_min_absorption_ratio;
+    options.hot_table_rebuild_cost = FLAGS_hot_table_rebuild_cost;
     options.hot_table_stage_ahead_ratio = FLAGS_hot_table_stage_ahead_ratio;
-    options.hot_table_consecutive_threshold_windows =
-        FLAGS_hot_table_consecutive_threshold_windows;
     options.enable_level_up_compaction = FLAGS_enable_level_up_compaction;
     options.level_up_warmth_threshold = FLAGS_level_up_warmth_threshold;
     options.level_up_min_skew_ratio = FLAGS_level_up_min_skew_ratio;

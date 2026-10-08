@@ -161,6 +161,11 @@ enum Tickers : uint32_t {
   HOT_TABLE_SEAL_DEFERRED_COUNT,
   // # of times a next HotTable was built (staged) for a coming seal.
   HOT_TABLE_STAGE_COUNT,
+  // HotTable cost-model decisions, one per decision window.
+  HOT_TABLE_DECISION_ENABLE,
+  HOT_TABLE_DECISION_REBUILD,
+  HOT_TABLE_DECISION_DISABLE,
+  HOT_TABLE_DECISION_CONTINUE,
 
   // Level Up Compaction tickers
   LEVEL_UP_KEY_CHECKED,

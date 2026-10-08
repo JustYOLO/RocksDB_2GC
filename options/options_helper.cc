@@ -378,11 +378,8 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->virtual_flush_interval_flushes = ioptions.virtual_flush_interval_flushes;
   cf_opts->hot_table_decay_factor = ioptions.hot_table_decay_factor;
   cf_opts->hot_table_zero_hit_penalty = ioptions.hot_table_zero_hit_penalty;
-  cf_opts->hot_table_min_duplicate_ratio = ioptions.hot_table_min_duplicate_ratio;
-  cf_opts->hot_table_min_absorption_ratio = ioptions.hot_table_min_absorption_ratio;
+  cf_opts->hot_table_rebuild_cost = ioptions.hot_table_rebuild_cost;
   cf_opts->hot_table_stage_ahead_ratio = ioptions.hot_table_stage_ahead_ratio;
-  cf_opts->hot_table_consecutive_threshold_windows =
-      ioptions.hot_table_consecutive_threshold_windows;
   cf_opts->hot_table_max_scan_backoff_flushes =
       ioptions.hot_table_max_scan_backoff_flushes;
 

@@ -94,6 +94,8 @@ class FlushJob {
              bool* skipped_since_bg_error = nullptr,
              ErrorHandler* error_handler = nullptr);
   void Cancel();
+  // Effective WAL size limit used by the HotTable cost model (W).
+  void SetHotTableWalLimit(uint64_t bytes) { hot_wal_limit_ = bytes; }
   const autovector<ReadOnlyMemTable*>& GetMemTables() const { return mems_; }
 
   // Returns the log number recorded in the flush VersionEdit after
@@ -164,9 +166,10 @@ class FlushJob {
   // True if any picked memtable carries a sealed HotTable. MemPurge rewrites
   // only memtable contents, so it must not run on such memtables.
   bool MemtablesHaveSealedHotTable() const;
-  // Requires db_mutex held. After a successful flush: sweeps the hit counts
-  // of the flushed HotTables, then either stages the next HotTable (none
-  // active) or checks for a hot-key shift that should end the active one.
+  // Requires db_mutex held. After a successful flush: folds the flushed
+  // HotTables' remaining hits and this flush's duplicate runs into the
+  // hot-key tracker, and advances the HotTable decision window
+  // (ColumnFamilyData::EndHotTableWindow()).
   void UpdateHotTableAfterFlush(
       const std::vector<HotMemTable*>& flushed_hot_mems);
   // The rate limiter priority (io_priority) is determined dynamically here.
@@ -257,6 +260,11 @@ class FlushJob {
   // window by UpdateHotTableAfterFlush().
   ColumnFamilyData::HotShiftWindow hot_flush_observation_;
   bool hot_flush_observed_ = false;
+  // Duplicate-key runs (key, versions) seen while this flush wrote its SST;
+  // applied to the hot-key tracker by UpdateHotTableAfterFlush().
+  std::vector<std::pair<std::string, uint64_t>> hot_dup_runs_;
+  // Effective WAL size limit (DBImpl::GetMaxTotalWalSize()); 0 = unknown.
+  uint64_t hot_wal_limit_ = 0;
   VersionEdit* edit_;
   Version* base_;
   uint64_t max_next_log_number_{0};

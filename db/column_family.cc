@@ -43,6 +43,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
 #include "table/merging_iterator.h"
+#include "test_util/sync_point.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
@@ -769,17 +770,12 @@ void ColumnFamilyData::ExecuteVirtualFlush(HotMemTable* flushed_hot_mem) {
       !space_saving_topk_) {
     return;
   }
+  // Hits since the last window end belong to no complete window: they rank
+  // keys (count) but are not window activity, and aging happens per window
+  // (EndHotTableWindow()).
   std::unordered_map<std::string, uint32_t> hit_map;
   flushed_hot_mem->SweepHits(&hit_map);
-  // A table sealed before it served even one whole memtable (e.g. an
-  // explicit flush right after activation) has mostly-zero hit counts that
-  // say nothing about which keys went cold. Penalizing them would shrink the
-  // next HotTable's key set for no reason, so only merge the hits it did see.
-  // A table that filled up did serve plenty of writes, whatever the count.
-  const bool hits_are_meaningful =
-      flushed_hot_mem->ObservedFlushes() > 0 || flushed_hot_mem->IsFull();
-  space_saving_topk_->ApplyDecayAndPenalties(hit_map, hits_are_meaningful);
-  RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
+  space_saving_topk_->AddHits(hit_map, /*in_window=*/false);
 }
 
 bool ColumnFamilyData::AddHotShiftObservation(const HotShiftWindow& flush,
@@ -789,14 +785,118 @@ bool ColumnFamilyData::AddHotShiftObservation(const HotShiftWindow& flush,
   hot_shift_window_.flushes += 1;
   hot_shift_window_.probed_entries += flush.probed_entries;
   hot_shift_window_.duplicate_entries += flush.duplicate_entries;
-  hot_shift_window_.hits += flush.hits;
-  hot_shift_window_.misses += flush.misses;
+  hot_shift_window_.appended_entries += flush.appended_entries;
   if (hot_shift_window_.flushes < std::max<uint32_t>(window_flushes, 1)) {
     return false;
   }
   *out = hot_shift_window_;
   hot_shift_window_ = HotShiftWindow();
   return true;
+}
+
+bool ColumnFamilyData::AddDisabledWindowObservation(const HotShiftWindow& flush,
+                                                    uint32_t window_flushes,
+                                                    HotShiftWindow* out) {
+  hot_disabled_window_.flushes += 1;
+  hot_disabled_window_.probed_entries += flush.probed_entries;
+  hot_disabled_window_.duplicate_entries += flush.duplicate_entries;
+  hot_disabled_window_.appended_entries += flush.appended_entries;
+  if (hot_disabled_window_.flushes < std::max<uint32_t>(window_flushes, 1)) {
+    return false;
+  }
+  *out = hot_disabled_window_;
+  hot_disabled_window_ = HotShiftWindow();
+  return true;
+}
+
+HotTableDecision ColumnFamilyData::EndHotTableWindow(
+    bool active, const HotShiftWindow& window, uint64_t wal_limit) {
+  std::unordered_map<std::string, uint32_t> hit_map;
+  uint64_t hits = 0;
+  std::shared_ptr<HotMemTable> hot = active ? hot_mem_shared() : nullptr;
+  if (hot != nullptr) {
+    // exchange(0) per key: safe while writers keep updating.
+    hot->SweepHits(&hit_map);
+    for (const auto& kv : hit_map) {
+      hits += kv.second;
+    }
+    space_saving_topk_->AddHits(hit_map, /*in_window=*/true);
+  }
+  const uint64_t window_writes =
+      hot != nullptr ? hits + window.appended_entries : window.probed_entries;
+  double a = (hot != nullptr && window_writes > 0)
+                 ? static_cast<double>(hits) / window_writes
+                 : 0.0;
+  TEST_SYNC_POINT_CALLBACK("ColumnFamilyData::EndHotTableWindow:a", &a);
+  size_t max_keys = ioptions_.hot_table_write_buffer_size /
+                    (32 + ioptions_.hot_table_max_value_size);
+  if (max_keys == 0) max_keys = 1024;
+  const double a_hat = space_saving_topk_->PredictAbsorptionAndResetWindow(
+      max_keys, ioptions_.hot_table_write_buffer_size,
+      sizeof(HotNode) + ioptions_.hot_table_max_value_size +
+          kHotTableIndexOverheadBytes,
+      window_writes);
+  space_saving_topk_->Age(hot != nullptr ? &hit_map : nullptr);
+  RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
+
+  HotTableCostModel model;
+  model.epoch_flushes = ioptions_.virtual_flush_interval_flushes;
+  model.rebuild_cost = ioptions_.hot_table_rebuild_cost;
+  model.memtable_bytes = mutable_cf_options_.write_buffer_size;
+  model.wal_limit_bytes = wal_limit;
+  if (model.DisableThresholdClamped() && !hot_threshold_clamp_logged_) {
+    hot_threshold_clamp_logged_ = true;
+    ROCKS_LOG_WARN(ioptions_.info_log,
+                   "[%s] [HotTable] disable threshold %.3f exceeds enable "
+                   "threshold %.3f (C*(E+kappa) >= W); clamped",
+                   GetName().c_str(), model.RawDisableThreshold(),
+                   model.EnableThreshold());
+  }
+  const HotTableDecision decision =
+      DecideHotTable(model, /*enabled=*/hot != nullptr, a, a_hat);
+  ROCKS_LOG_INFO(ioptions_.info_log,
+                 "[%s] [HotTable] window: enabled=%d flushes=%u a=%.3f "
+                 "a_hat=%.3f a_on=%.3f a_off=%.3f gain=%.2f dr=%.3f -> %s",
+                 GetName().c_str(), hot != nullptr ? 1 : 0, window.flushes, a,
+                 a_hat, model.EnableThreshold(), model.DisableThreshold(),
+                 hot != nullptr ? model.RebuildGain(a, a_hat) : 0.0,
+                 window.probed_entries > 0
+                     ? static_cast<double>(window.duplicate_entries) /
+                           static_cast<double>(window.probed_entries)
+                     : 0.0,
+                 HotTableDecisionName(decision));
+
+  Statistics* stats = ioptions_.statistics.get();
+  switch (decision) {
+    case HotTableDecision::kEnable:
+      RecordTick(stats, HOT_TABLE_DECISION_ENABLE);
+      hot_enabled_ = true;
+      hot_stay_disabled_windows_.store(0, std::memory_order_relaxed);
+      break;
+    case HotTableDecision::kStayDisabled:
+      hot_stay_disabled_windows_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case HotTableDecision::kRebuild:
+      RecordTick(stats, HOT_TABLE_DECISION_REBUILD);
+      // A table staged before this window holds the old hot keys; the
+      // stage-ahead path (MaybeStageNextHotTable()) builds a fresh one from
+      // the current keys before the seal is armed.
+      pending_hot_mem_.reset();
+      pending_hot_router_.reset();
+      RequestHotTableSeal();
+      break;
+    case HotTableDecision::kDisable:
+      RecordTick(stats, HOT_TABLE_DECISION_DISABLE);
+      hot_successor_vetoed_ = true;
+      pending_hot_mem_.reset();
+      pending_hot_router_.reset();
+      RequestHotTableSeal();
+      break;
+    case HotTableDecision::kContinue:
+      RecordTick(stats, HOT_TABLE_DECISION_CONTINUE);
+      break;
+  }
+  return decision;
 }
 
 bool ColumnFamilyData::ActiveHotTableHasData() const {
@@ -821,7 +921,8 @@ bool ColumnFamilyData::CanSealHotTableNow() const {
 
 void ColumnFamilyData::MaybeStageNextHotTable(bool wal_near_limit,
                                               InstrumentedMutex* db_mutex) {
-  if (!ioptions_.enable_hot_table || pending_hot_mem_ != nullptr) {
+  if (!ioptions_.enable_hot_table || pending_hot_mem_ != nullptr ||
+      hot_successor_vetoed_) {
     return;
   }
   std::shared_ptr<HotMemTable> active = hot_mem_shared();
@@ -836,12 +937,15 @@ void ColumnFamilyData::MaybeStageNextHotTable(bool wal_near_limit,
   if (!wal_near_limit && !hot_near_limit && !HotTableSealRequested()) {
     return;
   }
-  RebuildHotTable(/*previous_epoch_active=*/true, db_mutex);
+  RebuildHotTable(db_mutex);
 }
 
 void ColumnFamilyData::MaybeArmDeferredHotTableSeal() {
+  // An active HotTable with no writes yet is sealed too: a rebuild or
+  // disable decision (EndHotTableWindow()) must take effect even when the
+  // HotTable absorbed nothing.
   if (!ioptions_.enable_hot_table || !HotTableSealRequested() ||
-      !ActiveHotTableHasData() || !CanSealHotTableNow()) {
+      hot_mem() == nullptr || !CanSealHotTableNow()) {
     return;
   }
   mem_->RequestFlushForHotTableSeal();
@@ -885,6 +989,18 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
     ROCKS_LOG_INFO(ioptions_.info_log,
                    "[%s] [HotTable] Sealed HotTable with memtable %" PRIu64,
                    GetName().c_str(), sealed_mem->GetID());
+    if (hot_successor_vetoed_) {
+      // A kDisable decision: no successor. Back to disabled windows.
+      hot_successor_vetoed_ = false;
+      hot_enabled_ = false;
+      hot_disabled_window_ = HotShiftWindow();
+      hot_stay_disabled_windows_.store(0, std::memory_order_relaxed);
+      pending_hot_mem_.reset();
+      pending_hot_router_.reset();
+      ROCKS_LOG_INFO(ioptions_.info_log, "[%s] [HotTable] Disabled",
+                     GetName().c_str());
+      return;
+    }
   } else {
     // `sealed_mem` is a temporary memtable that ran without a HotTable. A
     // seal request has nothing to seal.
@@ -926,8 +1042,7 @@ uint64_t ColumnFamilyData::MinHotTableLogNumberToKeep(
   return min_log;
 }
 
-void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
-                                       InstrumentedMutex* db_mutex) {
+void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
   if (!ioptions_.enable_hot_table) {
     return;
   }
@@ -944,28 +1059,6 @@ void ColumnFamilyData::RebuildHotTable(bool previous_epoch_active,
   size_t capacity = ioptions_.hot_table_write_buffer_size /
                     (32 + ioptions_.hot_table_max_value_size);
   if (capacity == 0) capacity = 1024;
-
-  const bool hot_table_active = hot_mem_shared() != nullptr;
-  const bool currently_active =
-      hot_table_active || previous_epoch_active || pending_hot_mem_ != nullptr;
-  bool is_skewed = true;
-  if (space_saving_topk_) {
-    is_skewed = space_saving_topk_->IsWorkloadSkewed(
-        currently_active, ioptions_.hot_table_min_duplicate_ratio,
-        ioptions_.hot_table_min_absorption_ratio,
-        ioptions_.hot_table_consecutive_threshold_windows);
-  }
-
-  if (!is_skewed) {
-    // No next HotTable. An active one keeps its key set until it is sealed;
-    // only a CF with no HotTable at all forgets the hot-key history.
-    pending_hot_mem_.reset();
-    pending_hot_router_.reset();
-    if (!hot_table_active && space_saving_topk_) {
-      space_saving_topk_->Clear();
-    }
-    return;
-  }
 
   auto new_hot = std::make_shared<HotMemTable>(
       internal_comparator_, ioptions_.hot_table_write_buffer_size,

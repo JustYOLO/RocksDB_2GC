@@ -245,6 +245,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       io_tracer_, cfd->GetSuperVersion()->ShareSeqnoToTimeMapping(), db_id_,
       db_session_id_, cfd->GetFullHistoryTsLow(), &blob_callback_,
       mutable_db_options_.fast_sst_open, &bg_cv_);
+  flush_job.SetHotTableWalLimit(GetMaxTotalWalSize());
   FileMetaData file_meta;
 
   Status s;
@@ -588,6 +589,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         cfd->GetSuperVersion()->ShareSeqnoToTimeMapping(), db_id_,
         db_session_id_, cfd->GetFullHistoryTsLow(), &blob_callback_,
         mutable_db_options_.fast_sst_open, &bg_cv_));
+    jobs.back()->SetHotTableWalLimit(GetMaxTotalWalSize());
   }
 
   std::vector<FileMetaData> file_meta(num_cfs);

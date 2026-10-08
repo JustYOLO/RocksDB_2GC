@@ -108,10 +108,8 @@ struct ImmutableCFOptions {
   uint32_t virtual_flush_interval_flushes;
   double hot_table_decay_factor;
   double hot_table_zero_hit_penalty;
-  double hot_table_min_duplicate_ratio;
-  double hot_table_min_absorption_ratio;
+  double hot_table_rebuild_cost;
   double hot_table_stage_ahead_ratio;
-  uint32_t hot_table_consecutive_threshold_windows;
   uint32_t hot_table_max_scan_backoff_flushes;
 
   bool enable_level_up_compaction;

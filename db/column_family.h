@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cache/cache_reservation_manager.h"
+#include "db/hot_table_policy.h"
 #include "db/memtable_list.h"
 #include "db/snapshot_checker.h"
 #include "db/table_cache.h"
@@ -481,12 +482,6 @@ class ColumnFamilyData {
   SpaceSavingTopK* space_saving_topk() const { return space_saving_topk_.get(); }
   uint32_t cold_flush_counter() const { return cold_flush_counter_; }
   void IncrementColdFlushCounter() { cold_flush_counter_++; }
-  uint64_t last_hot_write_hits() const { return last_hot_write_hits_; }
-  uint64_t last_hot_write_misses() const { return last_hot_write_misses_; }
-  void set_last_hot_write_stats(uint64_t hits, uint64_t misses) {
-    last_hot_write_hits_ = hits;
-    last_hot_write_misses_ = misses;
-  }
   // HotTable lifecycle. A HotTable is active while hot_mem_ is non-null and
   // spans any number of memtables; its key set is fixed while it is active.
   // Once the active HotTable nears its seal (MaybeStageNextHotTable()), the
@@ -497,16 +492,16 @@ class ColumnFamilyData {
   // the new HotTable. The pair is flushed into one SST. Each HotTable takes
   // one max_write_buffer_number slot.
 
-  // Sweeps the per-key hit counts of a HotTable that is being flushed and
-  // applies decay/penalties to the hot-key tracker. REQUIRES: DB mutex held.
+  // Sweeps the hit counts a HotTable being flushed collected since the last
+  // decision window ended into the hot-key tracker (ranking only; aging
+  // happens per window in EndHotTableWindow()). REQUIRES: DB mutex held.
   void ExecuteVirtualFlush(HotMemTable* flushed_hot_mem);
-  // (Re)builds the staged HotTable that the next seal promotes, replacing
-  // any older staged one; drops it if the workload is no longer skewed.
-  // `previous_epoch_active` tells whether the flush that triggered this call
-  // included a sealed HotTable. The expensive reseed (O(capacity) top-K
-  // extraction and inserts) runs with `db_mutex` released.
+  // Builds the staged HotTable that the next seal promotes from the current
+  // top keys, replacing any older staged one. Callers decide whether one is
+  // wanted. The expensive reseed (O(capacity) top-K extraction and inserts)
+  // runs with `db_mutex` released.
   // REQUIRES: db_mutex held on entry and held again on return.
-  void RebuildHotTable(bool previous_epoch_active, InstrumentedMutex* db_mutex);
+  void RebuildHotTable(InstrumentedMutex* db_mutex);
 
   // While a HotTable is active and nothing is staged yet, builds the next
   // HotTable once the active one nears its seal: `wal_near_limit` (the
@@ -549,8 +544,9 @@ class ColumnFamilyData {
   // memtable and its HotTable, and the staged HotTable (promoted or not)
   // still takes a slot. REQUIRES: DB mutex held, called before the switch.
   bool CanSealHotTableNow() const;
-  // After a flush: if an optional seal was deferred and now fits, requests
-  // the memtable switch that performs it (the next write schedules it).
+  // After a flush: if a seal was requested (or deferred) and now fits,
+  // requests the memtable switch that performs it (the next write schedules
+  // it).
   // REQUIRES: DB mutex held.
   void MaybeArmDeferredHotTableSeal();
   // True if an active HotTable holds unflushed data.
@@ -582,9 +578,8 @@ class ColumnFamilyData {
     // duplicates.
     uint64_t probed_entries = 0;
     uint64_t duplicate_entries = 0;
-    // Writes routed to the active HotTable (hits) or rejected by it (misses).
-    uint64_t hits = 0;
-    uint64_t misses = 0;
+    // Entries of all flushes in the window (writes appended to memtables).
+    uint64_t appended_entries = 0;
   };
   // Adds one flush of memtables written while the active HotTable was
   // active. Once `window_flushes` such flushes have been added, returns true
@@ -592,6 +587,28 @@ class ColumnFamilyData {
   // held.
   bool AddHotShiftObservation(const HotShiftWindow& flush,
                               uint32_t window_flushes, HotShiftWindow* out);
+  // Disabled-state counterpart of AddHotShiftObservation(), over probed
+  // flushes. REQUIRES: DB mutex held.
+  bool AddDisabledWindowObservation(const HotShiftWindow& flush,
+                                    uint32_t window_flushes,
+                                    HotShiftWindow* out);
+  // Ends a decision window: sweeps the active HotTable's hits (if `active`),
+  // measures a and predicts a_hat, ages the tracker, decides with the cost
+  // model (W = `wal_limit`), logs and counts the decision, and applies it
+  // (enable flag, seal request, successor veto). REQUIRES: DB mutex held.
+  HotTableDecision EndHotTableWindow(bool active, const HotShiftWindow& window,
+                                     uint64_t wal_limit);
+  // Decision state: true from a kEnable decision until a seal that follows
+  // a kDisable decision. While true and no HotTable is active, the next
+  // flush stages one without waiting for a window. REQUIRES: DB mutex held.
+  bool HotTableEnabled() const { return hot_enabled_; }
+  // True after a kDisable decision until the seal it requested: no
+  // successor is staged or promoted. REQUIRES: DB mutex held.
+  bool HotSuccessorVetoed() const { return hot_successor_vetoed_; }
+  // Consecutive kStayDisabled decisions (drives probe backoff). Thread-safe.
+  uint32_t hot_stay_disabled_windows() const {
+    return hot_stay_disabled_windows_.load(std::memory_order_relaxed);
+  }
 
   // Single-flight guard for RebuildHotTable(), which releases the DB mutex
   // while reseeding.
@@ -897,14 +914,20 @@ class ColumnFamilyData {
   // over the active HotTable's whole life. Guarded by the DB mutex.
   HotShiftWindow hot_shift_window_;
   uint32_t active_hot_observed_flushes_{0};
+  // Decision state; see HotTableEnabled()/HotSuccessorVetoed(). Guarded by
+  // the DB mutex.
+  bool hot_enabled_{false};
+  bool hot_successor_vetoed_{false};
+  bool hot_threshold_clamp_logged_{false};
+  // Disabled-state decision window in progress. Guarded by the DB mutex.
+  HotShiftWindow hot_disabled_window_;
+  std::atomic<uint32_t> hot_stay_disabled_windows_{0};
   // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
   std::atomic<bool> hot_rebuild_in_flight_{false};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};
   uint32_t cold_flush_counter_{0};
-  uint64_t last_hot_write_hits_{0};
-  uint64_t last_hot_write_misses_{0};
   SuperVersion* super_version_;
 
   // An ordinal representing the current SuperVersion. Updated by

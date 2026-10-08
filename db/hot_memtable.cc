@@ -549,7 +549,7 @@ bool HotMemTable::Get(const Slice& user_key, std::string* value, Status* status,
     v2 = node->seq_version.load(std::memory_order_acquire);
   } while (v1 != v2);
 
-  node->hit_count.fetch_add(1, std::memory_order_relaxed);
+  // Reads are not hits: hit_count counts absorbed writes only.
   return true;
 }
 

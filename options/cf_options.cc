@@ -1157,11 +1157,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       virtual_flush_interval_flushes(cf_options.virtual_flush_interval_flushes),
       hot_table_decay_factor(cf_options.hot_table_decay_factor),
       hot_table_zero_hit_penalty(cf_options.hot_table_zero_hit_penalty),
-      hot_table_min_duplicate_ratio(cf_options.hot_table_min_duplicate_ratio),
-      hot_table_min_absorption_ratio(cf_options.hot_table_min_absorption_ratio),
+      hot_table_rebuild_cost(cf_options.hot_table_rebuild_cost),
       hot_table_stage_ahead_ratio(cf_options.hot_table_stage_ahead_ratio),
-      hot_table_consecutive_threshold_windows(
-          cf_options.hot_table_consecutive_threshold_windows),
       hot_table_max_scan_backoff_flushes(
           cf_options.hot_table_max_scan_backoff_flushes),
       enable_level_up_compaction(cf_options.enable_level_up_compaction),
