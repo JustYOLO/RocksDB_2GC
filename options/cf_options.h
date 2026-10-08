@@ -110,6 +110,7 @@ struct ImmutableCFOptions {
   double hot_table_zero_hit_penalty;
   double hot_table_rebuild_cost;
   double hot_table_stage_ahead_ratio;
+  bool hot_table_adaptive_growth_reserve;
   uint32_t hot_table_max_scan_backoff_flushes;
 
   bool enable_level_up_compaction;

@@ -1,5 +1,8 @@
 #include "db/space_saving_topk.h"
+
 #include <algorithm>
+
+#include "db/hot_table_policy.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -74,7 +77,7 @@ void SpaceSavingTopK::AddHits(
 
 double SpaceSavingTopK::PredictAbsorptionAndResetWindow(
     size_t max_keys, size_t budget_bytes, size_t per_key_bytes,
-    uint64_t window_writes) {
+    uint64_t reserve_per_key, bool keep_reserve, uint64_t window_writes) {
   std::lock_guard<std::mutex> lock(mutex_);
   uint64_t covered = 0;
   size_t keys = 0;
@@ -85,7 +88,9 @@ double SpaceSavingTopK::PredictAbsorptionAndResetWindow(
     }
     // Same cutoff as the seeding loop in ColumnFamilyData::RebuildHotTable().
     const size_t node_bytes = per_key_bytes + it->second.size();
-    if (used_bytes + node_bytes >= budget_bytes) {
+    if (used_bytes + node_bytes >= HotTableSeedLimit(budget_bytes, keys + 1,
+                                                     reserve_per_key,
+                                                     keep_reserve)) {
       break;
     }
     used_bytes += node_bytes;

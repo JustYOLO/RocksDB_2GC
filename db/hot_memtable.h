@@ -137,6 +137,25 @@ class HotMemTable {
   void SetObservedFlushes(uint32_t n) { observed_flushes_ = n; }
   uint32_t ObservedFlushes() const { return observed_flushes_; }
 
+  // Called once by the builder right after the last seeding Add(), before
+  // the table is visible to any other thread (not thread-safe). Records what
+  // seeding used and the growth reserve it kept per seeded key (0 if none).
+  void MarkSeedingDone(uint64_t reserve_per_key) {
+    seeded_bytes_ = ApproximateMemoryUsage();
+    seeded_keys_ = index_.size();
+    seeded_reserve_per_key_ = reserve_per_key;
+  }
+  size_t SeededBytes() const { return seeded_bytes_; }
+  size_t SeededKeys() const { return seeded_keys_; }
+  uint64_t SeededReservePerKey() const { return seeded_reserve_per_key_; }
+  // Bytes allocated since MarkSeedingDone(). The key set is fixed after
+  // seeding, so these are value slots reallocated for larger values. Safe to
+  // call concurrently with writers (approximate while they run).
+  size_t GrowthBytes() const {
+    const size_t usage = ApproximateMemoryUsage();
+    return usage > seeded_bytes_ ? usage - seeded_bytes_ : 0;
+  }
+
  private:
   friend class HotMemTableIterator;
 
@@ -156,6 +175,10 @@ class HotMemTable {
   std::atomic<uint64_t> earliest_log_num_{kMaxSequenceNumber};
   std::atomic<bool> closed_{false};
   uint32_t observed_flushes_{0};
+  // Set by MarkSeedingDone() before the table is published; read-only after.
+  size_t seeded_bytes_{0};
+  size_t seeded_keys_{0};
+  uint64_t seeded_reserve_per_key_{0};
 
   mutable std::shared_mutex index_rwlock_;
   std::map<std::string, HotNode*, KeyComparatorWrapper> index_;

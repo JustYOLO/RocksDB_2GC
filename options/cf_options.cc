@@ -1159,6 +1159,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       hot_table_zero_hit_penalty(cf_options.hot_table_zero_hit_penalty),
       hot_table_rebuild_cost(cf_options.hot_table_rebuild_cost),
       hot_table_stage_ahead_ratio(cf_options.hot_table_stage_ahead_ratio),
+      hot_table_adaptive_growth_reserve(
+          cf_options.hot_table_adaptive_growth_reserve),
       hot_table_max_scan_backoff_flushes(
           cf_options.hot_table_max_scan_backoff_flushes),
       enable_level_up_compaction(cf_options.enable_level_up_compaction),

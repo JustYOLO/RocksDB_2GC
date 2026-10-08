@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <atomic>
+#include <cstdio>
 #include <limits>
 
 #include "db/db_impl/db_impl.h"
@@ -4925,6 +4926,57 @@ TEST_F(DBFlushHotTableTest, TemporaryMemtableFlushDoesNotSealNewHotTable) {
   ASSERT_OK(Put("hot_a", "absorbed"));
   ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
   ASSERT_EQ(Get("hot_a"), "absorbed");
+}
+
+// End to end with more hot keys than a 64KB HotTable with 64-byte slots can
+// seed: writes that outgrow every hot key's slot once stay in the HotTable
+// with the growth reserve, and are reported when it is sealed. Without the
+// reserve the same writes fill the HotTable and seal it early.
+TEST_F(DBFlushHotTableTest, GrowthReserveAbsorbsSlotGrowth) {
+  auto hot_key = [](int i) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "hot_%04d", i);
+    return std::string(buf);
+  };
+  const int kVeryHot = 150;
+  const int kHotKeys = 400;
+  for (bool keep_reserve : {true, false}) {
+    SCOPED_TRACE("keep_reserve=" + std::to_string(keep_reserve));
+    Options options = HotTableOptions();
+    options.hot_table_adaptive_growth_reserve = keep_reserve;
+    DestroyAndReopen(options);
+    // Skewed so the predicted absorption enables the HotTable either way.
+    for (int round = 0; round < 60; round++) {
+      for (int i = 0; i < kVeryHot; i++) {
+        ASSERT_OK(Put(hot_key(i), "v" + std::to_string(round)));
+      }
+    }
+    for (int round = 0; round < 5; round++) {
+      for (int i = kVeryHot; i < kHotKeys; i++) {
+        ASSERT_OK(Put(hot_key(i), "v" + std::to_string(round)));
+      }
+    }
+    ASSERT_OK(Put("seed_cold", "s"));
+    ASSERT_OK(Flush());
+    ASSERT_OK(Put("activate", "x"));
+    ASSERT_OK(Flush());
+    HotMemTable* active = cfd()->hot_mem();
+    ASSERT_NE(active, nullptr);
+
+    // Outgrow every hot key's 64-byte slot once.
+    const std::string grown(128, 'g');
+    for (int i = 0; i < kHotKeys; i++) {
+      ASSERT_OK(Put(hot_key(i), grown));
+    }
+    const bool sealed_early =
+        cfd()->hot_mem() != active || cfd()->HotTableSealRequested();
+    ASSERT_EQ(sealed_early, !keep_reserve);
+    for (int i = 0; i < kHotKeys; i++) {
+      ASSERT_EQ(Get(hot_key(i)), grown);
+    }
+    ASSERT_OK(Flush());
+    ASSERT_GT(TestGetTickerCount(options, HOT_TABLE_GROWTH_BYTES), 0u);
+  }
 }
 
 // Recovery (DB close + reopen, which drives BuildTable() via the WAL replay

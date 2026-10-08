@@ -12,6 +12,66 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// --- HotTable seeding with a growth reserve -------------------------------
+//
+// A seeded HotTable node's value slot is sized for hot_table_max_value_size.
+// A larger value reallocates the node, and a HotTable that runs out of room
+// is sealed early. So seeding keeps `reserve_per_key` bytes of the budget free
+// for each seeded key, and the seeded share of the budget stays within
+// [kHotTableMinSeedPercent, kHotTableMaxSeedPercent] percent.
+
+constexpr uint64_t kHotTableMinSeedPercent = 30;
+constexpr uint64_t kHotTableMaxSeedPercent = 95;
+// A HotTable that filled up only shows a lower bound of the growth it needed;
+// the learned reserve is raised by this factor over that bound.
+constexpr double kHotGrowthReserveFullBackoff = 1.5;
+
+// floor(value * num / den) without overflowing for any uint64_t value.
+inline uint64_t HotTableFractionOf(uint64_t value, uint64_t num, uint64_t den) {
+  return value / den * num + value % den * num / den;
+}
+
+inline uint64_t HotTableMinSeedBytes(uint64_t budget) {
+  return HotTableFractionOf(budget, kHotTableMinSeedPercent, 100);
+}
+
+inline uint64_t HotTableMaxSeedBytes(uint64_t budget) {
+  return HotTableFractionOf(budget, kHotTableMaxSeedPercent, 100);
+}
+
+// Bytes the seeded nodes of a HotTable with `budget` bytes may take once
+// `num_keys` keys are seeded, each keeping `reserve_per_key` bytes for value
+// growth. With `keep_reserve` false: the whole budget (no reserve, no clamp).
+inline uint64_t HotTableSeedLimit(uint64_t budget, uint64_t num_keys,
+                                  uint64_t reserve_per_key, bool keep_reserve) {
+  if (!keep_reserve) {
+    return budget;
+  }
+  uint64_t room = 0;
+  if (reserve_per_key == 0 || num_keys <= budget / reserve_per_key) {
+    room = budget - num_keys * reserve_per_key;
+  }
+  return std::min(std::max(room, HotTableMinSeedBytes(budget)),
+                  HotTableMaxSeedBytes(budget));
+}
+
+// Most keys HotTableSeedLimit() can admit when every seeded node costs at
+// least `min_node_bytes`. Sizes the router and the top-K extraction, so it
+// must not be below the number of keys seeding actually admits. At least 1.
+inline uint64_t HotTableKeyCapacity(uint64_t budget, uint64_t min_node_bytes,
+                                    uint64_t reserve_per_key,
+                                    bool keep_reserve) {
+  min_node_bytes = std::max<uint64_t>(min_node_bytes, 1);
+  uint64_t keys = budget / min_node_bytes;
+  if (keep_reserve) {
+    const uint64_t with_reserve = budget / (min_node_bytes + reserve_per_key);
+    const uint64_t at_least = HotTableMinSeedBytes(budget) / min_node_bytes;
+    const uint64_t at_most = HotTableMaxSeedBytes(budget) / min_node_bytes;
+    keys = std::min(std::max(with_reserve, at_least), at_most);
+  }
+  return std::max<uint64_t>(keys, 1);
+}
+
 // Outcome of one HotTable decision window (see DecideHotTable()).
 enum class HotTableDecision {
   kEnable,        // disabled -> build a HotTable

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <map>
 #include <string>
 #include <utility>
@@ -291,6 +292,65 @@ class FlushJobHotTableTest : public FlushJobTestBase {
     cfd->OnMemtableSwitch(sealed_mem, /*new_wal_number=*/1);
     mutex_.Unlock();
     ASSERT_NE(cfd->hot_mem(), nullptr);
+  }
+
+  static constexpr int kNumCandidates = 20000;
+
+  // Fixed-width candidate key, so every seeded key costs the same bytes.
+  static std::string CandidateKey(int i) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "candidate_%05d", i);
+    return buf;
+  }
+
+  // Ranks far more candidate keys than fit into the 1MB HotTable budget.
+  void AddCandidateKeys(ColumnFamilyData* cfd) {
+    for (int i = 0; i < kNumCandidates; i++) {
+      cfd->space_saving_topk()->Update(CandidateKey(i), 10);
+    }
+  }
+
+  // Builds a HotTable from the tracked keys and makes it active, sealing the
+  // active one (if any) with a fresh immutable memtable. `served_flush`
+  // counts one flush toward the sealed table's life (ObservedFlushes()).
+  // Returns the table that was sealed, or null.
+  std::shared_ptr<HotMemTable> RebuildAndSwitch(ColumnFamilyData* cfd,
+                                                bool served_flush) {
+    MemTable* sealed_mem = AddImmutableMemtable(cfd, {{"switch_key", 1}});
+    std::shared_ptr<HotMemTable> sealed = cfd->hot_mem_shared();
+    mutex_.Lock();
+    if (sealed != nullptr && served_flush) {
+      ColumnFamilyData::HotShiftWindow unused;
+      cfd->AddHotShiftObservation(ColumnFamilyData::HotShiftWindow(),
+                                  /*window_flushes=*/100, &unused);
+    }
+    cfd->RebuildHotTable(&mutex_);
+    if (sealed != nullptr) {
+      cfd->RequestHotTableSeal(/*force=*/true);
+    }
+    cfd->OnMemtableSwitch(sealed_mem, /*new_wal_number=*/1);
+    mutex_.Unlock();
+    EXPECT_NE(cfd->hot_mem(), nullptr);
+    EXPECT_NE(cfd->hot_mem(), sealed.get());
+    return sealed;
+  }
+
+  // Writes `value` to the candidate keys the active HotTable holds (all of
+  // them, or until it is full if `stop_when_full`). Returns how many writes
+  // it absorbed.
+  size_t WriteSeededKeys(ColumnFamilyData* cfd, const std::string& value,
+                         bool stop_when_full, SequenceNumber* seq) {
+    HotMemTable* hot = cfd->hot_mem();
+    size_t written = 0;
+    for (int i = 0; i < kNumCandidates; i++) {
+      if (stop_when_full && hot->IsFull()) {
+        break;
+      }
+      if (hot->UpdateInPlace(CandidateKey(i), value, kTypeValue, ++*seq)) {
+        ++written;
+      }
+    }
+    return written;
   }
 };
 
@@ -580,21 +640,113 @@ TEST_F(FlushJobHotTableTest, WindowMeasuredWithoutStatistics) {
   ASSERT_NEAR(measured, 0.75, 1e-9);
 }
 
-// A rebuilt HotTable must not start out full, or its first hot write would
-// immediately request a seal.
+// A rebuilt HotTable keeps room for every seeded key's value to outgrow its
+// slot once, so it does not start out (nearly) full.
 TEST_F(FlushJobHotTableTest, StagedHotTableLeavesHeadroom) {
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
-  // Far more candidate keys than fit into the 1MB HotTable budget.
-  for (int i = 0; i < 20000; i++) {
-    cfd->space_saving_topk()->Update("candidate_" + std::to_string(i), 10);
-  }
+  AddCandidateKeys(cfd);
+  RebuildAndSwitch(cfd, /*served_flush=*/false);
+  HotMemTable* hot = cfd->hot_mem();
+  const uint64_t budget = hot->WriteBufferSize();
+  ASSERT_GT(hot->SeededKeys(), 0u);
+  ASSERT_FALSE(hot->IsFull());
+  // Before anything is learned, the reserve is one first growth of a key:
+  // a new node with twice the value slot.
+  const uint64_t one_growth =
+      sizeof(HotNode) + CandidateKey(0).size() + 2 * hot->MaxValueSize();
+  ASSERT_EQ(hot->SeededReservePerKey(), one_growth);
+  ASSERT_LE(hot->SeededBytes() + hot->SeededKeys() * one_growth, budget);
+  ASSERT_GE(hot->SeededBytes(), HotTableMinSeedBytes(budget));
+  ASSERT_LE(hot->SeededBytes(), HotTableMaxSeedBytes(budget));
+}
+
+// Growing every seeded key's value once fits in the reserve seeding kept, so
+// the HotTable does not fill up and request an early seal.
+TEST_F(FlushJobHotTableTest, OneGrowthPerSeededKeyFitsReserve) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  AddCandidateKeys(cfd);
+  RebuildAndSwitch(cfd, /*served_flush=*/false);
+  HotMemTable* hot = cfd->hot_mem();
+  SequenceNumber seq = 0;
+  const std::string grown(2 * hot->MaxValueSize(), 'g');
+  ASSERT_EQ(WriteSeededKeys(cfd, grown, /*stop_when_full=*/false, &seq),
+            hot->SeededKeys());
+  ASSERT_EQ(hot->GrowthBytes(), hot->SeededKeys() * hot->SeededReservePerKey());
+  ASSERT_FALSE(hot->IsFull());
+}
+
+// The reserve is learned from sealed HotTables: one sealed before serving a
+// whole memtable teaches nothing, one that served a flush sets the reserve
+// to its growth per seeded key, and one that filled up raises the reserve
+// above both the previous estimate and what it observed.
+TEST_F(FlushJobHotTableTest, LearnsGrowthReserveFromSealedHotTables) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  AddCandidateKeys(cfd);
+  RebuildAndSwitch(cfd, /*served_flush=*/false);
+  SequenceNumber seq = 0;
+
+  // Too short to learn from.
+  ASSERT_NE(RebuildAndSwitch(cfd, /*served_flush=*/false), nullptr);
   mutex_.Lock();
-  cfd->RebuildHotTable(&mutex_);
-  cfd->OnMemtableSwitch(cfd->mem(), /*new_wal_number=*/1);
+  ASSERT_FALSE(cfd->hot_growth_reserve_learned());
   mutex_.Unlock();
-  ASSERT_NE(cfd->hot_mem(), nullptr);
-  ASSERT_FALSE(cfd->hot_mem()->IsFull());
-  ASSERT_GT(cfd->hot_mem()->ApproximateMemoryUsage(), 0u);
+
+  // Grow 100 keys once, then seal after serving a flush.
+  HotMemTable* hot = cfd->hot_mem();
+  const std::string grown(2 * hot->MaxValueSize(), 'g');
+  for (int i = 0, written = 0; i < kNumCandidates && written < 100; i++) {
+    if (hot->UpdateInPlace(CandidateKey(i), grown, kTypeValue, ++seq)) {
+      written++;
+    }
+  }
+  std::shared_ptr<HotMemTable> sealed =
+      RebuildAndSwitch(cfd, /*served_flush=*/true);
+  ASSERT_NE(sealed, nullptr);
+  ASSERT_FALSE(sealed->IsFull());
+  const uint64_t learned =
+      static_cast<uint64_t>(static_cast<double>(sealed->GrowthBytes()) /
+                            static_cast<double>(sealed->SeededKeys()));
+  ASSERT_GT(learned, 0u);
+  mutex_.Lock();
+  ASSERT_TRUE(cfd->hot_growth_reserve_learned());
+  ASSERT_EQ(cfd->hot_growth_reserve_per_key(), learned);
+  mutex_.Unlock();
+
+  // Fill the next HotTable with large values until it is full.
+  WriteSeededKeys(cfd, std::string(8 << 10, 'f'), /*stop_when_full=*/true,
+                  &seq);
+  ASSERT_TRUE(cfd->hot_mem()->IsFull());
+  sealed = RebuildAndSwitch(cfd, /*served_flush=*/false);
+  const double observed = static_cast<double>(sealed->GrowthBytes()) /
+                          static_cast<double>(sealed->SeededKeys());
+  mutex_.Lock();
+  ASSERT_EQ(
+      cfd->hot_growth_reserve_per_key(),
+      static_cast<uint64_t>(std::max(static_cast<double>(learned), observed) *
+                            kHotGrowthReserveFullBackoff));
+  mutex_.Unlock();
+}
+
+class FlushJobHotTableNoReserveTest : public FlushJobHotTableTest {
+ public:
+  FlushJobHotTableNoReserveTest() {
+    cf_options_.hot_table_adaptive_growth_reserve = false;
+  }
+};
+
+// Without the reserve (the earlier behavior), seeding fills the budget and
+// the same growth fills the HotTable.
+TEST_F(FlushJobHotTableNoReserveTest, SeedsWholeBudget) {
+  auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+  AddCandidateKeys(cfd);
+  RebuildAndSwitch(cfd, /*served_flush=*/false);
+  HotMemTable* hot = cfd->hot_mem();
+  ASSERT_EQ(hot->SeededReservePerKey(), 0u);
+  ASSERT_GT(hot->SeededBytes(), HotTableMaxSeedBytes(hot->WriteBufferSize()));
+  SequenceNumber seq = 0;
+  WriteSeededKeys(cfd, std::string(2 * hot->MaxValueSize(), 'g'),
+                  /*stop_when_full=*/true, &seq);
+  ASSERT_TRUE(hot->IsFull());
 }
 
 TEST_F(FlushJobTest, FlushMemTablesSingleColumnFamily) {

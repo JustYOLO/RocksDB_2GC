@@ -506,10 +506,10 @@ class ColumnFamilyData {
   // While a HotTable is active and nothing is staged yet, builds the next
   // HotTable once the active one nears its seal: `wal_near_limit` (the
   // caller compares the total WAL size with max_total_wal_size), the active
-  // HotTable reaching hot_table_stage_ahead_ratio of its size limit, or a
-  // requested seal. Does nothing otherwise, so the staged table is built at
-  // most once per epoch. REQUIRES: db_mutex held on entry and held again on
-  // return (it is released while building).
+  // HotTable having used hot_table_stage_ahead_ratio of its room for growth
+  // (see that option), or a requested seal. Does nothing otherwise, so the
+  // staged table is built at most once per epoch. REQUIRES: db_mutex held on
+  // entry and held again on return (it is released while building).
   void MaybeStageNextHotTable(bool wal_near_limit, InstrumentedMutex* db_mutex);
 
   // Asks the next memtable switch of this CF to seal the active HotTable
@@ -592,6 +592,15 @@ class ColumnFamilyData {
   bool AddDisabledWindowObservation(const HotShiftWindow& flush,
                                     uint32_t window_flushes,
                                     HotShiftWindow* out);
+  // HotTable growth reserve per seeded key learned from sealed HotTables,
+  // and whether any sealed HotTable has set it yet (see
+  // hot_table_adaptive_growth_reserve). REQUIRES: DB mutex held.
+  uint64_t hot_growth_reserve_per_key() const {
+    return hot_growth_reserve_per_key_;
+  }
+  bool hot_growth_reserve_learned() const {
+    return hot_growth_reserve_learned_;
+  }
   // Ends a decision window: sweeps the active HotTable's hits (if `active`),
   // measures a and predicts a_hat, ages the tracker, decides with the cost
   // model (W = `wal_limit`), logs and counts the decision, and applies it
@@ -842,6 +851,17 @@ class ColumnFamilyData {
 
  private:
   friend class ColumnFamilySet;
+  // Updates the learned growth reserve from a HotTable being sealed, and
+  // reports its growth. REQUIRES: DB mutex held; `sealed_hot` closed.
+  void LearnHotGrowthReserve(const HotMemTable& sealed_hot);
+  // Reserve per seeded key the next HotTable is expected to keep: the learned
+  // one, or before anything is learned one first growth of a node (a new
+  // node with twice the value slot) without its key bytes. Only for sizing
+  // and prediction; RebuildHotTable() adds key bytes to the initial value.
+  // REQUIRES: DB mutex held.
+  uint64_t HotGrowthReserveEstimate() const;
+  // HotTableKeyCapacity() for this CF's HotTable options.
+  size_t HotTableKeyCapacityFor(uint64_t reserve_per_key) const;
   ColumnFamilyData(uint32_t id, const std::string& name,
                    Version* dummy_versions, Cache* table_cache,
                    WriteBufferManager* write_buffer_manager,
@@ -924,6 +944,9 @@ class ColumnFamilyData {
   std::atomic<uint32_t> hot_stay_disabled_windows_{0};
   // See TryBeginHotTableRebuild()/EndHotTableRebuild() above.
   std::atomic<bool> hot_rebuild_in_flight_{false};
+  // See hot_growth_reserve_per_key(). Guarded by the DB mutex.
+  uint64_t hot_growth_reserve_per_key_{0};
+  bool hot_growth_reserve_learned_{false};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};

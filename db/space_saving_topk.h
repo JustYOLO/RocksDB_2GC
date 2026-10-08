@@ -41,10 +41,13 @@ class SpaceSavingTopK {
   // Predicted absorption of a HotTable built now: the window_count of the
   // keys GetTopK(max_keys) would return, cut off where a HotTable of
   // `budget_bytes` would stop seeding (each key costs
-  // `per_key_bytes + key.size()`), divided by `window_writes` (capped at 1).
-  // Resets window_count of every entry.
+  // `per_key_bytes + key.size()`, and seeding stops at HotTableSeedLimit()
+  // with `reserve_per_key` and `keep_reserve`), divided by `window_writes`
+  // (capped at 1). Resets window_count of every entry.
   double PredictAbsorptionAndResetWindow(size_t max_keys, size_t budget_bytes,
                                          size_t per_key_bytes,
+                                         uint64_t reserve_per_key,
+                                         bool keep_reserve,
                                          uint64_t window_writes);
   // Ages every entry once: keys in `swept_hits` with zero hits get the
   // zero-hit penalty, all others the decay factor. `swept_hits` may be null.

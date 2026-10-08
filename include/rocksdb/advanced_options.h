@@ -475,15 +475,27 @@ struct AdvancedColumnFamilyOptions {
   double hot_table_rebuild_cost = 1.0;
   // The next HotTable is built (staged) only once the active one is close to
   // being sealed: when the total WAL size reaches this fraction of
-  // max_total_wal_size, when the active HotTable reaches this fraction of
-  // hot_table_write_buffer_size, or when a seal has been requested. It is
-  // built at most once per HotTable epoch. A staged HotTable takes a memtable
-  // slot and its memory, so staging late keeps both free for most of the
-  // epoch; staging too late makes a seal find nothing staged and fall back to
-  // a temporary memtable (see rocksdb.hot.table.temp.memtable.count). Leave
-  // room for at least one memtable flush between this point and the limit.
+  // max_total_wal_size, when the active HotTable has used this fraction of
+  // the room it has for growth (all of hot_table_write_buffer_size if
+  // hot_table_adaptive_growth_reserve is false, otherwise what its seeded
+  // keys left free), or when a seal has been requested. It is built at most
+  // once per HotTable epoch. A staged HotTable takes a memtable slot and its
+  // memory, so staging late keeps both free for most of the epoch; staging
+  // too late makes a seal find nothing staged and fall back to a temporary
+  // memtable (see rocksdb.hot.table.temp.memtable.count). Leave room for at
+  // least one memtable flush between this point and the limit.
   // 0 stages right after the active HotTable is activated.
   double hot_table_stage_ahead_ratio = 0.75;
+  // Seed each HotTable only up to the memory that leaves room for its keys'
+  // values to grow, instead of filling hot_table_write_buffer_size. A hot
+  // key's slot is sized for hot_table_max_value_size; a larger value
+  // reallocates it, and a HotTable that runs out of room is sealed early
+  // (with the memtable it is paired with, however small). The room kept per
+  // key is learned from sealed HotTables, and seeded keys take between 30%
+  // and 95% of hot_table_write_buffer_size. Memory use never exceeds
+  // hot_table_write_buffer_size either way. false seeds up to the whole
+  // budget.
+  bool hot_table_adaptive_growth_reserve = true;
   // Once the cost model has decided to stay disabled for consecutive
   // windows, the per-flush duplicate-key detection is only re-probed once
   // every N flushes, where N grows with the number of such windows, up to

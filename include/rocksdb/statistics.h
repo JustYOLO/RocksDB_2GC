@@ -166,6 +166,9 @@ enum Tickers : uint32_t {
   HOT_TABLE_DECISION_REBUILD,
   HOT_TABLE_DECISION_DISABLE,
   HOT_TABLE_DECISION_CONTINUE,
+  // Bytes sealed HotTables allocated after seeding, i.e. for hot values
+  // outgrowing their slots (added once per seal).
+  HOT_TABLE_GROWTH_BYTES,
 
   // Level Up Compaction tickers
   LEVEL_UP_KEY_CHECKED,
@@ -186,7 +189,8 @@ enum Tickers : uint32_t {
   BLOCK_CACHE_HIT_TIME_NANOS,
   DISK_HIT_TIME_NANOS,
 
-  // # of Get() queries where key was found in a data block served from block cache
+  // # of Get() queries where key was found in a data block served from block
+  // cache
   BLOCK_CACHE_KEY_HIT,
 
   // # of Get() queries served by L0

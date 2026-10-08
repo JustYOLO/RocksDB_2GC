@@ -765,6 +765,54 @@ ColumnFamilyData::ColumnFamilyData(
   }
 }
 
+uint64_t ColumnFamilyData::HotGrowthReserveEstimate() const {
+  if (hot_growth_reserve_learned_) {
+    return hot_growth_reserve_per_key_;
+  }
+  return sizeof(HotNode) + 2 * uint64_t{ioptions_.hot_table_max_value_size};
+}
+
+size_t ColumnFamilyData::HotTableKeyCapacityFor(
+    uint64_t reserve_per_key) const {
+  // Key bytes are left out of the node cost, which only raises the bound.
+  return static_cast<size_t>(HotTableKeyCapacity(
+      ioptions_.hot_table_write_buffer_size,
+      sizeof(HotNode) + ioptions_.hot_table_max_value_size +
+          kHotTableIndexOverheadBytes,
+      reserve_per_key, ioptions_.hot_table_adaptive_growth_reserve));
+}
+
+void ColumnFamilyData::LearnHotGrowthReserve(const HotMemTable& sealed_hot) {
+  RecordTick(ioptions_.statistics.get(), HOT_TABLE_GROWTH_BYTES,
+             sealed_hot.GrowthBytes());
+  if (!ioptions_.hot_table_adaptive_growth_reserve ||
+      sealed_hot.SeededKeys() == 0) {
+    return;
+  }
+  const double observed = static_cast<double>(sealed_hot.GrowthBytes()) /
+                          static_cast<double>(sealed_hot.SeededKeys());
+  // Until something is learned, correct the reserve this table was seeded
+  // with.
+  const double prior = static_cast<double>(
+      hot_growth_reserve_learned_ ? hot_growth_reserve_per_key_
+                                  : sealed_hot.SeededReservePerKey());
+  double next;
+  if (sealed_hot.IsFull()) {
+    // It ran out of room: it needed at least `observed` per key, likely more.
+    next = std::max(prior, observed) * kHotGrowthReserveFullBackoff;
+  } else if (sealed_hot.ObservedFlushes() > 0) {
+    next =
+        hot_growth_reserve_learned_ ? 0.5 * prior + 0.5 * observed : observed;
+  } else {
+    // Sealed before serving a whole memtable: too short to tell how much an
+    // epoch grows.
+    return;
+  }
+  hot_growth_reserve_per_key_ = static_cast<uint64_t>(std::min(
+      next, static_cast<double>(ioptions_.hot_table_write_buffer_size)));
+  hot_growth_reserve_learned_ = true;
+}
+
 void ColumnFamilyData::ExecuteVirtualFlush(HotMemTable* flushed_hot_mem) {
   if (!ioptions_.enable_hot_table || flushed_hot_mem == nullptr ||
       !space_saving_topk_) {
@@ -828,14 +876,15 @@ HotTableDecision ColumnFamilyData::EndHotTableWindow(
                  ? static_cast<double>(hits) / window_writes
                  : 0.0;
   TEST_SYNC_POINT_CALLBACK("ColumnFamilyData::EndHotTableWindow:a", &a);
-  size_t max_keys = ioptions_.hot_table_write_buffer_size /
-                    (32 + ioptions_.hot_table_max_value_size);
-  if (max_keys == 0) max_keys = 1024;
+  const bool keep_reserve = ioptions_.hot_table_adaptive_growth_reserve;
+  const uint64_t reserve_per_key =
+      keep_reserve ? HotGrowthReserveEstimate() : 0;
   const double a_hat = space_saving_topk_->PredictAbsorptionAndResetWindow(
-      max_keys, ioptions_.hot_table_write_buffer_size,
+      HotTableKeyCapacityFor(reserve_per_key),
+      ioptions_.hot_table_write_buffer_size,
       sizeof(HotNode) + ioptions_.hot_table_max_value_size +
           kHotTableIndexOverheadBytes,
-      window_writes);
+      reserve_per_key, keep_reserve, window_writes);
   space_saving_topk_->Age(hot != nullptr ? &hit_map : nullptr);
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 
@@ -930,10 +979,17 @@ void ColumnFamilyData::MaybeStageNextHotTable(bool wal_near_limit,
     // Between epochs the flush job stages the next HotTable itself.
     return;
   }
+  // Near the seal once the active HotTable has used the stage-ahead fraction
+  // of its room for growth: what seeding left free when it kept a growth
+  // reserve, the whole budget otherwise.
+  const double seeded = ioptions_.hot_table_adaptive_growth_reserve
+                            ? static_cast<double>(active->SeededBytes())
+                            : 0.0;
+  const double budget = static_cast<double>(active->WriteBufferSize());
   const bool hot_near_limit =
       static_cast<double>(active->ApproximateMemoryUsage()) >=
-      ioptions_.hot_table_stage_ahead_ratio *
-          static_cast<double>(active->WriteBufferSize());
+      seeded + ioptions_.hot_table_stage_ahead_ratio *
+                   std::max(budget - seeded, 0.0);
   if (!wal_near_limit && !hot_near_limit && !HotTableSealRequested()) {
     return;
   }
@@ -980,6 +1036,7 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
     // final. The router stays enabled: readers of the sealed pair use it.
     active_hot->Close();
     active_hot->SetObservedFlushes(active_hot_observed_flushes_);
+    LearnHotGrowthReserve(*active_hot);
     sealed_mem->SetSealedHotTable(active_hot, active_router);
     {
       WriteLock l(&hot_table_ptr_mutex_);
@@ -987,8 +1044,12 @@ void ColumnFamilyData::OnMemtableSwitch(ReadOnlyMemTable* sealed_mem,
       hot_router_.reset();
     }
     ROCKS_LOG_INFO(ioptions_.info_log,
-                   "[%s] [HotTable] Sealed HotTable with memtable %" PRIu64,
-                   GetName().c_str(), sealed_mem->GetID());
+                   "[%s] [HotTable] Sealed HotTable with memtable %" PRIu64
+                   " (seeded keys: %zu, growth bytes: %zu, full: %d, growth "
+                   "reserve per key: %" PRIu64 ")",
+                   GetName().c_str(), sealed_mem->GetID(),
+                   active_hot->SeededKeys(), active_hot->GrowthBytes(),
+                   active_hot->IsFull() ? 1 : 0, hot_growth_reserve_per_key_);
     if (hot_successor_vetoed_) {
       // A kDisable decision: no successor. Back to disabled windows.
       hot_successor_vetoed_ = false;
@@ -1056,15 +1117,19 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
     ~GuardRelease() { cfd->EndHotTableRebuild(); }
   } guard_release{this};
 
-  size_t capacity = ioptions_.hot_table_write_buffer_size /
-                    (32 + ioptions_.hot_table_max_value_size);
-  if (capacity == 0) capacity = 1024;
+  // Read under db_mutex: OnMemtableSwitch() updates the learned reserve.
+  const bool keep_reserve = ioptions_.hot_table_adaptive_growth_reserve;
+  const bool reserve_learned = hot_growth_reserve_learned_;
+  const uint64_t reserve_estimate = HotGrowthReserveEstimate();
+  const size_t capacity =
+      HotTableKeyCapacityFor(keep_reserve ? reserve_estimate : 0);
 
   auto new_hot = std::make_shared<HotMemTable>(
       internal_comparator_, ioptions_.hot_table_write_buffer_size,
       ioptions_.hot_table_max_value_size, write_buffer_mgr());
   auto new_router = std::make_shared<HotTableRouter>(capacity);
   size_t seeded = 0;
+  uint64_t reserve_per_key = 0;
   if (space_saving_topk_) {
     // O(capacity) in-memory work that touches only space_saving_topk_ (own
     // mutex) and the two unpublished objects above, so release db_mutex.
@@ -1072,14 +1137,30 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
       db_mutex->Unlock();
     }
     auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
+    if (keep_reserve) {
+      reserve_per_key = reserve_estimate;
+      if (!reserve_learned && !top_keys.empty()) {
+        // Nothing learned yet: keep one first growth of each key (a new
+        // node with twice the value slot), including its key bytes.
+        uint64_t key_bytes = 0;
+        for (const auto& entry : top_keys) {
+          key_bytes += entry.key.size();
+        }
+        const uint64_t avg_key_bytes =
+            (key_bytes + top_keys.size() - 1) / top_keys.size();
+        reserve_per_key = sizeof(HotNode) + avg_key_bytes +
+                          2 * uint64_t{new_hot->MaxValueSize()};
+      }
+    }
     for (const auto& entry : top_keys) {
-      // Leave headroom: a HotTable that is already full when it becomes
-      // active would request its own seal on the first hot write.
       const size_t node_bytes = sizeof(HotNode) + entry.key.size() +
                                 new_hot->MaxValueSize() +
                                 kHotTableIndexOverheadBytes;
+      // Stop where the growth reserve of every seeded key, this one
+      // included, would no longer fit (see HotTableSeedLimit()).
       if (new_hot->ApproximateMemoryUsage() + node_bytes >=
-          new_hot->WriteBufferSize()) {
+          HotTableSeedLimit(new_hot->WriteBufferSize(), seeded + 1,
+                            reserve_per_key, keep_reserve)) {
         break;
       }
       new_router->Add(entry.key);
@@ -1090,6 +1171,8 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
       db_mutex->Lock();
     }
   }
+  new_hot->MarkSeedingDone(reserve_per_key);
+  const size_t seeded_bytes = new_hot->SeededBytes();
   // Replaces any older staged table. A seal may have promoted that one while
   // db_mutex was released; this one is then staged for the epoch after it.
   pending_hot_mem_ = std::move(new_hot);
@@ -1097,8 +1180,10 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_STAGE_COUNT);
   ROCKS_LOG_INFO(ioptions_.info_log,
                  "[%s] [HotTable] Staged pending HotTable with %zu hot keys "
-                 "(capacity: %zu)",
-                 GetName().c_str(), seeded, capacity);
+                 "(capacity: %zu, seeded bytes: %zu of %zu, growth reserve "
+                 "per key: %" PRIu64 ")",
+                 GetName().c_str(), seeded, capacity, seeded_bytes,
+                 ioptions_.hot_table_write_buffer_size, reserve_per_key);
 }
 
 void ColumnFamilyData::DecayAndEvaluateLevelUpSkew() {

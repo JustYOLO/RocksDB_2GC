@@ -376,20 +376,115 @@ TEST_F(HotMemTableTest, TrackerWindowCounts) {
   ASSERT_EQ(top[1].key, "a");
   ASSERT_EQ(top[1].window_count, 5u);
   // Both keys are covered: (5 + 2) / 10.
-  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.7, 1e-9);
+  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 0, false, 10),
+              0.7, 1e-9);
   // The prediction reset the window.
-  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.0);
+  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 0, false, 10),
+            0.0);
   // Memory cutoff: with 12 bytes and 10 + 1 bytes per key, only the top key
   // ("a", now count 9) fits.
   t.Update("a", 4, true);
   t.Update("c", 1, true);
   ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, /*budget_bytes=*/12,
-                                                /*per_key_bytes=*/10, 10),
+                                                /*per_key_bytes=*/10,
+                                                /*reserve_per_key=*/0,
+                                                /*keep_reserve=*/false, 10),
               0.4, 1e-9);
   // Hits outside a window rank keys but are not window activity.
   std::unordered_map<std::string, uint32_t> hits{{"a", 7}};
   t.AddHits(hits, /*in_window=*/false);
-  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 10), 0.0);
+  ASSERT_EQ(t.PredictAbsorptionAndResetWindow(10, 1 << 20, 1, 0, false, 10),
+            0.0);
+}
+
+TEST_F(HotMemTableTest, SeedLimitKeepsGrowthReserve) {
+  struct Case {
+    const char* name;
+    uint64_t num_keys;
+    uint64_t reserve_per_key;
+    bool keep_reserve;
+    uint64_t expected;
+  };
+  const Case cases[] = {
+      {"no_reserve_whole_budget", 5, 100, false, 1000},
+      {"reserve_leaves_room", 3, 100, true, 700},
+      {"clamped_to_max_seed", 0, 100, true, 950},
+      {"clamped_to_min_seed", 9, 100, true, 300},
+      {"zero_reserve", 7, 0, true, 950},
+      {"reserve_overflow_is_min_seed", uint64_t{1} << 40, uint64_t{1} << 40,
+       true, 300},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    ASSERT_EQ(HotTableSeedLimit(/*budget=*/1000, c.num_keys, c.reserve_per_key,
+                                c.keep_reserve),
+              c.expected);
+  }
+}
+
+TEST_F(HotMemTableTest, KeyCapacityBoundsSeeding) {
+  struct Case {
+    const char* name;
+    uint64_t budget;
+    uint64_t min_node_bytes;
+    uint64_t reserve_per_key;
+    bool keep_reserve;
+    uint64_t expected;
+  };
+  const Case cases[] = {
+      {"no_reserve", 1000, 10, 90, false, 100},
+      {"reserve", 1000, 10, 15, true, 40},
+      {"min_seed_floor", 1000, 10, 90, true, 30},
+      {"max_seed_cap", 1000, 10, 0, true, 95},
+      {"zero_node_bytes", 5, 0, 0, false, 5},
+      {"at_least_one", 0, 10, 0, false, 1},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    ASSERT_EQ(HotTableKeyCapacity(c.budget, c.min_node_bytes, c.reserve_per_key,
+                                  c.keep_reserve),
+              c.expected);
+  }
+}
+
+TEST_F(HotMemTableTest, GrowthBytesCountOnlySlotGrowthAfterSeeding) {
+  InternalKeyComparator cmp(BytewiseComparator());
+  HotMemTable hot(cmp, 1 << 20, /*max_val_size=*/64);
+  for (int i = 0; i < 10; i++) {
+    ASSERT_TRUE(hot.Add("seed_" + std::to_string(i), Slice(), kTypeValue,
+                        /*seq=*/0));
+  }
+  hot.MarkSeedingDone(/*reserve_per_key=*/100);
+  ASSERT_EQ(hot.SeededKeys(), 10u);
+  ASSERT_EQ(hot.SeededBytes(), hot.ApproximateMemoryUsage());
+  ASSERT_EQ(hot.SeededReservePerKey(), 100u);
+  ASSERT_EQ(hot.GrowthBytes(), 0u);
+  // A value that fits the 64-byte slot allocates nothing.
+  ASSERT_TRUE(hot.UpdateInPlace("seed_0", std::string(40, 'a'), kTypeValue, 1));
+  ASSERT_EQ(hot.GrowthBytes(), 0u);
+  // Outgrowing it reallocates the node with max(100, 2 * 64) value bytes.
+  ASSERT_TRUE(
+      hot.UpdateInPlace("seed_0", std::string(100, 'b'), kTypeValue, 2));
+  ASSERT_EQ(hot.GrowthBytes(),
+            sizeof(HotNode) + std::string("seed_0").size() + 128);
+}
+
+TEST_F(HotMemTableTest, PredictionKeepsGrowthReserve) {
+  SpaceSavingTopK t(/*max_capacity=*/10);
+  // Counts of at least 2, like the keys seeding picks.
+  t.Update("a", 4, /*in_window=*/true);
+  t.Update("c", 2, /*in_window=*/true);
+  // Each key costs 20 + 1 bytes: without a reserve both fit in 100 bytes.
+  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(
+                  10, /*budget_bytes=*/100, /*per_key_bytes=*/20,
+                  /*reserve_per_key=*/60, /*keep_reserve=*/false, 10),
+              0.6, 1e-9);
+  t.Update("a", 4, true);
+  t.Update("c", 2, true);
+  // Keeping 60 bytes per key, two keys may only take the 30-byte floor
+  // (HotTableSeedLimit(100, 2, 60, true)), and they need 42: only "a".
+  ASSERT_NEAR(t.PredictAbsorptionAndResetWindow(10, 100, 20, 60, true, 10), 0.4,
+              1e-9);
 }
 
 TEST_F(HotMemTableTest, ScanProbeIntervalBacksOffOnceConfidentlyFlat) {

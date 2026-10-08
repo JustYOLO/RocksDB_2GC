@@ -380,6 +380,8 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->hot_table_zero_hit_penalty = ioptions.hot_table_zero_hit_penalty;
   cf_opts->hot_table_rebuild_cost = ioptions.hot_table_rebuild_cost;
   cf_opts->hot_table_stage_ahead_ratio = ioptions.hot_table_stage_ahead_ratio;
+  cf_opts->hot_table_adaptive_growth_reserve =
+      ioptions.hot_table_adaptive_growth_reserve;
   cf_opts->hot_table_max_scan_backoff_flushes =
       ioptions.hot_table_max_scan_backoff_flushes;
 

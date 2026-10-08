@@ -1810,6 +1810,9 @@ DEFINE_double(hot_table_rebuild_cost, 1.0,
 DEFINE_double(hot_table_stage_ahead_ratio, 0.75,
               "Stage the next HotTable once the WAL or the active HotTable "
               "reaches this fraction of its limit");
+DEFINE_bool(hot_table_adaptive_growth_reserve, true,
+            "Seed a HotTable only up to the memory that leaves a learned "
+            "room for its keys' values to grow");
 
 DEFINE_bool(enable_level_up_compaction, false,
             "Enable Level Up Compaction for read-hot ranges");
@@ -5915,6 +5918,8 @@ class Benchmark {
     options.hot_table_zero_hit_penalty = FLAGS_hot_table_zero_hit_penalty;
     options.hot_table_rebuild_cost = FLAGS_hot_table_rebuild_cost;
     options.hot_table_stage_ahead_ratio = FLAGS_hot_table_stage_ahead_ratio;
+    options.hot_table_adaptive_growth_reserve =
+        FLAGS_hot_table_adaptive_growth_reserve;
     options.enable_level_up_compaction = FLAGS_enable_level_up_compaction;
     options.level_up_warmth_threshold = FLAGS_level_up_warmth_threshold;
     options.level_up_min_skew_ratio = FLAGS_level_up_min_skew_ratio;
