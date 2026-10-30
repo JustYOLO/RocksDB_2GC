@@ -394,6 +394,12 @@ DEFINE_uint64(hotcold_hot_keys, 100,
               "fillhotcold: number of hot keys, written in strict rotation. "
               "Each hot key is rewritten after hotcold_hot_keys / "
               "hotcold_hot_fraction writes.");
+DEFINE_bool(hotcold_random, false,
+            "fillhotcold: hotspot mode. Each write is hot with probability "
+            "hotcold_hot_fraction and then goes to a uniformly random hot "
+            "key (seeded from --seed), so a hot key's update gaps are "
+            "geometric with mean hotcold_hot_keys / hotcold_hot_fraction "
+            "writes instead of exactly that.");
 
 DEFINE_string(key_log_file, "",
               "If non-empty, fillzip, fillhotcold, mixgraph and twittertrace "
@@ -8439,6 +8445,8 @@ class Benchmark {
   // inverse of the fraction is an integer). Keys are HotColdMix64 of an even
   // number (cold) or an odd number (hot): unique, disjoint, and spread over
   // the whole key space. Garbage = hot writes - distinct hot keys written.
+  // With --hotcold_random the hot writes are independent draws instead (see
+  // the flag): same mean distance, geometric gaps.
   void FillHotCold(ThreadState* thread) {
     // Hot writes per kPeriod writes; write n is hot when
     // floor((n + 1) * f) > floor(n * f).
@@ -8464,13 +8472,31 @@ class Benchmark {
     uint64_t hot_writes = 0;
     uint64_t cold_writes = 0;
     int64_t bytes = 0;
+    // Hotspot mode only: its own generator, so the key stream depends on
+    // --seed alone; hot keys written so far, for the exact garbage count.
+    std::mt19937_64 rng(FLAGS_seed);
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+    std::uniform_int_distribution<uint64_t> pick_hot(
+        0, hot_keys > 0 ? hot_keys - 1 : 0);
+    std::vector<bool> hot_seen(FLAGS_hotcold_random ? hot_keys : 0);
+    uint64_t hot_keys_written = 0;
 
     for (uint64_t n = 0; n < static_cast<uint64_t>(FLAGS_num); ++n) {
-      const bool hot =
-          (n + 1) * hot_per_period / kPeriod > n * hot_per_period / kPeriod;
+      const bool hot = FLAGS_hotcold_random
+                           ? coin(rng) < FLAGS_hotcold_hot_fraction
+                           : (n + 1) * hot_per_period / kPeriod >
+                                 n * hot_per_period / kPeriod;
       uint64_t v;
       if (hot) {
-        v = HotColdMix64(2 * (hot_writes % hot_keys) + 1);
+        uint64_t h = hot_writes % hot_keys;
+        if (FLAGS_hotcold_random) {
+          h = pick_hot(rng);
+          if (!hot_seen[h]) {
+            hot_seen[h] = true;
+            hot_keys_written++;
+          }
+        }
+        v = HotColdMix64(2 * h + 1);
         hot_writes++;
       } else {
         v = HotColdMix64(2 * cold_writes);
@@ -8497,15 +8523,19 @@ class Benchmark {
       thread->stats.FinishedOps(nullptr, db, 1, kWrite);
     }
 
-    const uint64_t hot_keys_written = std::min(hot_writes, hot_keys);
+    if (!FLAGS_hotcold_random) {
+      hot_keys_written = std::min(hot_writes, hot_keys);
+    }
+    // update_distance_writes is the mean distance in hotspot mode.
     fprintf(stdout,
             "HOTCOLD: writes=%" PRIu64 " hot_writes=%" PRIu64
             " cold_writes=%" PRIu64 " hot_keys=%" PRIu64
             " hot_keys_written=%" PRIu64 " garbage=%" PRIu64
-            " hot_fraction=%.6f update_distance_writes=%.1f\n",
+            " hot_fraction=%.6f random=%d update_distance_writes=%.1f\n",
             hot_writes + cold_writes, hot_writes, cold_writes, hot_keys,
             hot_keys_written, hot_writes - hot_keys_written,
             static_cast<double>(hot_per_period) / kPeriod,
+            FLAGS_hotcold_random ? 1 : 0,
             hot_per_period > 0
                 ? static_cast<double>(hot_keys) * kPeriod / hot_per_period
                 : 0.0);
