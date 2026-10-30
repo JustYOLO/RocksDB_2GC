@@ -815,7 +815,7 @@ void ColumnFamilyData::LearnHotGrowthReserve(const HotMemTable& sealed_hot) {
 
 void ColumnFamilyData::ExecuteVirtualFlush(HotMemTable* flushed_hot_mem) {
   if (!ioptions_.enable_hot_table || flushed_hot_mem == nullptr ||
-      !space_saving_topk_) {
+      !space_saving_topk_ || !HotKeyTrackingActive()) {
     return;
   }
   // Hits since the last window end belong to no complete window: they rank
@@ -862,13 +862,16 @@ HotTableDecision ColumnFamilyData::EndHotTableWindow(
   std::unordered_map<std::string, uint32_t> hit_map;
   uint64_t hits = 0;
   std::shared_ptr<HotMemTable> hot = active ? hot_mem_shared() : nullptr;
+  const bool tracking = HotKeyTrackingActive();
   if (hot != nullptr) {
     // exchange(0) per key: safe while writers keep updating.
     hot->SweepHits(&hit_map);
     for (const auto& kv : hit_map) {
       hits += kv.second;
     }
-    space_saving_topk_->AddHits(hit_map, /*in_window=*/true);
+    if (tracking) {
+      space_saving_topk_->AddHits(hit_map, /*in_window=*/true);
+    }
   }
   const uint64_t window_writes =
       hot != nullptr ? hits + window.appended_entries : window.probed_entries;
@@ -885,7 +888,9 @@ HotTableDecision ColumnFamilyData::EndHotTableWindow(
       sizeof(HotNode) + ioptions_.hot_table_max_value_size +
           kHotTableIndexOverheadBytes,
       reserve_per_key, keep_reserve, window_writes);
-  space_saving_topk_->Age(hot != nullptr ? &hit_map : nullptr);
+  if (tracking) {
+    space_saving_topk_->Age(hot != nullptr ? &hit_map : nullptr);
+  }
   RecordTick(ioptions_.statistics.get(), HOT_TABLE_VIRTUAL_FLUSH_COUNT);
 
   HotTableCostModel model;
@@ -893,6 +898,8 @@ HotTableDecision ColumnFamilyData::EndHotTableWindow(
   model.rebuild_cost = ioptions_.hot_table_rebuild_cost;
   model.memtable_bytes = mutable_cf_options_.write_buffer_size;
   model.wal_limit_bytes = wal_limit;
+  model.allow_rebuild = ioptions_.hot_table_rebuild_on_prediction;
+  model.allow_disable = ioptions_.hot_table_disable_on_low_absorption;
   if (model.DisableThresholdClamped() && !hot_threshold_clamp_logged_) {
     hot_threshold_clamp_logged_ = true;
     ROCKS_LOG_WARN(ioptions_.info_log,
@@ -1130,21 +1137,35 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
   auto new_router = std::make_shared<HotTableRouter>(capacity);
   size_t seeded = 0;
   uint64_t reserve_per_key = 0;
+  // Freeze the key set at the first HotTable built with any keys.
+  const bool freeze_keys =
+      !ioptions_.hot_table_track_hot_keys && HotKeyTrackingActive();
+  std::vector<std::string> seeded_keys;
   if (space_saving_topk_) {
     // O(capacity) in-memory work that touches only space_saving_topk_ (own
-    // mutex) and the two unpublished objects above, so release db_mutex.
+    // mutex), frozen_hot_keys_ (only written here, and this is
+    // single-flight) and the two unpublished objects above, so release
+    // db_mutex.
     if (db_mutex) {
       db_mutex->Unlock();
     }
-    auto top_keys = space_saving_topk_->GetTopK(capacity, /*min_count=*/2);
+    std::vector<std::string> top_keys;
+    if (HotKeyTrackingActive()) {
+      for (auto& entry :
+           space_saving_topk_->GetTopK(capacity, /*min_count=*/2)) {
+        top_keys.push_back(std::move(entry.key));
+      }
+    } else {
+      top_keys = frozen_hot_keys_;
+    }
     if (keep_reserve) {
       reserve_per_key = reserve_estimate;
       if (!reserve_learned && !top_keys.empty()) {
         // Nothing learned yet: keep one first growth of each key (a new
         // node with twice the value slot), including its key bytes.
         uint64_t key_bytes = 0;
-        for (const auto& entry : top_keys) {
-          key_bytes += entry.key.size();
+        for (const auto& key : top_keys) {
+          key_bytes += key.size();
         }
         const uint64_t avg_key_bytes =
             (key_bytes + top_keys.size() - 1) / top_keys.size();
@@ -1152,8 +1173,8 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
                           2 * uint64_t{new_hot->MaxValueSize()};
       }
     }
-    for (const auto& entry : top_keys) {
-      const size_t node_bytes = sizeof(HotNode) + entry.key.size() +
+    for (const auto& key : top_keys) {
+      const size_t node_bytes = sizeof(HotNode) + key.size() +
                                 new_hot->MaxValueSize() +
                                 kHotTableIndexOverheadBytes;
       // Stop where the growth reserve of every seeded key, this one
@@ -1163,13 +1184,24 @@ void ColumnFamilyData::RebuildHotTable(InstrumentedMutex* db_mutex) {
                             reserve_per_key, keep_reserve)) {
         break;
       }
-      new_router->Add(entry.key);
-      new_hot->Add(entry.key, Slice(), kTypeValue, /*seq=*/0, /*log_num=*/0);
+      new_router->Add(key);
+      new_hot->Add(key, Slice(), kTypeValue, /*seq=*/0, /*log_num=*/0);
       ++seeded;
+      if (freeze_keys) {
+        seeded_keys.push_back(key);
+      }
     }
     if (db_mutex) {
       db_mutex->Lock();
     }
+  }
+  if (freeze_keys && !seeded_keys.empty()) {
+    frozen_hot_keys_ = std::move(seeded_keys);
+    hot_keys_frozen_.store(true, std::memory_order_relaxed);
+    ROCKS_LOG_INFO(ioptions_.info_log,
+                   "[%s] [HotTable] Hot-key tracking stopped; every HotTable "
+                   "is seeded with these %zu keys",
+                   GetName().c_str(), frozen_hot_keys_.size());
   }
   new_hot->MarkSeedingDone(reserve_per_key);
   const size_t seeded_bytes = new_hot->SeededBytes();

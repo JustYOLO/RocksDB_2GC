@@ -88,6 +88,11 @@ struct HotTableCostModel {
   double rebuild_cost = 1.0;     // kappa
   uint64_t memtable_bytes = 0;   // C
   uint64_t wal_limit_bytes = 0;  // W; 0 = unknown
+  // Whether an active HotTable may be rebuilt or disabled. false never
+  // returns that decision (see hot_table_rebuild_on_prediction and
+  // hot_table_disable_on_low_absorption).
+  bool allow_rebuild = true;
+  bool allow_disable = true;
 
   double EnableThreshold() const {
     const double e = std::max<uint32_t>(epoch_flushes, 1);
@@ -131,10 +136,10 @@ inline HotTableDecision DecideHotTable(const HotTableCostModel& m,
     return a_hat >= m.EnableThreshold() ? HotTableDecision::kEnable
                                         : HotTableDecision::kStayDisabled;
   }
-  if (m.RebuildGain(a, a_hat) >= m.rebuild_cost) {
+  if (m.allow_rebuild && m.RebuildGain(a, a_hat) >= m.rebuild_cost) {
     return HotTableDecision::kRebuild;
   }
-  if (a < m.DisableThreshold()) {
+  if (m.allow_disable && a < m.DisableThreshold()) {
     return HotTableDecision::kDisable;
   }
   return HotTableDecision::kContinue;

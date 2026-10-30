@@ -618,6 +618,12 @@ class ColumnFamilyData {
   uint32_t hot_stay_disabled_windows() const {
     return hot_stay_disabled_windows_.load(std::memory_order_relaxed);
   }
+  // False once hot_table_track_hot_keys is off and the first HotTable has
+  // been built: the hot-key tracker then takes no more updates, and every
+  // HotTable is seeded with that first HotTable's keys. Thread-safe.
+  bool HotKeyTrackingActive() const {
+    return !hot_keys_frozen_.load(std::memory_order_relaxed);
+  }
 
   // Single-flight guard for RebuildHotTable(), which releases the DB mutex
   // while reseeding.
@@ -947,6 +953,12 @@ class ColumnFamilyData {
   // See hot_growth_reserve_per_key(). Guarded by the DB mutex.
   uint64_t hot_growth_reserve_per_key_{0};
   bool hot_growth_reserve_learned_{false};
+  // Keys of the first HotTable, used to seed every HotTable once
+  // hot_keys_frozen_ is set (see HotKeyTrackingActive()). Written only by
+  // RebuildHotTable(), which is single-flight, before it sets
+  // hot_keys_frozen_; read-only after.
+  std::vector<std::string> frozen_hot_keys_;
+  std::atomic<bool> hot_keys_frozen_{false};
   std::shared_ptr<SpaceSavingTopK> space_saving_topk_;
   std::shared_ptr<SpatialCountMinSketch> spatial_cms_;
   uint32_t level_up_flush_counter_{0};

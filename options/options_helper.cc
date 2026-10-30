@@ -382,6 +382,11 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->hot_table_stage_ahead_ratio = ioptions.hot_table_stage_ahead_ratio;
   cf_opts->hot_table_adaptive_growth_reserve =
       ioptions.hot_table_adaptive_growth_reserve;
+  cf_opts->hot_table_rebuild_on_prediction =
+      ioptions.hot_table_rebuild_on_prediction;
+  cf_opts->hot_table_disable_on_low_absorption =
+      ioptions.hot_table_disable_on_low_absorption;
+  cf_opts->hot_table_track_hot_keys = ioptions.hot_table_track_hot_keys;
   cf_opts->hot_table_max_scan_backoff_flushes =
       ioptions.hot_table_max_scan_backoff_flushes;
 

@@ -342,6 +342,46 @@ TEST_F(HotMemTableTest, CostModelWalLimitEdgeCases) {
   ASSERT_NEAR(m.DisableThreshold(), m.EnableThreshold(), 1e-12);
 }
 
+// Turning off rebuild or disable removes only that decision: the other
+// checks still run.
+TEST_F(HotMemTableTest, CostModelAblationSwitches) {
+  HotTableCostModel m;
+  m.epoch_flushes = 5;
+  m.rebuild_cost = 1.0;
+  m.memtable_bytes = 64ull << 20;
+  m.wal_limit_bytes = 1ull << 30;
+
+  struct Case {
+    const char* name;
+    bool allow_rebuild;
+    bool allow_disable;
+    bool enabled;
+    double a;
+    double a_hat;
+    HotTableDecision expected;
+  };
+  const Case cases[] = {
+      {"no_rebuild_falls_to_disable", false, true, true, 0.03, 0.45,
+       HotTableDecision::kDisable},
+      {"no_rebuild_continues", false, true, true, 0.10, 0.45,
+       HotTableDecision::kContinue},
+      {"no_disable_still_rebuilds", true, false, true, 0.03, 0.45,
+       HotTableDecision::kRebuild},
+      {"no_disable_continues", true, false, true, 0.03, 0.03,
+       HotTableDecision::kContinue},
+      {"neither_continues", false, false, true, 0.0, 0.45,
+       HotTableDecision::kContinue},
+      {"neither_still_enables", false, false, false, 0.0, 0.20,
+       HotTableDecision::kEnable},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    m.allow_rebuild = c.allow_rebuild;
+    m.allow_disable = c.allow_disable;
+    ASSERT_EQ(DecideHotTable(m, c.enabled, c.a, c.a_hat), c.expected);
+  }
+}
+
 TEST_F(HotMemTableTest, OnlyAppliedWritesCountAsHits) {
   InternalKeyComparator cmp(BytewiseComparator());
   HotMemTable hot(cmp, 1 << 20, 64);

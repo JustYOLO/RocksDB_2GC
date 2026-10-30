@@ -496,6 +496,24 @@ struct AdvancedColumnFamilyOptions {
   // hot_table_write_buffer_size either way. false seeds up to the whole
   // budget.
   bool hot_table_adaptive_growth_reserve = true;
+  // The three options below each turn off one way a HotTable adapts to a
+  // changing hot key set. They exist for ablation experiments; all three
+  // false keeps the first hot key set for the whole run.
+  //
+  // Let the cost model seal an active HotTable and build a successor from
+  // the current hot keys when a rebuilt one is predicted to absorb enough
+  // more writes (HotTableDecision::kRebuild). false never rebuilds on that
+  // prediction.
+  bool hot_table_rebuild_on_prediction = true;
+  // Let the cost model seal an active HotTable with no successor when it
+  // absorbs too little (HotTableDecision::kDisable). false keeps a HotTable
+  // active once it is enabled.
+  bool hot_table_disable_on_low_absorption = true;
+  // Keep updating the hot-key tracker for the whole run. false stops
+  // updating it once the first HotTable is built, and seeds every later
+  // HotTable with that first HotTable's keys. Flushes then skip duplicate-key
+  // counting, so a HotTable that is disabled afterwards is not enabled again.
+  bool hot_table_track_hot_keys = true;
   // Once the cost model has decided to stay disabled for consecutive
   // windows, the per-flush duplicate-key detection is only re-probed once
   // every N flushes, where N grows with the number of such windows, up to

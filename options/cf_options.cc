@@ -1161,6 +1161,11 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       hot_table_stage_ahead_ratio(cf_options.hot_table_stage_ahead_ratio),
       hot_table_adaptive_growth_reserve(
           cf_options.hot_table_adaptive_growth_reserve),
+      hot_table_rebuild_on_prediction(
+          cf_options.hot_table_rebuild_on_prediction),
+      hot_table_disable_on_low_absorption(
+          cf_options.hot_table_disable_on_low_absorption),
+      hot_table_track_hot_keys(cf_options.hot_table_track_hot_keys),
       hot_table_max_scan_backoff_flushes(
           cf_options.hot_table_max_scan_backoff_flushes),
       enable_level_up_compaction(cf_options.enable_level_up_compaction),

@@ -4758,6 +4758,82 @@ TEST_F(DBFlushHotTableTest, LowAbsorptionDisables) {
   ASSERT_EQ(Get("hot_a"), "a19");
 }
 
+// With rebuild and disable decisions off, a hot-set shift that would rebuild
+// (HotSetShiftRebuilds) or disable (LowAbsorptionDisables) keeps the active
+// HotTable and its stale keys.
+TEST_F(DBFlushHotTableTest, NoRebuildOrDisableKeepsHotTableAfterShift) {
+  Options options = HotTableOptions();
+  options.write_buffer_size = 64 << 10;
+  options.max_total_wal_size = 1 << 20;  // a_off = 64KB / 1MB = 0.0625
+  options.hot_table_rebuild_on_prediction = false;
+  options.hot_table_disable_on_low_absorption = false;
+  DestroyAndReopen(options);
+  ActivateHotTable();
+  HotMemTable* old_hot = cfd()->hot_mem();
+  const uint64_t continues_before =
+      TestGetTickerCount(options, HOT_TABLE_DECISION_CONTINUE);
+
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 40; i++) {
+      ASSERT_OK(Put("shift_a", std::string(1000, 'a')));
+      ASSERT_OK(Put("shift_b", std::string(1000, 'b')));
+    }
+    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  }
+  ASSERT_GT(TestGetTickerCount(options, HOT_TABLE_DECISION_CONTINUE),
+            continues_before);
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_DECISION_REBUILD), 0u);
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_DECISION_DISABLE), 0u);
+  ASSERT_OK(Put("x1", "1"));
+  ASSERT_OK(Put("x2", "2"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_EQ(cfd()->hot_mem(), old_hot);
+
+  const uint64_t hits = TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
+  ASSERT_OK(Put("shift_a", "new"));
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits);
+  ASSERT_OK(Put("hot_a", "still_hot"));
+  ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT), hits + 1);
+  ASSERT_EQ(Get("shift_a"), "new");
+  ASSERT_EQ(Get("hot_a"), "still_hot");
+}
+
+// Keys that become hot after the first HotTable reach the next HotTable only
+// while the hot-key tracker is updated.
+TEST_F(DBFlushHotTableTest, FrozenHotKeysSeedEveryHotTable) {
+  for (const bool track : {true, false}) {
+    SCOPED_TRACE(track ? "tracking" : "frozen");
+    Options options = HotTableOptions();
+    options.hot_table_track_hot_keys = track;
+    DestroyAndReopen(options);
+    ActivateHotTable();
+    ASSERT_EQ(cfd()->HotKeyTrackingActive(), track);
+
+    for (int i = 0; i < 40; i++) {
+      ASSERT_OK(Put("shift_a", "s" + std::to_string(i)));
+      ASSERT_OK(Put("hot_a", "h" + std::to_string(i)));
+    }
+    // Seals the HotTable and stages a successor from the tracker (or the
+    // frozen keys); the next switch promotes it.
+    ASSERT_OK(Flush());
+    ASSERT_TRUE(HasStagedHotTable());
+    ASSERT_OK(Put("activate2", "x"));
+    ASSERT_OK(Flush());
+    ASSERT_NE(cfd()->hot_mem(), nullptr);
+
+    const uint64_t hits =
+        TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT);
+    ASSERT_OK(Put("shift_a", "new"));
+    ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT),
+              hits + (track ? 1 : 0));
+    ASSERT_OK(Put("hot_a", "still_hot"));
+    ASSERT_EQ(TestGetTickerCount(options, HOT_TABLE_WRITE_HIT_COUNT),
+              hits + (track ? 2 : 1));
+    ASSERT_EQ(Get("shift_a"), "new");
+    ASSERT_EQ(Get("hot_a"), "still_hot");
+  }
+}
+
 // An explicit flush seals the HotTable but is not a decision: with nothing
 // staged, the CF stays enabled and stages a successor right away.
 TEST_F(DBFlushHotTableTest, ExplicitFlushKeepsEnabledState) {

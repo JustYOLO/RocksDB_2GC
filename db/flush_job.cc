@@ -1125,7 +1125,9 @@ Status FlushJob::WriteLevel0Table() {
       uint32_t interval = SpaceSavingTopK::ComputeScanProbeInterval(
           cfd_->hot_stay_disabled_windows(), /*threshold_windows=*/1,
           cfd_->ioptions().hot_table_max_scan_backoff_flushes);
-      should_probe = (cfd_->cold_flush_counter() % interval == 0);
+      // Nothing uses the counts once hot-key tracking has stopped.
+      should_probe = cfd_->HotKeyTrackingActive() &&
+                     (cfd_->cold_flush_counter() % interval == 0);
     }
     std::vector<HotTableDupCountingIterator*> dup_counting_iters;
     {
@@ -1516,7 +1518,9 @@ void FlushJob::UpdateHotTableAfterFlush(
     // Disabled: only probed flushes carry evidence.
     in_window = in_window && hot_flush_observation_.probed_entries > 0;
   }
-  tracker->UpdateBatch(hot_dup_runs_, in_window);
+  if (cfd_->HotKeyTrackingActive()) {
+    tracker->UpdateBatch(hot_dup_runs_, in_window);
+  }
   hot_dup_runs_.clear();
 
   const uint32_t window_flushes =

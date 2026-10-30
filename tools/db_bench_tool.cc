@@ -1789,6 +1789,30 @@ DEFINE_uint64(inplace_update_num_locks,
 
 DEFINE_bool(enable_hot_table, false,
             "Enable Adaptive In-Place Hot Table architecture");
+
+// Writes absorbed in memory and not absorbed so far, for the fillzip window
+// hit-rate reports (--hot_table_window_ops / --hot_table_window_seconds):
+// HotTable write hits and misses when the HotTable is enabled; otherwise,
+// with --inplace_update_support, in-place updates out of all keys written.
+static void GetWindowWriteCounts(uint64_t* hits, uint64_t* misses) {
+  *hits = 0;
+  *misses = 0;
+  if (!dbstats) {
+    return;
+  }
+  if (!FLAGS_enable_hot_table && FLAGS_inplace_update_support) {
+    const uint64_t updated =
+        dbstats->getTickerCount(ROCKSDB_NAMESPACE::NUMBER_KEYS_UPDATED);
+    const uint64_t written =
+        dbstats->getTickerCount(ROCKSDB_NAMESPACE::NUMBER_KEYS_WRITTEN);
+    *hits = updated;
+    *misses = written > updated ? written - updated : 0;
+    return;
+  }
+  *hits = dbstats->getTickerCount(ROCKSDB_NAMESPACE::HOT_TABLE_WRITE_HIT_COUNT);
+  *misses =
+      dbstats->getTickerCount(ROCKSDB_NAMESPACE::HOT_TABLE_WRITE_MISS_COUNT);
+}
 DEFINE_bool(report_flush_time_breakdown, false,
             "Enable per-phase flush latency breakdown histograms (memtable "
             "iterator setup, read+merge, SST block writes, file finish, "
@@ -1813,6 +1837,15 @@ DEFINE_double(hot_table_stage_ahead_ratio, 0.75,
 DEFINE_bool(hot_table_adaptive_growth_reserve, true,
             "Seed a HotTable only up to the memory that leaves a learned "
             "room for its keys' values to grow");
+DEFINE_bool(hot_table_rebuild_on_prediction, true,
+            "Let the HotTable cost model rebuild an active HotTable when a "
+            "rebuilt one is predicted to absorb more writes");
+DEFINE_bool(hot_table_disable_on_low_absorption, true,
+            "Let the HotTable cost model disable an active HotTable that "
+            "absorbs too few writes");
+DEFINE_bool(hot_table_track_hot_keys, true,
+            "Keep updating the hot-key tracker; false seeds every HotTable "
+            "with the first HotTable's keys");
 
 DEFINE_bool(enable_level_up_compaction, false,
             "Enable Level Up Compaction for read-hot ranges");
@@ -5920,6 +5953,11 @@ class Benchmark {
     options.hot_table_stage_ahead_ratio = FLAGS_hot_table_stage_ahead_ratio;
     options.hot_table_adaptive_growth_reserve =
         FLAGS_hot_table_adaptive_growth_reserve;
+    options.hot_table_rebuild_on_prediction =
+        FLAGS_hot_table_rebuild_on_prediction;
+    options.hot_table_disable_on_low_absorption =
+        FLAGS_hot_table_disable_on_low_absorption;
+    options.hot_table_track_hot_keys = FLAGS_hot_table_track_hot_keys;
     options.enable_level_up_compaction = FLAGS_enable_level_up_compaction;
     options.level_up_warmth_threshold = FLAGS_level_up_warmth_threshold;
     options.level_up_min_skew_ratio = FLAGS_level_up_min_skew_ratio;
@@ -8167,10 +8205,7 @@ class Benchmark {
 
             uint64_t cur_hits = 0;
             uint64_t cur_misses = 0;
-            if (dbstats) {
-              cur_hits = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT);
-              cur_misses = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_MISS_COUNT);
-            }
+            GetWindowWriteCounts(&cur_hits, &cur_misses);
             uint64_t prev_hits = g_last_window_hits.load(std::memory_order_relaxed);
             uint64_t prev_misses = g_last_window_misses.load(std::memory_order_relaxed);
             uint64_t delta_hits = (cur_hits >= prev_hits) ? (cur_hits - prev_hits) : cur_hits;
@@ -8250,10 +8285,7 @@ class Benchmark {
             if (still_should) {
               uint64_t cur_hits = 0;
               uint64_t cur_misses = 0;
-              if (dbstats) {
-                cur_hits = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_HIT_COUNT);
-                cur_misses = dbstats->getTickerCount(Tickers::HOT_TABLE_WRITE_MISS_COUNT);
-              }
+              GetWindowWriteCounts(&cur_hits, &cur_misses);
               uint64_t prev_hits = g_last_window_hits.load(std::memory_order_relaxed);
               uint64_t prev_misses = g_last_window_misses.load(std::memory_order_relaxed);
               uint64_t delta_hits = (cur_hits >= prev_hits) ? (cur_hits - prev_hits) : cur_hits;
