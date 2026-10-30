@@ -386,6 +386,26 @@ DEFINE_int64(key_range, 10000000, "zipf key range");
 DEFINE_bool(YCSB_uniform_distribution, false,
             "Uniform key distribution for YCSB");
 
+DEFINE_double(hotcold_hot_fraction, 0.5,
+              "fillhotcold: fraction of writes that go to the hot keys. Hot "
+              "writes are spaced evenly, so with 1/f an integer every "
+              "(1/f)-th write is hot.");
+DEFINE_uint64(hotcold_hot_keys, 100,
+              "fillhotcold: number of hot keys, written in strict rotation. "
+              "Each hot key is rewritten after hotcold_hot_keys / "
+              "hotcold_hot_fraction writes.");
+
+DEFINE_string(key_log_file, "",
+              "If non-empty, fillzip, fillhotcold, mixgraph and twittertrace "
+              "write one 24-byte record per Put to this file: uint64 Put "
+              "index, uint64 XXH3 hash of the key, uint32 key + value bytes, "
+              "uint32 zero (all little-endian). Only one such benchmark per "
+              "run; a later one overwrites the file.");
+DEFINE_bool(key_log_only, false,
+            "With --key_log_file, generate and log the key stream of "
+            "fillzip, fillhotcold, mixgraph and twittertrace without "
+            "writing to the DB (twittertrace also skips its reads).");
+
 DEFINE_string(ycsb_rw_key_overlap_mode, "100",
               "Hot key range overlap mode between reads and writes in YCSB: "
               "\"100\" or \"full\" (100% overlap, default YCSB behavior), "
@@ -2403,6 +2423,73 @@ class UniformDistribution : public BaseDistribution,
   bool NeedTruncate() override { return false; }
   std::random_device rd_;
   std::mt19937 gen_;
+};
+
+// Writes the --key_log_file records of one benchmark run (format in the flag
+// description). Does nothing when --key_log_file is empty.
+class KeyLogWriter {
+ public:
+  KeyLogWriter() {
+    if (FLAGS_key_log_file.empty()) {
+      return;
+    }
+    if (FLAGS_threads > 1) {
+      fprintf(stderr, "key log: --key_log_file needs --threads=1\n");
+      exit(1);
+    }
+    file_ = fopen(FLAGS_key_log_file.c_str(), "wb");
+    if (file_ == nullptr) {
+      fprintf(stderr, "key log: cannot open %s: %s\n",
+              FLAGS_key_log_file.c_str(), strerror(errno));
+      exit(1);
+    }
+    buf_.reserve(kBufferBytes);
+  }
+
+  ~KeyLogWriter() {
+    if (file_ == nullptr) {
+      return;
+    }
+    Flush();
+    if (fclose(file_) != 0) {
+      fprintf(stderr, "key log: close failed: %s\n", strerror(errno));
+      exit(1);
+    }
+    fprintf(stdout, "KEY LOG: %" PRIu64 " records written to %s\n", records_,
+            FLAGS_key_log_file.c_str());
+  }
+
+  void Append(const Slice& key, size_t value_bytes) {
+    if (file_ == nullptr) {
+      return;
+    }
+    char rec[kRecordBytes];
+    EncodeFixed64(rec, records_++);
+    EncodeFixed64(rec + 8, XXH3_64bits(key.data(), key.size()));
+    EncodeFixed32(rec + 16, static_cast<uint32_t>(key.size() + value_bytes));
+    EncodeFixed32(rec + 20, 0);
+    buf_.append(rec, kRecordBytes);
+    if (buf_.size() >= kBufferBytes) {
+      Flush();
+    }
+  }
+
+ private:
+  static constexpr size_t kRecordBytes = 24;
+  static constexpr size_t kBufferBytes = 1 << 20;
+
+  void Flush() {
+    if (!buf_.empty() &&
+        fwrite(buf_.data(), 1, buf_.size(), file_) != buf_.size()) {
+      fprintf(stderr, "key log: write failed: %s\n", strerror(errno));
+      exit(1);
+    }
+    buf_.clear();
+  }
+
+  FILE* file_ = nullptr;
+  std::string buf_;
+  uint64_t records_ = 0;
 };
 
 // Helper for quickly generating random data.
@@ -4513,6 +4600,14 @@ class Benchmark {
           num_threads = 1;
         }
         method = &Benchmark::WriteUniqueRandom;
+      } else if (name == "fillhotcold") {
+        fresh_db = true;
+        if (num_threads > 1) {
+          fprintf(stderr,
+                  "fillhotcold multithreaded not supported, use 1 thread\n");
+          num_threads = 1;
+        }
+        method = &Benchmark::FillHotCold;
       } else if (name == "overwrite") {
         method = &Benchmark::WriteRandom;
       } else if (name == "fillsync") {
@@ -8186,6 +8281,7 @@ class Benchmark {
 
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
+    KeyLogWriter key_log;
 
     while (nums > 0) {
       nums--;
@@ -8249,7 +8345,12 @@ class Benchmark {
             RateLimiter::OpType::kWrite);
         thread->stats.ResetLastOpTime();
       }
-      Status s = db->Put(write_options_, key, gen.Generate(value_size));
+      Slice val = gen.Generate(value_size);
+      key_log.Append(key, val.size());
+      Status s;
+      if (!FLAGS_key_log_only) {
+        s = db->Put(write_options_, key, val);
+      }
       if (s.ok()) {
         writes_done++;
         thread->stats.FinishedOps(nullptr, db, 1, kWrite);
@@ -8318,6 +8419,97 @@ class Benchmark {
     snprintf(msg, sizeof(msg), "( writes:%" PRIu64 " total:%" PRIu64 ")",
              writes_done, readwrites_);
     thread->stats.AddMessage(msg);
+  }
+
+  // splitmix64 finalizer, a bijection on uint64_t.
+  static uint64_t HotColdMix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+  }
+
+  // fillhotcold: --num writes with an exactly known garbage pattern. A
+  // fraction --hotcold_hot_fraction of the writes go to --hotcold_hot_keys
+  // hot keys in strict rotation; every other write goes to a new cold key.
+  // Hot writes are spread evenly, so a hot key is rewritten after
+  // hotcold_hot_keys / hotcold_hot_fraction writes (exactly, when the
+  // inverse of the fraction is an integer). Keys are HotColdMix64 of an even
+  // number (cold) or an odd number (hot): unique, disjoint, and spread over
+  // the whole key space. Garbage = hot writes - distinct hot keys written.
+  void FillHotCold(ThreadState* thread) {
+    // Hot writes per kPeriod writes; write n is hot when
+    // floor((n + 1) * f) > floor(n * f).
+    constexpr uint64_t kPeriod = 1000000;
+    if (FLAGS_hotcold_hot_fraction < 0.0 || FLAGS_hotcold_hot_fraction > 1.0) {
+      fprintf(stderr,
+              "fillhotcold: --hotcold_hot_fraction must be in [0, 1]\n");
+      ErrorExit();
+    }
+    const uint64_t hot_per_period = static_cast<uint64_t>(
+        std::llround(FLAGS_hotcold_hot_fraction * kPeriod));
+    const uint64_t hot_keys = FLAGS_hotcold_hot_keys;
+    if (hot_per_period > 0 && hot_keys == 0) {
+      fprintf(stderr, "fillhotcold: --hotcold_hot_keys must be positive\n");
+      ErrorExit();
+    }
+
+    RandomGenerator gen;
+    KeyLogWriter key_log;
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+    DB* db = SelectDB(thread);
+    uint64_t hot_writes = 0;
+    uint64_t cold_writes = 0;
+    int64_t bytes = 0;
+
+    for (uint64_t n = 0; n < static_cast<uint64_t>(FLAGS_num); ++n) {
+      const bool hot =
+          (n + 1) * hot_per_period / kPeriod > n * hot_per_period / kPeriod;
+      uint64_t v;
+      if (hot) {
+        v = HotColdMix64(2 * (hot_writes % hot_keys) + 1);
+        hot_writes++;
+      } else {
+        v = HotColdMix64(2 * cold_writes);
+        cold_writes++;
+      }
+      GenerateKeyFromInt(v, FLAGS_num, &key);
+
+      if (FLAGS_benchmark_write_rate_limit > 0) {
+        thread->shared->write_rate_limiter->Request(
+            value_size + FLAGS_key_size, Env::IO_HIGH, nullptr /* stats */,
+            RateLimiter::OpType::kWrite);
+        thread->stats.ResetLastOpTime();
+      }
+      Slice val = gen.Generate(value_size);
+      key_log.Append(key, val.size());
+      if (!FLAGS_key_log_only) {
+        Status s = db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "fillhotcold: put error: %s\n", s.ToString().c_str());
+          ErrorExit();
+        }
+      }
+      bytes += key.size() + val.size();
+      thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+    }
+
+    const uint64_t hot_keys_written = std::min(hot_writes, hot_keys);
+    fprintf(stdout,
+            "HOTCOLD: writes=%" PRIu64 " hot_writes=%" PRIu64
+            " cold_writes=%" PRIu64 " hot_keys=%" PRIu64
+            " hot_keys_written=%" PRIu64 " garbage=%" PRIu64
+            " hot_fraction=%.6f update_distance_writes=%.1f\n",
+            hot_writes + cold_writes, hot_writes, cold_writes, hot_keys,
+            hot_keys_written, hot_writes - hot_keys_written,
+            static_cast<double>(hot_per_period) / kPeriod,
+            hot_per_period > 0
+                ? static_cast<double>(hot_keys) * kPeriod / hot_per_period
+                : 0.0);
+    thread->stats.AddBytes(bytes);
   }
 
   // VaryingWorkload: Sequences 5 distinct phases continuously:
@@ -9439,6 +9631,7 @@ class Benchmark {
     Slice key = AllocateKey(&key_guard);
     PinnableSlice pinnable_val;
     query.Initiate(ratio);
+    KeyLogWriter key_log;
 
     // the limit of qps initiation
     if (FLAGS_sine_mix_rate) {
@@ -9560,9 +9753,11 @@ class Benchmark {
         }
         total_val_size += val_size;
 
-        s = db_with_cfh->db->Put(
-            write_options_, key,
-            gen.Generate(static_cast<unsigned int>(val_size)));
+        Slice val = gen.Generate(static_cast<unsigned int>(val_size));
+        key_log.Append(key, val.size());
+        if (!FLAGS_key_log_only) {
+          s = db_with_cfh->db->Put(write_options_, key, val);
+        }
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           ErrorExit();
@@ -11940,6 +12135,7 @@ class Benchmark {
     uint64_t total_found = 0;
     uint64_t total_bytes = 0;
     const uint64_t put_limit = FLAGS_twittertrace_put_limit;
+    KeyLogWriter key_log;
 
     std::string line;
     while (std::getline(in, line)) {
@@ -11974,7 +12170,7 @@ class Benchmark {
       bool stop_for_target_db_size = false;
 
       if (op == "get" || op == "gets") {
-        if (FLAGS_twittertrace_skip_reads) {
+        if (FLAGS_twittertrace_skip_reads || FLAGS_key_log_only) {
           continue;
         }
         std::string val;
@@ -11992,7 +12188,10 @@ class Benchmark {
       } else if (op == "set" || op == "add" || op == "replace" ||
                  op == "append" || op == "prepend") {
         Slice val = gen.Generate(static_cast<unsigned int>(value_size));
-        s = db->Put(write_opts, key, val);
+        key_log.Append(key, val.size());
+        if (!FLAGS_key_log_only) {
+          s = db->Put(write_opts, key, val);
+        }
         if (!s.ok()) {
           fprintf(stderr, "twittertrace: Put error: %s\n",
                   s.ToString().c_str());
